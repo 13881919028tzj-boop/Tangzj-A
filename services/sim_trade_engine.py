@@ -1,0 +1,1065 @@
+"""本地自动模拟交易执行器。
+
+安全边界：
+- 只做本地模拟订单、模拟持仓、模拟盈亏。
+- 不连接真实账户，不读取真实资金，不调用任何 Binance 下单接口。
+- 唯一信号来源是 AI交易委员会通过的模拟候选。
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from services.ai_committee_engine import get_committee_approved_signals
+from services.trading_database import record_sim_close, record_sim_open
+
+
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+ACCOUNT_PATH = DATA_DIR / "sim_account.json"
+SETTINGS_PATH = DATA_DIR / "sim_settings.json"
+POSITIONS_PATH = DATA_DIR / "sim_positions.json"
+ORDERS_PATH = DATA_DIR / "sim_orders.json"
+HISTORY_JSON_PATH = DATA_DIR / "sim_trade_history.json"
+HISTORY_CSV_PATH = DATA_DIR / "sim_trade_history.csv"
+LOG_PATH = DATA_DIR / "sim_trade_log.json"
+EQUITY_JSON_PATH = DATA_DIR / "sim_equity_curve.json"
+EQUITY_CSV_PATH = DATA_DIR / "sim_equity_curve.csv"
+
+
+DEFAULT_SETTINGS = {
+    "initial_balance": 1000.0,
+    "max_position_pct": 10.0,
+    "max_risk_pct": 1.0,
+    "max_positions": 3,
+    "max_same_symbol_positions": 1,
+    "allow_long": True,
+    "allow_short": True,
+    "leverage": 5,
+    "market_type": "futures",
+    "futures_leverage_locked": True,
+    "continuous_run": True,
+    "ignore_loss_limits": True,
+    "entry_mode": "立即按当前价模拟开仓",
+    "tp1_close_pct": 50.0,
+    "move_sl_to_breakeven": True,
+    "daily_loss_limit_pct": 3.0,
+    "max_drawdown_limit_pct": 8.0,
+    "consecutive_loss_pause": 3,
+    "signal_ttl_minutes": 60,
+    "cooldown_minutes": 15,
+    "mode": "auto",
+}
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ts() -> int:
+    return int(time.time())
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            _write_json(path, default)
+            return default
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data
+    except Exception as exc:
+        print(f"[模拟交易] 读取文件失败 {path.name} error={exc!r}")
+        backup = path.with_suffix(path.suffix + f".broken_{int(time.time())}") if path.exists() else None
+        try:
+            if backup:
+                path.rename(backup)
+        except Exception:
+            pass
+        _write_json(path, default)
+        return default
+
+
+def _write_json(path: Path, data: Any) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_sim_event(event_type: str, symbol: str = "", direction: str = "", price: float | None = None, content: str = "", reason: str = "") -> None:
+    logs = _read_json(LOG_PATH, [])
+    logs.insert(
+        0,
+        {
+            "time": _now(),
+            "event_type": event_type,
+            "symbol": symbol,
+            "direction": direction,
+            "price": price,
+            "content": content,
+            "reason": reason,
+        },
+    )
+    _write_json(LOG_PATH, logs[:500])
+
+
+def default_account(initial_balance: float = 1000.0) -> dict[str, Any]:
+    return {
+        "initial_balance": initial_balance,
+        "available_balance": initial_balance,
+        "used_margin": 0.0,
+        "equity": initial_balance,
+        "unrealized_pnl": 0.0,
+        "realized_pnl": 0.0,
+        "total_pnl": 0.0,
+        "return_pct": 0.0,
+        "max_equity": initial_balance,
+        "max_drawdown": 0.0,
+        "daily_pnl": 0.0,
+        "consecutive_losses": 0,
+        "status": "stopped",
+        "updated_at": _now(),
+    }
+
+
+def load_settings() -> dict[str, Any]:
+    settings = _read_json(SETTINGS_PATH, DEFAULT_SETTINGS.copy())
+    merged = DEFAULT_SETTINGS.copy()
+    if isinstance(settings, dict):
+        merged.update(settings)
+    if merged.get("futures_leverage_locked", True):
+        merged["market_type"] = "futures"
+        merged["leverage"] = 5
+    if merged.get("continuous_run", True):
+        merged["ignore_loss_limits"] = True
+        if merged.get("mode") == "observe":
+            merged["mode"] = "auto"
+    return merged
+
+
+def save_settings(settings: dict[str, Any]) -> None:
+    merged = DEFAULT_SETTINGS.copy()
+    merged.update(settings or {})
+    if merged.get("futures_leverage_locked", True):
+        merged["market_type"] = "futures"
+        merged["leverage"] = 5
+    if merged.get("continuous_run", True):
+        merged["ignore_loss_limits"] = True
+        if merged.get("mode") == "observe":
+            merged["mode"] = "auto"
+    _write_json(SETTINGS_PATH, merged)
+
+
+def init_sim_account() -> dict[str, Any]:
+    settings = load_settings()
+    account = _read_json(ACCOUNT_PATH, default_account(float(settings.get("initial_balance", 1000))))
+    if not isinstance(account, dict):
+        account = default_account(float(settings.get("initial_balance", 1000)))
+        save_sim_account(account)
+    return account
+
+
+def load_sim_account() -> dict[str, Any]:
+    return init_sim_account()
+
+
+def save_sim_account(account: dict[str, Any]) -> None:
+    account = enrich_sim_account(account)
+    account["updated_at"] = _now()
+    _write_json(ACCOUNT_PATH, account)
+    append_equity_curve_point(account)
+
+
+def reset_sim_account(initial_balance: float | None = None) -> dict[str, Any]:
+    settings = load_settings()
+    balance = float(initial_balance if initial_balance is not None else settings.get("initial_balance", 1000))
+    settings["initial_balance"] = balance
+    save_settings(settings)
+    account = default_account(balance)
+    _write_json(POSITIONS_PATH, [])
+    _write_json(ORDERS_PATH, [])
+    _write_json(HISTORY_JSON_PATH, [])
+    _write_json(LOG_PATH, [])
+    _write_json(EQUITY_JSON_PATH, [])
+    if HISTORY_CSV_PATH.exists():
+        HISTORY_CSV_PATH.unlink()
+    if EQUITY_CSV_PATH.exists():
+        EQUITY_CSV_PATH.unlink()
+    save_sim_account(account)
+    log_sim_event("模拟账户重置", content=f"初始资金重置为 {balance:.2f} USDT")
+    return account
+
+
+def clear_sim_history() -> None:
+    """清空模拟交易历史，保留账户、订单和持仓。"""
+    _write_json(HISTORY_JSON_PATH, [])
+    if HISTORY_CSV_PATH.exists():
+        HISTORY_CSV_PATH.unlink()
+    log_sim_event("清空模拟历史", content="用户清空模拟交易历史。")
+
+
+def load_positions() -> list[dict[str, Any]]:
+    data = _read_json(POSITIONS_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def save_positions(positions: list[dict[str, Any]]) -> None:
+    _write_json(POSITIONS_PATH, positions)
+
+
+def load_orders() -> list[dict[str, Any]]:
+    data = _read_json(ORDERS_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def save_orders(orders: list[dict[str, Any]]) -> None:
+    _write_json(ORDERS_PATH, orders)
+
+
+def get_open_positions() -> list[dict[str, Any]]:
+    return [p for p in load_positions() if p.get("status") in {"open", "partially_closed"}]
+
+
+def get_pending_orders() -> list[dict[str, Any]]:
+    return [o for o in load_orders() if o.get("status") == "pending"]
+
+
+def get_closed_trades() -> list[dict[str, Any]]:
+    return load_sim_trade_history()
+
+
+def calculate_used_margin(positions: list[dict[str, Any]] | None = None) -> float:
+    return sum(_to_float(p.get("margin_usdt"), 0) for p in (positions or get_open_positions()))
+
+
+def calculate_total_exposure(positions: list[dict[str, Any]] | None = None) -> float:
+    return sum(_to_float(p.get("notional_usdt"), 0) for p in (positions or get_open_positions()))
+
+
+def calculate_long_short_exposure(positions: list[dict[str, Any]] | None = None) -> tuple[float, float]:
+    long_exposure = 0.0
+    short_exposure = 0.0
+    for position in positions or get_open_positions():
+        notional = _to_float(position.get("notional_usdt"), 0)
+        if position.get("direction") == "short":
+            short_exposure += notional
+        else:
+            long_exposure += notional
+    return long_exposure, short_exposure
+
+
+def calculate_account_drawdown(account: dict[str, Any]) -> tuple[float, float]:
+    equity = _to_float(account.get("equity"), 0)
+    max_equity = max(_to_float(account.get("max_equity"), equity), equity)
+    current = (max_equity - equity) / max_equity * 100 if max_equity else 0.0
+    return current, max(_to_float(account.get("max_drawdown"), 0), current)
+
+
+def calculate_available_balance(account: dict[str, Any], positions: list[dict[str, Any]] | None = None) -> float:
+    used = calculate_used_margin(positions)
+    equity = _to_float(account.get("equity"), 0)
+    return max(0.0, equity - used)
+
+
+def enrich_sim_account(account: dict[str, Any] | None, positions: list[dict[str, Any]] | None = None, orders: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    account = dict(account or default_account())
+    positions = positions if positions is not None else get_open_positions()
+    orders = orders if orders is not None else get_pending_orders()
+    unrealized = sum(_to_float(p.get("unrealized_pnl"), 0) for p in positions)
+    used_margin = calculate_used_margin(positions)
+    long_exposure, short_exposure = calculate_long_short_exposure(positions)
+    account["used_margin"] = used_margin
+    account["total_exposure"] = long_exposure + short_exposure
+    account["long_exposure"] = long_exposure
+    account["short_exposure"] = short_exposure
+    account["unrealized_pnl"] = unrealized
+    account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized
+    account["equity"] = _to_float(account.get("available_balance"), 0) + used_margin + unrealized
+    account["max_equity"] = max(_to_float(account.get("max_equity"), account.get("initial_balance")), _to_float(account.get("equity"), 0))
+    account["current_drawdown"], account["max_drawdown"] = calculate_account_drawdown(account)
+    initial = _to_float(account.get("initial_balance"), 1)
+    account["return_pct"] = (account["equity"] - initial) / initial * 100 if initial else 0
+    account["open_position_count"] = len(positions)
+    account["pending_order_count"] = len(orders)
+    account["risk_status"] = "locked" if account.get("status") == "stopped" else "warning" if account["current_drawdown"] >= 5 or account["max_drawdown"] >= 8 else "normal"
+    account["last_update"] = _now()
+    return account
+
+
+def load_sim_trade_history() -> list[dict[str, Any]]:
+    data = _read_json(HISTORY_JSON_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def save_sim_trade_history(history: list[dict[str, Any]]) -> None:
+    _write_json(HISTORY_JSON_PATH, history[:1000])
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if history:
+        keys = sorted({key for row in history for key in row.keys()})
+        with HISTORY_CSV_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(history)
+
+
+def get_sim_equity_curve(limit: int | None = None) -> list[dict[str, Any]]:
+    data = _read_json(EQUITY_JSON_PATH, [])
+    rows = data if isinstance(data, list) else []
+    return rows[-limit:] if limit else rows
+
+
+def save_sim_equity_curve(rows: list[dict[str, Any]]) -> None:
+    rows = rows[-2000:]
+    _write_json(EQUITY_JSON_PATH, rows)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if rows:
+        keys = ["time", "equity", "available_balance", "used_margin", "unrealized_pnl", "realized_pnl", "total_pnl", "current_drawdown", "max_drawdown"]
+        with EQUITY_CSV_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=keys, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def append_equity_curve_point(account: dict[str, Any]) -> None:
+    rows = get_sim_equity_curve()
+    point = {
+        "time": _now(),
+        "equity": round(_to_float(account.get("equity"), 0), 8),
+        "available_balance": round(_to_float(account.get("available_balance"), 0), 8),
+        "used_margin": round(_to_float(account.get("used_margin"), 0), 8),
+        "unrealized_pnl": round(_to_float(account.get("unrealized_pnl"), 0), 8),
+        "realized_pnl": round(_to_float(account.get("realized_pnl"), 0), 8),
+        "total_pnl": round(_to_float(account.get("total_pnl"), 0), 8),
+        "current_drawdown": round(_to_float(account.get("current_drawdown"), 0), 8),
+        "max_drawdown": round(_to_float(account.get("max_drawdown"), 0), 8),
+    }
+    last = rows[-1] if rows else {}
+    if last and last.get("time") == point["time"] and last.get("equity") == point["equity"] and last.get("total_pnl") == point["total_pnl"]:
+        return
+    rows.append(point)
+    save_sim_equity_curve(rows)
+
+
+def load_sim_events(limit: int = 50) -> list[dict[str, Any]]:
+    data = _read_json(LOG_PATH, [])
+    return (data if isinstance(data, list) else [])[:limit]
+
+
+def get_committee_signals_for_simulation(limit: int = 20) -> list[dict[str, Any]]:
+    return get_committee_approved_signals(limit)
+
+
+def _rr_value(signal: dict[str, Any]) -> float:
+    rr = signal.get("risk_reward_ratio")
+    if isinstance(rr, str) and ":" in rr:
+        return _to_float(rr.split(":", 1)[1])
+    return _to_float(rr)
+
+
+def _position_pct(signal: dict[str, Any], settings: dict[str, Any]) -> float:
+    text = str(signal.get("position_suggestion", "0%"))
+    if "1%-3%" in text:
+        pct = 2.0
+    elif "3%-5%" in text:
+        pct = 4.0
+    elif "5%-10%" in text:
+        pct = 7.0
+    elif "10%-15%" in text:
+        pct = 10.0
+    else:
+        pct = 0.0
+    action = str(signal.get("action", ""))
+    if "轻仓" in action:
+        pct = min(pct, 3.0 if pct <= 4 else pct * 0.7)
+    risk_score = _to_float(signal.get("risk_score"), 50)
+    if risk_score >= 70:
+        pct = min(pct, 3.0)
+    return min(pct, float(settings.get("max_position_pct", 10)))
+
+
+def _entry_zone(signal: dict[str, Any], current_price: float) -> tuple[float, float]:
+    entry = signal.get("entry_zone") or {}
+    low = _to_float(entry.get("low"), 0)
+    high = _to_float(entry.get("high"), 0)
+    if low <= 0 or high <= 0:
+        return current_price, current_price
+    return min(low, high), max(low, high)
+
+
+def _price_field(data: dict[str, Any] | None) -> float:
+    return _to_float((data or {}).get("price"), 0)
+
+
+def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[str, float] | None = None) -> tuple[bool, list[str]]:
+    settings = load_settings()
+    account = load_sim_account()
+    positions = [p for p in load_positions() if p.get("status") in {"open", "partially_closed"}]
+    reasons: list[str] = []
+    symbol = str(signal.get("symbol", "")).upper()
+    action = str(signal.get("action", ""))
+    direction = str(signal.get("direction", ""))
+    if action not in {"轻仓试多", "顺势做多", "轻仓试空", "顺势做空"}:
+        reasons.append("委员会最终动作不属于可模拟开仓动作。")
+    if str(signal.get("trade_permission", "")) not in {"approved", "cautious", ""}:
+        reasons.append("委员会交易许可未通过。")
+    if signal.get("approved_for_simulation") is False:
+        reasons.append("委员会未批准进入模拟候选。")
+    if signal.get("veto_members"):
+        reasons.append("风险委员或其他委员已触发否决。")
+    if _to_float(signal.get("committee_confidence"), 0) < 60:
+        reasons.append("委员会置信度不足。")
+    if _rr_value(signal) and _rr_value(signal) < 1.2:
+        reasons.append("风险收益比低于1:1.2。")
+    if account.get("status") != "running":
+        reasons.append("模拟交易未处于运行状态。")
+    if settings.get("mode") == "observe":
+        reasons.append("当前为仅观察模式，不创建新订单。")
+    if direction == "long" and not settings.get("allow_long", True):
+        reasons.append("参数设置不允许模拟做多。")
+    if direction == "short" and not settings.get("allow_short", True):
+        reasons.append("参数设置不允许模拟做空。")
+    if len(positions) >= int(settings.get("max_positions", 3)):
+        reasons.append("当前持仓数量已达到上限。")
+    same_symbol = [p for p in positions if p.get("symbol") == symbol]
+    if len(same_symbol) >= int(settings.get("max_same_symbol_positions", 1)):
+        reasons.append(f"当前已持有 {symbol} 模拟仓位。")
+    same_order = [o for o in load_orders() if o.get("status") == "pending" and o.get("symbol") == symbol]
+    if same_order:
+        reasons.append(f"当前已有 {symbol} 待触发模拟订单。")
+    ignore_loss_limits = bool(settings.get("continuous_run", True) or settings.get("ignore_loss_limits", True))
+    if not ignore_loss_limits:
+        if _to_float(account.get("daily_pnl"), 0) <= -_to_float(account.get("initial_balance"), 1000) * _to_float(settings.get("daily_loss_limit_pct"), 3) / 100:
+            reasons.append("已达到每日最大亏损限制。")
+        if _to_float(account.get("max_drawdown"), 0) >= _to_float(settings.get("max_drawdown_limit_pct"), 8):
+            reasons.append("已达到最大回撤限制。")
+        if int(account.get("consecutive_losses", 0)) >= int(settings.get("consecutive_loss_pause", 3)):
+            reasons.append("连续亏损次数达到暂停阈值。")
+    if current_prices is not None and _to_float(current_prices.get(symbol), 0) <= 0:
+        reasons.append("当前价格不可用，无法创建模拟订单。")
+    return not reasons, reasons
+
+
+def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> dict[str, Any] | None:
+    settings = load_settings()
+    account = load_sim_account()
+    current_prices = {str(signal.get("symbol", "")).upper(): current_price}
+    ok, reasons = validate_signal_for_simulation(signal, current_prices)
+    if not ok:
+        log_sim_event("拒绝创建模拟订单", signal.get("symbol", ""), signal.get("direction", ""), current_price, reason="；".join(reasons))
+        return None
+    symbol = str(signal.get("symbol", "")).upper()
+    direction = str(signal.get("direction", "neutral"))
+    low, high = _entry_zone(signal, current_price)
+    pct = _position_pct(signal, settings)
+    if pct <= 0:
+        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason="仓位建议为0%。")
+        return None
+    margin = min(_to_float(account.get("available_balance"), 0), _to_float(account.get("equity"), 0) * pct / 100)
+    leverage = 5 if settings.get("futures_leverage_locked", True) else max(1, min(20, int(settings.get("leverage", 5))))
+    notional = margin * leverage
+    stop = _price_field(signal.get("stop_loss"))
+    tp1 = _price_field(signal.get("take_profit_1"))
+    tp2 = _price_field(signal.get("take_profit_2"))
+    if stop <= 0 or tp1 <= 0 or tp2 <= 0:
+        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason="止损或止盈价格不可用。")
+        return None
+    order = {
+        "order_id": f"sim_order_{int(time.time() * 1000)}",
+        "symbol": symbol,
+        "direction": direction,
+        "action": signal.get("action"),
+        "status": "pending",
+        "entry_zone_low": low,
+        "entry_zone_high": high,
+        "planned_entry_price": current_price if low <= current_price <= high else (low + high) / 2,
+        "stop_loss": stop,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "position_pct": signal.get("position_suggestion", "0%"),
+        "notional_usdt": notional,
+        "margin_usdt": margin,
+        "quantity": notional / current_price if current_price > 0 else 0,
+        "leverage": leverage,
+        "market_type": settings.get("market_type", "futures"),
+        "contract_type": "USDT_PERPETUAL" if settings.get("market_type") == "futures" else "SPOT_SIM",
+        "created_time": _now(),
+        "created_ts": _ts(),
+        "expired_time": datetime.fromtimestamp(_ts() + int(settings.get("signal_ttl_minutes", 60)) * 60).strftime("%Y-%m-%d %H:%M:%S"),
+        "expired_ts": _ts() + int(settings.get("signal_ttl_minutes", 60)) * 60,
+        "source": "AI交易委员会",
+        "committee_snapshot": signal,
+        "local_strategy_snapshot": {},
+        "reason": signal.get("chairman_summary", ""),
+    }
+    mode = str(settings.get("entry_mode", "等待入场区"))
+    if mode == "立即按当前价模拟开仓" or low <= current_price <= high:
+        order["status"] = "filled"
+        open_sim_position(order, current_price)
+        log_sim_event("模拟开仓", symbol, direction, current_price, content=f"由委员会信号触发，仓位 {margin:.2f} USDT。")
+    else:
+        orders = load_orders()
+        orders.insert(0, order)
+        save_orders(orders)
+        log_sim_event("创建待触发订单", symbol, direction, current_price, content=f"等待入场区 {low:.8f}-{high:.8f}")
+    return order
+
+
+def get_current_price(symbol: str, current_prices: dict[str, float] | None = None) -> float:
+    return _to_float((current_prices or {}).get(symbol), 0)
+
+
+def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
+    account = load_sim_account()
+    margin = _to_float(order.get("margin_usdt"), 0)
+    if margin > _to_float(account.get("available_balance"), 0):
+        log_sim_event("拒绝模拟开仓", order.get("symbol", ""), order.get("direction", ""), price, reason="可用余额不足。")
+        return {}
+    quantity = _to_float(order.get("notional_usdt"), 0) / price if price > 0 else 0
+    position = {
+        "position_id": f"sim_pos_{int(time.time() * 1000)}",
+        "symbol": order.get("symbol"),
+        "direction": order.get("direction"),
+        "status": "open",
+        "entry_price": price,
+        "current_price": price,
+        "quantity": quantity,
+        "margin_usdt": margin,
+        "notional_usdt": _to_float(order.get("notional_usdt"), 0),
+        "leverage": int(order.get("leverage", 1)),
+        "market_type": order.get("market_type", "futures"),
+        "contract_type": order.get("contract_type", "USDT_PERPETUAL"),
+        "open_time": _now(),
+        "open_ts": _ts(),
+        "update_time": _now(),
+        "stop_loss": _to_float(order.get("stop_loss"), 0),
+        "take_profit_1": _to_float(order.get("take_profit_1"), 0),
+        "take_profit_2": _to_float(order.get("take_profit_2"), 0),
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "moved_stop_to_breakeven": False,
+        "unrealized_pnl": 0.0,
+        "unrealized_pnl_pct": 0.0,
+        "realized_pnl": 0.0,
+        "risk_reward_ratio": order.get("committee_snapshot", {}).get("risk_reward_ratio"),
+        "committee_confidence": order.get("committee_snapshot", {}).get("committee_confidence"),
+        "committee_risk_score": order.get("committee_snapshot", {}).get("risk_score"),
+        "committee_action": order.get("committee_snapshot", {}).get("action"),
+        "local_strategy_action": "",
+        "invalid_condition": order.get("committee_snapshot", {}).get("invalid_condition"),
+        "open_reason": order.get("reason"),
+        "close_reason": "",
+        "committee_snapshot": order.get("committee_snapshot"),
+        "local_strategy_snapshot": order.get("local_strategy_snapshot"),
+    }
+    positions = load_positions()
+    positions.insert(0, position)
+    save_positions(positions)
+    account["available_balance"] = _to_float(account.get("available_balance"), 0) - margin
+    account["used_margin"] = _to_float(account.get("used_margin"), 0) + margin
+    save_sim_account(account)
+    try:
+        record_sim_open(position)
+    except Exception as exc:
+        log_sim_event("模拟交易数据库写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"开仓记录未写入SQLite：{exc!r}")
+    return position
+
+
+def calculate_unrealized_pnl(position: dict[str, Any], price: float) -> float:
+    entry = _to_float(position.get("entry_price"), 0)
+    qty = _to_float(position.get("quantity"), 0)
+    if entry <= 0 or qty <= 0:
+        return 0.0
+    if position.get("direction") == "short":
+        return (entry - price) * qty
+    return (price - entry) * qty
+
+
+def calculate_position_r_multiple(position: dict[str, Any], current_price: float | None = None) -> float | None:
+    entry = _to_float(position.get("entry_price"), 0)
+    price = _to_float(current_price if current_price is not None else position.get("current_price"), 0)
+    stop = _to_float(position.get("stop_loss"), 0)
+    if entry <= 0 or price <= 0 or stop <= 0:
+        return None
+    if position.get("direction") == "short":
+        risk_per_unit = stop - entry
+        reward_per_unit = entry - price
+    else:
+        risk_per_unit = entry - stop
+        reward_per_unit = price - entry
+    if risk_per_unit <= 0:
+        return None
+    return reward_per_unit / risk_per_unit
+
+
+def calculate_position_holding_time(position: dict[str, Any]) -> dict[str, Any]:
+    seconds = max(0, _ts() - int(position.get("open_ts", _ts())))
+    minutes = seconds // 60
+    if minutes < 60:
+        text = f"{minutes}分钟"
+    else:
+        text = f"{minutes // 60}小时{minutes % 60}分钟"
+    return {"seconds": seconds, "text": text}
+
+
+def calculate_position_pnl(position: dict[str, Any], current_price: float) -> dict[str, Any]:
+    pnl = calculate_unrealized_pnl(position, current_price)
+    margin = _to_float(position.get("margin_usdt"), 0)
+    notional = _to_float(position.get("notional_usdt"), 0)
+    r_multiple = calculate_position_r_multiple(position, current_price)
+    return {
+        "unrealized_pnl": pnl,
+        "unrealized_pnl_pct": pnl / margin * 100 if margin else 0,
+        "unrealized_pnl_pct_notional": pnl / notional * 100 if notional else 0,
+        "r_multiple": r_multiple,
+    }
+
+
+def calculate_realized_pnl(entry_price: float, exit_price: float, quantity: float, direction: str) -> float:
+    if direction == "short":
+        return (entry_price - exit_price) * quantity
+    return (exit_price - entry_price) * quantity
+
+
+def check_stop_loss(position: dict[str, Any], price: float) -> bool:
+    """检查是否触发模拟止损。"""
+    stop = _to_float(position.get("stop_loss"), 0)
+    direction = str(position.get("direction"))
+    return stop > 0 and ((direction == "long" and price <= stop) or (direction == "short" and price >= stop))
+
+
+def check_take_profit(position: dict[str, Any], price: float) -> str | None:
+    """检查模拟止盈层级。"""
+    direction = str(position.get("direction"))
+    tp1 = _to_float(position.get("take_profit_1"), 0)
+    tp2 = _to_float(position.get("take_profit_2"), 0)
+    if tp2 > 0 and ((direction == "long" and price >= tp2) or (direction == "short" and price <= tp2)):
+        return "tp2"
+    if not position.get("tp1_hit") and tp1 > 0 and ((direction == "long" and price >= tp1) or (direction == "short" and price <= tp1)):
+        return "tp1"
+    return None
+
+
+def check_signal_invalid(position: dict[str, Any]) -> tuple[bool, str]:
+    """预留本地策略/委员会信号失效检查。"""
+    snapshot = position.get("committee_snapshot") or {}
+    if snapshot.get("trade_permission") == "blocked":
+        return True, "委员会信号已变为禁止开仓。"
+    if snapshot.get("veto_members"):
+        return True, "委员会存在否决委员。"
+    return False, ""
+
+
+def check_committee_reversal(position: dict[str, Any]) -> tuple[bool, str]:
+    """预留委员会方向反转检查，本版本仅记录接口。"""
+    return False, ""
+
+
+def close_sim_position(position_id: str, reason: str, price: float, ratio: float = 1.0) -> dict[str, Any] | None:
+    positions = load_positions()
+    history = load_sim_trade_history()
+    account = load_sim_account()
+    ratio = max(0.0, min(1.0, ratio))
+    for position in positions:
+        if position.get("position_id") != position_id or position.get("status") not in {"open", "partially_closed"}:
+            continue
+        qty = _to_float(position.get("quantity"), 0)
+        close_qty = qty * ratio
+        close_notional = _to_float(position.get("notional_usdt"), 0) * ratio
+        pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), price, close_qty, str(position.get("direction")))
+        released_margin = _to_float(position.get("margin_usdt"), 0) * ratio
+        position["realized_pnl"] = _to_float(position.get("realized_pnl"), 0) + pnl
+        position["quantity"] = qty - close_qty
+        position["margin_usdt"] = _to_float(position.get("margin_usdt"), 0) - released_margin
+        position["notional_usdt"] = _to_float(position.get("notional_usdt"), 0) * (1 - ratio)
+        position["current_price"] = price
+        position["update_time"] = _now()
+        account["available_balance"] = _to_float(account.get("available_balance"), 0) + released_margin + pnl
+        account["used_margin"] = max(0.0, _to_float(account.get("used_margin"), 0) - released_margin)
+        account["realized_pnl"] = _to_float(account.get("realized_pnl"), 0) + pnl
+        account["daily_pnl"] = _to_float(account.get("daily_pnl"), 0) + pnl
+        if ratio >= 0.999 or position["quantity"] <= 0:
+            position["status"] = "closed"
+            position["close_reason"] = reason
+            trade = _history_row(position, price, pnl, reason, close_qty=close_qty, close_notional=close_notional)
+            history.insert(0, trade)
+            try:
+                record_sim_close(position, price, pnl, reason)
+            except Exception as exc:
+                log_sim_event("模拟交易数据库写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"平仓记录未写入SQLite：{exc!r}")
+            if pnl < 0:
+                account["consecutive_losses"] = int(account.get("consecutive_losses", 0)) + 1
+            else:
+                account["consecutive_losses"] = 0
+        else:
+            position["status"] = "partially_closed"
+        account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + _to_float(account.get("unrealized_pnl"), 0)
+        account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + _to_float(account.get("unrealized_pnl"), 0)
+        save_positions(positions)
+        save_sim_account(account)
+        save_sim_trade_history(history)
+        log_sim_event("模拟平仓" if ratio >= 0.999 else "模拟部分平仓", position.get("symbol", ""), position.get("direction", ""), price, content=f"盈亏 {pnl:.2f} USDT", reason=reason)
+        return position
+    return None
+
+
+def partial_close_sim_position(position_id: str, ratio: float, reason: str, price: float) -> dict[str, Any] | None:
+    return close_sim_position(position_id, reason, price, ratio)
+
+
+def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason: str, close_qty: float | None = None, close_notional: float | None = None) -> dict[str, Any]:
+    entry = _to_float(position.get("entry_price"), 0)
+    notional = _to_float(close_notional, 0) if close_notional is not None else _to_float(position.get("notional_usdt"), 0)
+    r_multiple = calculate_position_r_multiple(position, exit_price)
+    snapshot = position.get("committee_snapshot") or {}
+    local_snapshot = position.get("local_strategy_snapshot") or {}
+    return {
+        "trade_id": position.get("position_id"),
+        "symbol": position.get("symbol"),
+        "direction": position.get("direction"),
+        "open_time": position.get("open_time"),
+        "close_time": _now(),
+        "holding_seconds": max(0, _ts() - int(position.get("open_ts", _ts()))),
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "quantity": close_qty if close_qty is not None else position.get("quantity"),
+        "notional_usdt": notional,
+        "leverage": position.get("leverage"),
+        "pnl": pnl,
+        "pnl_pct": pnl / notional * 100 if notional else 0,
+        "r_multiple": r_multiple if r_multiple is not None else "",
+        "is_win": pnl > 0,
+        "close_reason": reason,
+        "strategy_name": local_snapshot.get("strategy_name") or snapshot.get("strategy_name") or "",
+        "committee_action": position.get("committee_action"),
+        "committee_confidence": position.get("committee_confidence"),
+        "committee_risk_score": position.get("committee_risk_score"),
+        "local_strategy_action": position.get("local_strategy_action"),
+        "risk_reward_ratio": position.get("risk_reward_ratio"),
+        "chairman_summary": snapshot.get("chairman_summary"),
+        "main_reasons": snapshot.get("main_reasons"),
+        "main_risks": snapshot.get("main_risks"),
+        "committee_snapshot": snapshot,
+        "external_ai_snapshot": snapshot.get("external_ai") or snapshot.get("external_ai_snapshot") or {},
+        "local_strategy_snapshot": local_snapshot,
+        "tp1_hit": bool(position.get("tp1_hit")),
+        "tp2_hit": bool(position.get("tp2_hit")) or "止盈2" in reason,
+        "stop_loss_hit": "止损" in reason,
+        "manual_close": "用户" in reason or "手动" in reason,
+    }
+
+
+def check_pending_orders(current_prices: dict[str, float]) -> None:
+    orders = load_orders()
+    remaining: list[dict[str, Any]] = []
+    for order in orders:
+        if order.get("status") != "pending":
+            remaining.append(order)
+            continue
+        symbol = str(order.get("symbol", ""))
+        price = get_current_price(symbol, current_prices)
+        if _ts() > int(order.get("expired_ts", 0)):
+            order["status"] = "expired"
+            log_sim_event("订单过期", symbol, order.get("direction", ""), price, reason="超过信号有效期未触发。")
+            continue
+        if price <= 0:
+            remaining.append(order)
+            continue
+        low = _to_float(order.get("entry_zone_low"), 0)
+        high = _to_float(order.get("entry_zone_high"), 0)
+        if low <= price <= high:
+            order["status"] = "filled"
+            open_sim_position(order, price)
+            log_sim_event("订单触发", symbol, order.get("direction", ""), price, content="价格进入委员会入场区。")
+        else:
+            remaining.append(order)
+    save_orders(remaining)
+
+
+def update_sim_positions(current_prices: dict[str, float]) -> None:
+    positions = load_positions()
+    account = load_sim_account()
+    unrealized_total = 0.0
+    external_position_change = False
+    for position in positions:
+        if position.get("status") not in {"open", "partially_closed"}:
+            continue
+        symbol = str(position.get("symbol", ""))
+        price = get_current_price(symbol, current_prices)
+        if price <= 0:
+            continue
+        pnl_info = calculate_position_pnl(position, price)
+        pnl = _to_float(pnl_info.get("unrealized_pnl"), 0)
+        position["current_price"] = price
+        position["unrealized_pnl"] = pnl
+        position["unrealized_pnl_pct"] = _to_float(pnl_info.get("unrealized_pnl_pct"), 0)
+        position["unrealized_pnl_pct_notional"] = _to_float(pnl_info.get("unrealized_pnl_pct_notional"), 0)
+        position["r_multiple"] = pnl_info.get("r_multiple")
+        position["holding_seconds"] = calculate_position_holding_time(position)["seconds"]
+        position["update_time"] = _now()
+        unrealized_total += pnl
+        direction = str(position.get("direction"))
+        if check_stop_loss(position, price):
+            close_sim_position(position["position_id"], "触发止损", price)
+            external_position_change = True
+            continue
+        take_profit_hit = check_take_profit(position, price)
+        if take_profit_hit == "tp1":
+            partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
+            position["tp1_hit"] = True
+            if load_settings().get("move_sl_to_breakeven", True):
+                position["stop_loss"] = _to_float(position.get("entry_price"), position.get("stop_loss"))
+                position["moved_stop_to_breakeven"] = True
+                log_sim_event("移动止损到保本", symbol, direction, price, reason="止盈1已触发。")
+            external_position_change = True
+        if take_profit_hit == "tp2":
+            position["tp2_hit"] = True
+            close_sim_position(position["position_id"], "触发止盈2", price)
+            external_position_change = True
+    if external_position_change:
+        positions = load_positions()
+        account = load_sim_account()
+        unrealized_total = 0.0
+        for open_position in positions:
+            if open_position.get("status") not in {"open", "partially_closed"}:
+                continue
+            price = get_current_price(str(open_position.get("symbol", "")), current_prices)
+            if price > 0:
+                unrealized_total += calculate_unrealized_pnl(open_position, price)
+    account["unrealized_pnl"] = unrealized_total
+    account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized_total
+    account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + unrealized_total
+    account["max_equity"] = max(_to_float(account.get("max_equity"), account.get("initial_balance")), _to_float(account.get("equity"), 0))
+    max_equity = _to_float(account.get("max_equity"), 0)
+    account["max_drawdown"] = max(_to_float(account.get("max_drawdown"), 0), (max_equity - _to_float(account.get("equity"), 0)) / max_equity * 100 if max_equity else 0)
+    account["return_pct"] = (account["equity"] - _to_float(account.get("initial_balance"), 0)) / _to_float(account.get("initial_balance"), 1) * 100
+    save_positions(positions)
+    save_sim_account(account)
+
+
+def process_committee_signals(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    settings = load_settings()
+    account = load_sim_account()
+    signals = signals if signals is not None else get_committee_signals_for_simulation()
+    results: list[dict[str, Any]] = []
+    if account.get("status") != "running" or settings.get("mode") == "observe":
+        return [{"status": "skipped", "reason": "模拟交易未运行或处于仅观察模式。"}]
+    existing_orders = [o for o in load_orders() if o.get("status") == "pending"]
+    for signal in signals[:10]:
+        symbol = str(signal.get("symbol", "")).upper()
+        if any(o.get("symbol") == symbol for o in existing_orders):
+            results.append({"symbol": symbol, "status": "rejected", "reason": "当前已有待触发模拟订单。"})
+            continue
+        price = get_current_price(symbol, current_prices)
+        ok, reasons = validate_signal_for_simulation(signal, current_prices)
+        if not ok:
+            results.append({"symbol": symbol, "status": "rejected", "reason": "；".join(reasons)})
+            continue
+        order = create_pending_sim_order(signal, price)
+        results.append({"symbol": symbol, "status": "created" if order else "rejected", "reason": "已创建模拟订单。" if order else "模拟订单创建失败。"})
+    return results
+
+
+def update_simulation(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    check_pending_orders(current_prices)
+    update_sim_positions(current_prices)
+    process_results = process_committee_signals(current_prices, signals)
+    return get_sim_account_summary(process_results=process_results)
+
+
+def set_sim_status(status: str) -> dict[str, Any]:
+    account = load_sim_account()
+    account["status"] = status
+    save_sim_account(account)
+    log_sim_event("模拟交易状态变更", content=f"状态变更为 {status}")
+    return account
+
+
+def cancel_order(order_id: str, reason: str = "用户取消待触发订单") -> None:
+    orders = load_orders()
+    kept: list[dict[str, Any]] = []
+    for order in orders:
+        if order.get("order_id") == order_id:
+            log_sim_event("订单取消", order.get("symbol", ""), order.get("direction", ""), None, reason=reason)
+        else:
+            kept.append(order)
+    save_orders(kept)
+
+
+def move_stop_to_breakeven(position_id: str) -> None:
+    positions = load_positions()
+    for position in positions:
+        if position.get("position_id") == position_id and position.get("status") in {"open", "partially_closed"}:
+            position["stop_loss"] = _to_float(position.get("entry_price"), position.get("stop_loss"))
+            position["moved_stop_to_breakeven"] = True
+            log_sim_event("移动止损到保本", position.get("symbol", ""), position.get("direction", ""), position.get("current_price"), reason="用户手动移动。")
+    save_positions(positions)
+
+
+def calculate_sim_stats() -> dict[str, Any]:
+    history = load_sim_trade_history()
+    wins = [row for row in history if row.get("is_win")]
+    losses = [row for row in history if not row.get("is_win")]
+    pnl_values = [_to_float(row.get("pnl"), 0) for row in history]
+    total_profit = sum(v for v in pnl_values if v > 0)
+    total_loss = abs(sum(v for v in pnl_values if v < 0))
+    long_rows = [row for row in history if row.get("direction") == "long"]
+    short_rows = [row for row in history if row.get("direction") == "short"]
+    r_values = [_to_float(row.get("r_multiple"), 0) for row in history if row.get("r_multiple") not in {"", None}]
+    holding_values = [_to_float(row.get("holding_seconds"), 0) for row in history]
+    reason_counts: dict[str, int] = {}
+    symbol_pnl: dict[str, float] = {}
+    consecutive_wins = 0
+    consecutive_losses = 0
+    for row in history:
+        reason = str(row.get("close_reason") or "未知原因")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        symbol = str(row.get("symbol") or "")
+        if symbol:
+            symbol_pnl[symbol] = symbol_pnl.get(symbol, 0.0) + _to_float(row.get("pnl"), 0)
+    for row in history:
+        if row.get("is_win"):
+            consecutive_wins += 1
+            if consecutive_losses == 0:
+                continue
+        break
+    for row in history:
+        if not row.get("is_win"):
+            consecutive_losses += 1
+            if consecutive_wins == 0:
+                continue
+        break
+    best_symbol = max(symbol_pnl.items(), key=lambda item: item[1])[0] if symbol_pnl else "暂无"
+    worst_symbol = min(symbol_pnl.items(), key=lambda item: item[1])[0] if symbol_pnl else "暂无"
+    common_reason = max(reason_counts.items(), key=lambda item: item[1])[0] if reason_counts else "暂无"
+    return {
+        "total_trades": len(history),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(history) * 100 if history else 0,
+        "total_pnl": sum(pnl_values),
+        "max_win": max(pnl_values) if pnl_values else 0,
+        "max_loss": min(pnl_values) if pnl_values else 0,
+        "avg_win": total_profit / len(wins) if wins else 0,
+        "avg_loss": -total_loss / len(losses) if losses else 0,
+        "profit_factor": total_profit / total_loss if total_loss else (total_profit if total_profit else 0),
+        "avg_holding_seconds": sum(holding_values) / len(holding_values) if holding_values else 0,
+        "avg_r_multiple": sum(r_values) / len(r_values) if r_values else 0,
+        "consecutive_wins": consecutive_wins,
+        "consecutive_losses": consecutive_losses,
+        "long_win_rate": len([r for r in long_rows if r.get("is_win")]) / len(long_rows) * 100 if long_rows else 0,
+        "short_win_rate": len([r for r in short_rows if r.get("is_win")]) / len(short_rows) * 100 if short_rows else 0,
+        "common_close_reason": common_reason,
+        "best_symbol": best_symbol,
+        "worst_symbol": worst_symbol,
+        "recent_10": history[:10],
+    }
+
+
+def calculate_account_risk_summary(account: dict[str, Any] | None = None, positions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    account = account or load_sim_account()
+    positions = positions if positions is not None else get_open_positions()
+    initial = _to_float(account.get("initial_balance"), 1)
+    total_stop_loss = 0.0
+    max_single_loss = 0.0
+    for position in positions:
+        entry = _to_float(position.get("entry_price"), 0)
+        stop = _to_float(position.get("stop_loss"), 0)
+        qty = _to_float(position.get("quantity"), 0)
+        if entry <= 0 or stop <= 0 or qty <= 0:
+            continue
+        if position.get("direction") == "short":
+            loss = max(0.0, (stop - entry) * qty)
+        else:
+            loss = max(0.0, (entry - stop) * qty)
+        total_stop_loss += loss
+        max_single_loss = max(max_single_loss, loss)
+    risk_pct = total_stop_loss / initial * 100 if initial else 0
+    daily_limit = initial * _to_float(load_settings().get("daily_loss_limit_pct"), 3) / 100
+    allowed = account.get("status") == "running" and account.get("risk_status") != "locked"
+    status = "警戒" if risk_pct >= 3 or _to_float(account.get("current_drawdown"), 0) >= 5 else "正常"
+    if not allowed:
+        status = "锁定"
+    return {
+        "status": status,
+        "total_risk_usdt": total_stop_loss,
+        "total_risk_pct": risk_pct,
+        "max_single_loss": max_single_loss,
+        "daily_loss_limit_usdt": daily_limit,
+        "available_balance_ok": _to_float(account.get("available_balance"), 0) > 0,
+        "near_drawdown_limit": _to_float(account.get("max_drawdown"), 0) >= _to_float(load_settings().get("max_drawdown_limit_pct"), 8) * 0.8,
+        "allow_new_position": allowed,
+        "explanation": "当前模拟账户风险处于正常范围。" if status == "正常" else "当前模拟账户风险偏高或交易状态未运行，建议暂停新增模拟仓位。",
+    }
+
+
+def get_position_detail(position_id: str) -> dict[str, Any] | None:
+    for position in load_positions():
+        if position.get("position_id") == position_id:
+            detail = dict(position)
+            detail["holding_time"] = calculate_position_holding_time(position)
+            detail["r_multiple"] = calculate_position_r_multiple(position)
+            detail["events"] = [e for e in load_sim_events(200) if e.get("symbol") == position.get("symbol")][:20]
+            return detail
+    return None
+
+
+def get_trade_history_summary() -> dict[str, Any]:
+    return calculate_sim_stats()
+
+
+def get_recent_trade_results(limit: int = 10) -> list[dict[str, Any]]:
+    return load_sim_trade_history()[:limit]
+
+
+def calculate_sim_performance_stats() -> dict[str, Any]:
+    stats = calculate_sim_stats()
+    account = enrich_sim_account(load_sim_account())
+    stats.update(
+        {
+            "current_equity": account.get("equity", 0),
+            "current_drawdown": account.get("current_drawdown", 0),
+            "max_drawdown": account.get("max_drawdown", 0),
+            "current_unrealized_pnl": account.get("unrealized_pnl", 0),
+            "open_position_count": account.get("open_position_count", 0),
+            "pending_order_count": account.get("pending_order_count", 0),
+            "return_pct": account.get("return_pct", 0),
+            "daily_pnl": account.get("daily_pnl", 0),
+        }
+    )
+    return stats
+
+
+def get_sim_account_summary(process_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    positions = load_positions()
+    orders = load_orders()
+    open_positions = [p for p in positions if p.get("status") in {"open", "partially_closed"}]
+    pending_orders = [o for o in orders if o.get("status") == "pending"]
+    account = enrich_sim_account(load_sim_account(), open_positions, pending_orders)
+    history = load_sim_trade_history()
+    stats = calculate_sim_performance_stats()
+    risk_summary = calculate_account_risk_summary(account, open_positions)
+    return {
+        "account": account,
+        "settings": load_settings(),
+        "positions": positions,
+        "orders": orders,
+        "history": history,
+        "equity_curve": get_sim_equity_curve(300),
+        "risk_summary": risk_summary,
+        "events": load_sim_events(30),
+        "stats": stats,
+        "process_results": process_results or [],
+        "safety_notice": "当前为模拟交易，不会使用真实资金，不会执行真实订单。",
+    }

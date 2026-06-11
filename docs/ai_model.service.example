@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Model Streamlit Service
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/ai_model
+ExecStart=/opt/ai_model/venv/bin/python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/ai_model/.env
+StandardOutput=append:/opt/ai_model/logs/systemd.log
+StandardError=append:/opt/ai_model/logs/systemd_error.log
+
+[Install]
+WantedBy=multi-user.target

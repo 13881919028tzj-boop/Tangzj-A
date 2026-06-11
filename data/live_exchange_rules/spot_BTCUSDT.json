@@ -1,0 +1,76 @@
+{
+  "ok": true,
+  "symbol": "BTCUSDT",
+  "status": "TRADING",
+  "baseAsset": "BTC",
+  "quoteAsset": "USDT",
+  "tickSize": 0.01,
+  "minPrice": 0.01,
+  "stepSize": 1e-05,
+  "minQty": 1e-05,
+  "maxQty": 9000.0,
+  "minNotional": 5.0,
+  "raw_filters": {
+    "PRICE_FILTER": {
+      "filterType": "PRICE_FILTER",
+      "minPrice": "0.01000000",
+      "maxPrice": "1000000.00000000",
+      "tickSize": "0.01000000"
+    },
+    "LOT_SIZE": {
+      "filterType": "LOT_SIZE",
+      "minQty": "0.00001000",
+      "maxQty": "9000.00000000",
+      "stepSize": "0.00001000"
+    },
+    "ICEBERG_PARTS": {
+      "filterType": "ICEBERG_PARTS",
+      "limit": 100
+    },
+    "MARKET_LOT_SIZE": {
+      "filterType": "MARKET_LOT_SIZE",
+      "minQty": "0.00000000",
+      "maxQty": "161.52391330",
+      "stepSize": "0.00000000"
+    },
+    "TRAILING_DELTA": {
+      "filterType": "TRAILING_DELTA",
+      "minTrailingAboveDelta": 10,
+      "maxTrailingAboveDelta": 2000,
+      "minTrailingBelowDelta": 10,
+      "maxTrailingBelowDelta": 2000
+    },
+    "PERCENT_PRICE_BY_SIDE": {
+      "filterType": "PERCENT_PRICE_BY_SIDE",
+      "bidMultiplierUp": "2",
+      "bidMultiplierDown": "0.5",
+      "askMultiplierUp": "2",
+      "askMultiplierDown": "0.5",
+      "avgPriceMins": 5
+    },
+    "NOTIONAL": {
+      "filterType": "NOTIONAL",
+      "minNotional": "5.00000000",
+      "applyMinToMarket": true,
+      "maxNotional": "9000000.00000000",
+      "applyMaxToMarket": false,
+      "avgPriceMins": 5
+    },
+    "MAX_NUM_ORDERS": {
+      "filterType": "MAX_NUM_ORDERS",
+      "maxNumOrders": 200
+    },
+    "MAX_NUM_ORDER_LISTS": {
+      "filterType": "MAX_NUM_ORDER_LISTS",
+      "maxNumOrderLists": 20
+    },
+    "MAX_NUM_ALGO_ORDERS": {
+      "filterType": "MAX_NUM_ALGO_ORDERS",
+      "maxNumAlgoOrders": 5
+    },
+    "MAX_NUM_ORDER_AMENDS": {
+      "filterType": "MAX_NUM_ORDER_AMENDS",
+      "maxNumOrderAmends": 10
+    }
+  }
+}

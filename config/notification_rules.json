@@ -1,0 +1,25 @@
+{
+  "enabled": false,
+  "channels": {
+    "system": true,
+    "telegram": false,
+    "email": false,
+    "webhook": false,
+    "push": false,
+    "wechat": false
+  },
+  "notify_on_approval": true,
+  "notify_on_risk": true,
+  "approval_notifications": true,
+  "risk_notifications": true,
+  "live_notifications": true,
+  "sim_notifications": false,
+  "server_notifications": true,
+  "auto_live_notifications": true,
+  "external_ai_notifications": true,
+  "only_high_priority": false,
+  "mute_low_priority": true,
+  "dedupe_minutes": 5,
+  "retention_days": 90,
+  "auto_archive_read": false
+}
