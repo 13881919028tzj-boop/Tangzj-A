@@ -1,10 +1,13 @@
 """后台 Binance 公共行情刷新服务。
 
 刷新频率：
-- 当前交易对象行情：1秒
-- 当前交易对象 K线：1秒推动最新蜡烛，完整K线低频补齐
-- 所有市场榜单与机会榜完整扫描：3秒
-- 当前交易对象和顶部行情：1秒
+- 优先币种行情：5秒
+- 当前交易对象 K线：5秒完整补齐，ticker 推动最新蜡烛
+- 盘口：1秒
+- 大单：5秒
+- 轻量榜单与机会榜：10秒
+- 观察池同步与TOP10快速预判：30秒
+- 模拟/实盘自动循环入口：60秒
 - 全部 USDT 交易对象列表：启动时加载，后续每30分钟刷新一次
 
 本模块不访问 Streamlit session_state，避免 SessionInfo/runtime 问题。
@@ -160,7 +163,14 @@ def refresh_whales_now(symbol: str) -> None:
         market_cache.set_whale_error("大单数据获取失败，请稍后重试。")
 
 
-def _refresh_rankings(symbols: list[str]) -> None:
+def _refresh_rankings(
+    symbols: list[str],
+    *,
+    sync_watchlist: bool = False,
+    run_fast_precheck: bool = False,
+    run_simulation: bool = False,
+    run_live_auto: bool = False,
+) -> None:
     """刷新市场榜单。"""
     try:
         valid_symbols = set(symbols)
@@ -180,22 +190,26 @@ def _refresh_rankings(symbols: list[str]) -> None:
         rankings.update(scan_market_opportunities(tickers))
         market_cache.set_rankings(rankings)
         _debug_log(LIVE_CACHE_LOG, f"rankings_refresh tickers={len(tickers)} ticker_cache_synced={synced}")
-        try:
-            sync_watchlist_from_rankings(rankings)
-        except Exception as watch_exc:
-            print(f"[观察池] 后台同步失败，不影响行情榜单。error={repr(watch_exc)}")
-        try:
-            process_top1_fast_opportunity(rankings)
-        except Exception as fast_exc:
-            print(f"[AI模型8.3.1.1] TOP1快速捕捉失败，不影响主行情。error={repr(fast_exc)}")
-        try:
-            run_auto_simulation_cycle(rankings)
-        except Exception as sim_exc:
-            print(f"[AI模型8.5] 后台自动模拟循环失败，不影响行情刷新。error={repr(sim_exc)}")
-        try:
-            run_live_auto_trading_cycle(rankings)
-        except Exception as live_auto_exc:
-            print(f"[AI模型9.0] 后台自动交易循环失败，不影响行情刷新。error={repr(live_auto_exc)}")
+        if sync_watchlist:
+            try:
+                sync_watchlist_from_rankings(rankings)
+            except Exception as watch_exc:
+                print(f"[观察池] 后台同步失败，不影响行情榜单。error={repr(watch_exc)}")
+        if run_fast_precheck:
+            try:
+                process_top1_fast_opportunity(rankings)
+            except Exception as fast_exc:
+                print(f"[AI模型8.3.1.1] TOP1快速捕捉失败，不影响主行情。error={repr(fast_exc)}")
+        if run_simulation:
+            try:
+                run_auto_simulation_cycle(rankings)
+            except Exception as sim_exc:
+                print(f"[AI模型8.5] 后台自动模拟循环失败，不影响行情刷新。error={repr(sim_exc)}")
+        if run_live_auto:
+            try:
+                run_live_auto_trading_cycle(rankings)
+            except Exception as live_auto_exc:
+                print(f"[AI模型9.0] 后台自动交易循环失败，不影响行情刷新。error={repr(live_auto_exc)}")
     except Exception as exc:
         print(f"[AI模型7.0.6] Binance榜单获取失败 error={repr(exc)}")
         market_cache.set_error("Binance行情获取失败，请检查网络或稍后重试。")
@@ -206,6 +220,10 @@ def _worker() -> None:
     symbols = []
     last_symbol_refresh = 0.0
     last_ranking_refresh = 0.0
+    last_watchlist_sync = 0.0
+    last_fast_precheck = 0.0
+    last_auto_simulation = 0.0
+    last_live_auto = 0.0
     while True:
         now = time.time()
         try:
@@ -215,10 +233,31 @@ def _worker() -> None:
 
             market_cache.mark_status_ok()
             fast_settings = get_fast_opportunity_settings()
-            ranking_seconds = max(60, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 60) or 60))
+            ranking_seconds = max(10, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 10) or 10))
+            watchlist_seconds = max(30, int(fast_settings.get("LIGHT_MARKET_SCAN_SECONDS", 30) or 30))
+            fast_precheck_seconds = max(30, int(fast_settings.get("COMMITTEE_FAST_PRECHECK_SECONDS", 30) or 30))
+            automation_seconds = 60
             if now - last_ranking_refresh >= ranking_seconds:
-                _refresh_rankings(symbols)
+                do_watchlist = now - last_watchlist_sync >= watchlist_seconds
+                do_fast = now - last_fast_precheck >= fast_precheck_seconds
+                do_sim = now - last_auto_simulation >= automation_seconds
+                do_live = now - last_live_auto >= automation_seconds
+                _refresh_rankings(
+                    symbols,
+                    sync_watchlist=do_watchlist,
+                    run_fast_precheck=do_fast,
+                    run_simulation=do_sim,
+                    run_live_auto=do_live,
+                )
                 last_ranking_refresh = now
+                if do_watchlist:
+                    last_watchlist_sync = now
+                if do_fast:
+                    last_fast_precheck = now
+                if do_sim:
+                    last_auto_simulation = now
+                if do_live:
+                    last_live_auto = now
         except Exception as exc:
             print(f"[AI模型7.0.6] 后台刷新异常 error={repr(exc)}")
             market_cache.set_error("Binance行情获取失败，请检查网络或稍后重试。")

@@ -30,13 +30,13 @@ DATA_DIR = BASE_DIR / "data"
 SETTINGS_PATH = DATA_DIR / "fast_opportunity_settings.json"
 
 DEFAULT_SETTINGS = {
-    "TOP10_OPPORTUNITY_REFRESH_SECONDS": 3,
+    "TOP10_OPPORTUNITY_REFRESH_SECONDS": 10,
     "TOP1_FAST_CAPTURE_SECONDS": 3,
-    "COMMITTEE_FAST_PRECHECK_SECONDS": 3,
+    "COMMITTEE_FAST_PRECHECK_SECONDS": 30,
     "COMMITTEE_FULL_REVIEW_SECONDS": 15,
     "EXTERNAL_AI_REFRESH_SECONDS": 90,
     "LIGHT_MARKET_SCAN_SECONDS": 30,
-    "DEEP_MARKET_SCAN_SECONDS": 120,
+    "DEEP_MARKET_SCAN_SECONDS": 60,
     "OPPORTUNITY_TRIGGER_SCORE": 80,
     "COMMITTEE_TARGET_MIN_STABLE_CYCLES": 2,
     "COMMITTEE_TARGET_SWITCH_SCORE_GAP": 5,
@@ -131,7 +131,10 @@ def load_fast_opportunity_settings() -> dict[str, Any]:
         if not isinstance(loaded, dict):
             return dict(DEFAULT_SETTINGS)
         merged = {**DEFAULT_SETTINGS, **loaded}
-        merged["TOP10_OPPORTUNITY_REFRESH_SECONDS"] = max(3, int(_to_int(merged.get("TOP10_OPPORTUNITY_REFRESH_SECONDS"), 3)))
+        merged["TOP10_OPPORTUNITY_REFRESH_SECONDS"] = max(10, int(_to_int(merged.get("TOP10_OPPORTUNITY_REFRESH_SECONDS"), 10)))
+        merged["COMMITTEE_FAST_PRECHECK_SECONDS"] = max(30, int(_to_int(merged.get("COMMITTEE_FAST_PRECHECK_SECONDS"), 30)))
+        merged["LIGHT_MARKET_SCAN_SECONDS"] = max(30, int(_to_int(merged.get("LIGHT_MARKET_SCAN_SECONDS"), 30)))
+        merged["DEEP_MARKET_SCAN_SECONDS"] = max(60, int(_to_int(merged.get("DEEP_MARKET_SCAN_SECONDS"), 60)))
         merged["OPPORTUNITY_DUPLICATE_COOLDOWN_SECONDS"] = 120
         merged["COMMITTEE_REVIEW_TOP_N"] = max(10, int(_to_int(merged.get("COMMITTEE_REVIEW_TOP_N"), 10)))
         merged["FULL_REVIEW_TOP_N"] = max(10, int(_to_int(merged.get("FULL_REVIEW_TOP_N"), 10)))

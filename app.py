@@ -2071,7 +2071,7 @@ def render_fast_opportunity_panel() -> None:
             <div class="metric-box"><div class="metric-label">快速评分</div><div class="metric-value green">{int(capture.get("fast_score", status.get("target_score", 0)) or 0)}</div></div>
             <div class="metric-box"><div class="metric-label">快速捕捉</div><div class="metric-value {'green' if capture_state == '通过' else 'yellow'}">{capture_state}</div></div>
             <div class="metric-box"><div class="metric-label">委员会预判</div><div class="metric-value {'green' if precheck_state == '进入候选' else 'yellow'}">{escape(str(precheck_state))}</div></div>
-            <div class="metric-box"><div class="metric-label">完整复核</div><div class="metric-value yellow">{int(settings.get("COMMITTEE_FULL_REVIEW_SECONDS", 15))}秒周期</div></div>
+            <div class="metric-box"><div class="metric-label">榜单刷新</div><div class="metric-value yellow">{int(settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 10))}秒</div></div>
             <div class="metric-box"><div class="metric-label">触发阈值</div><div class="metric-value blue">{int(settings.get("OPPORTUNITY_TRIGGER_SCORE", 80))}分</div></div>
           </div>
           <div class="module-desc" style="margin-top:8px;">
@@ -2089,9 +2089,9 @@ def render_fast_opportunity_panel() -> None:
         new_settings["ENABLE_FAST_COMMITTEE_PRECHECK"] = s2.checkbox("启用委员会快速预判", value=bool(settings.get("ENABLE_FAST_COMMITTEE_PRECHECK", True)))
         new_settings["ENABLE_COMMITTEE_ANCHOR_TOP1"] = st.checkbox("委员会当前交易对象自动锚定TOP1", value=bool(settings.get("ENABLE_COMMITTEE_ANCHOR_TOP1", True)))
         c1, c2, c3 = st.columns(3)
-        new_settings["TOP10_OPPORTUNITY_REFRESH_SECONDS"] = c1.number_input("TOP10刷新秒数", min_value=3, max_value=30, value=int(settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 3)), step=1)
+        new_settings["TOP10_OPPORTUNITY_REFRESH_SECONDS"] = c1.number_input("TOP10刷新秒数", min_value=10, max_value=60, value=int(settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 10)), step=5)
         new_settings["TOP1_FAST_CAPTURE_SECONDS"] = c2.number_input("TOP1捕捉秒数", min_value=3, max_value=30, value=int(settings.get("TOP1_FAST_CAPTURE_SECONDS", 3)), step=1)
-        new_settings["COMMITTEE_FAST_PRECHECK_SECONDS"] = c3.number_input("快速预判秒数", min_value=3, max_value=30, value=int(settings.get("COMMITTEE_FAST_PRECHECK_SECONDS", 3)), step=1)
+        new_settings["COMMITTEE_FAST_PRECHECK_SECONDS"] = c3.number_input("快速预判秒数", min_value=30, max_value=120, value=int(settings.get("COMMITTEE_FAST_PRECHECK_SECONDS", 30)), step=10)
         c4, c5, c6 = st.columns(3)
         new_settings["COMMITTEE_FULL_REVIEW_SECONDS"] = c4.number_input("完整复核秒数", min_value=10, max_value=120, value=int(settings.get("COMMITTEE_FULL_REVIEW_SECONDS", 15)), step=5)
         new_settings["OPPORTUNITY_TRIGGER_SCORE"] = c5.number_input("机会触发分数", min_value=60, max_value=95, value=int(settings.get("OPPORTUNITY_TRIGGER_SCORE", 80)), step=1)
@@ -4612,9 +4612,25 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
     live_symbol = st.session_state.get("current_symbol", symbol)
     live_ticker = market_cache.get_ticker(live_symbol) or ticker
-    render_kline_system(live_symbol)
-    render_orderbook_system(live_symbol, live_ticker)
     if fragment:
+        if st.session_state.get("chart_interactive"):
+            render_kline_system(live_symbol)
+        else:
+            @fragment(run_every="8s")
+            def _live_kline_module() -> None:
+                live_symbol = st.session_state.get("current_symbol", symbol)
+                render_kline_system(live_symbol)
+
+            _live_kline_module()
+
+        @fragment(run_every="3s")
+        def _live_orderbook_module() -> None:
+            live_symbol = st.session_state.get("current_symbol", symbol)
+            live_ticker = market_cache.get_ticker(live_symbol) or ticker
+            render_orderbook_system(live_symbol, live_ticker)
+
+        _live_orderbook_module()
+
         @fragment(run_every="5s")
         def _live_signal_analysis() -> None:
             live_symbol = st.session_state.get("current_symbol", symbol)
@@ -4623,6 +4639,8 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
 
         _live_signal_analysis()
     else:
+        render_kline_system(live_symbol)
+        render_orderbook_system(live_symbol, live_ticker)
         render_signal_analysis(live_symbol, live_ticker)
 
 
