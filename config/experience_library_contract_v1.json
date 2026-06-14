@@ -1,0 +1,147 @@
+{
+  "contract_name": "AI_MODEL Experience Library Contract",
+  "contract_version": "experience_library_contract_v1",
+  "default_library_path": "/data/ai-training-data/experience_library/current/",
+  "recommended_formats": ["parquet", "jsonl", "json", "csv"],
+  "preferred_format": "parquet",
+  "required_files": {
+    "manifest": "experience_manifest.json",
+    "version": "experience_version.json",
+    "symbol_level_experience": "symbol_level_experience.parquet",
+    "group_level_experience": "group_level_experience.parquet",
+    "global_level_experience": "global_level_experience.parquet"
+  },
+  "compatible_alternative_extensions": [".jsonl", ".json", ".csv"],
+  "experience_levels": {
+    "symbol_level_experience": {
+      "scope_type": "SYMBOL",
+      "description": "同一个币种自己的历史相似状态经验"
+    },
+    "group_level_experience": {
+      "scope_type": "GROUP",
+      "description": "同类币种历史相似状态经验，单币种样本不足时优先补充"
+    },
+    "global_level_experience": {
+      "scope_type": "GLOBAL",
+      "description": "全市场通用规律和兜底参考"
+    }
+  },
+  "required_record_fields": {
+    "base": [
+      "experience_id",
+      "experience_version",
+      "generated_at",
+      "scope_type",
+      "symbol",
+      "symbol_group",
+      "state_code",
+      "state_vector_center",
+      "sample_count",
+      "avg_similarity",
+      "confidence",
+      "data_quality"
+    ],
+    "future_path": [
+      "future_30m_up_probability",
+      "future_30m_down_probability",
+      "future_30m_sideways_probability",
+      "future_60m_up_probability",
+      "future_60m_down_probability",
+      "future_60m_sideways_probability"
+    ],
+    "returns": [
+      "avg_return_30m",
+      "avg_return_60m",
+      "median_return_30m",
+      "median_return_60m"
+    ],
+    "mfe_mae": [
+      "mfe_p50",
+      "mfe_p75",
+      "mfe_p90",
+      "mae_p50",
+      "mae_p75",
+      "mae_p90"
+    ],
+    "position_advice": [
+      "suggested_stop_loss",
+      "suggested_take_profit_1",
+      "suggested_take_profit_2",
+      "suggested_trailing_stop",
+      "suggested_max_holding_minutes"
+    ],
+    "risk": [
+      "historical_max_drawdown",
+      "historical_loss_probability",
+      "trap_risk_avg",
+      "risk_score_avg"
+    ],
+    "applicability": [
+      "min_similarity_required",
+      "min_sample_count_required",
+      "applicable_market_regime",
+      "notes"
+    ],
+    "versions": [
+      "schema_version",
+      "state_language_version",
+      "cognition_model_version",
+      "weight_config_version",
+      "similarity_config_version"
+    ]
+  },
+  "query_required_fields": [
+    "symbol",
+    "symbol_group",
+    "state_code",
+    "state_vector",
+    "trend_direction",
+    "trend_strength",
+    "trend_quality_score",
+    "capital_score",
+    "structure_score",
+    "behavior_score",
+    "risk_score",
+    "risk_safe_score",
+    "demand_score",
+    "buy_demand_score",
+    "sell_supply_score",
+    "net_demand_score",
+    "urgency_score",
+    "sustainability_score",
+    "trap_risk_score",
+    "confidence",
+    "data_integrity_score"
+  ],
+  "experience_blending_rules": [
+    {
+      "condition": "symbol_level_similar_sample_count >= 300",
+      "symbol_level_weight": 0.6,
+      "group_level_weight": 0.25,
+      "global_level_weight": 0.15
+    },
+    {
+      "condition": "100 <= symbol_level_similar_sample_count < 300",
+      "symbol_level_weight": 0.35,
+      "group_level_weight": 0.45,
+      "global_level_weight": 0.2
+    },
+    {
+      "condition": "symbol_level_similar_sample_count < 100",
+      "symbol_level_weight": 0.1,
+      "group_level_weight": 0.6,
+      "global_level_weight": 0.3
+    },
+    {
+      "condition": "experience_library_missing",
+      "vote": "ABSTAIN",
+      "confidence": 0,
+      "data_integrity_score": 0
+    }
+  ],
+  "security_rules": [
+    "经验库不得包含 API key、secret、password、token。",
+    "经验库不得写入 GitHub，大文件保存在 /data/ai-training-data。",
+    "AI_MODEL 读取经验库时只读取清单和必要摘要，不能一次性加载巨大文件。"
+  ]
+}

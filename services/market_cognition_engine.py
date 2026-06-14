@@ -9,12 +9,13 @@ from services.demand_engine import analyze_demand, clamp
 from services.market_state_engine import build_market_state
 
 
-APP_VERSION = "AI模型 9.2 市场认知量化与经验库数据标准版"
+APP_VERSION = "AI模型 9.2.3 经验库数据契约与读取接口预留版"
 DATA_VERSION = "market_cognition_v1"
 SCHEMA_VERSION = "experience_sample_schema_v1"
 STATE_LANGUAGE_VERSION = "market_state_language_v1"
 COGNITION_MODEL_VERSION = "market_cognition_rule_based_v1"
 WEIGHT_CONFIG_VERSION = "market_cognition_weights_v1"
+SIMILARITY_CONFIG_VERSION = "cognition_similarity_weights_v1"
 PROBABILITY_TYPE = "rule_based_v1"
 
 
@@ -100,6 +101,9 @@ def _path_probabilities(demand: dict[str, Any], state: dict[str, Any]) -> tuple[
         "reason": "基于需求、趋势、资金、行为、结构和风险的规则概率；非历史经验统计。",
         "probability_type": PROBABILITY_TYPE,
     }
+    path_30m["up_probability"] = path_30m["up"]
+    path_30m["sideways_probability"] = path_30m["sideways"]
+    path_30m["down_probability"] = path_30m["down"]
 
     urgency = _to_float(demand.get("urgency_score"), 50)
     sustainable_shift = (sustainability - 50) * 0.08
@@ -119,7 +123,19 @@ def _path_probabilities(demand: dict[str, Any], state: dict[str, Any]) -> tuple[
         "reason": "60分钟概率在30分钟规则概率上加入持续性、紧迫度和风险衰减。",
         "probability_type": PROBABILITY_TYPE,
     }
+    path_60m["up_probability"] = path_60m["up"]
+    path_60m["sideways_probability"] = path_60m["sideways"]
+    path_60m["down_probability"] = path_60m["down"]
     return path_30m, path_60m
+
+
+def _capital_direction(capital_score: Any) -> str:
+    score = _to_float(capital_score, 50)
+    if score >= 58:
+        return "INFLOW"
+    if score <= 42:
+        return "OUTFLOW"
+    return "NEUTRAL"
 
 
 def _source_status(ticker: Any, rows: Any, orderbook_analysis: Any, whale: Any, derivatives: Any) -> dict[str, str]:
@@ -217,6 +233,7 @@ def build_market_cognition(
         "state_language_version": STATE_LANGUAGE_VERSION,
         "cognition_model_version": COGNITION_MODEL_VERSION,
         "weight_config_version": WEIGHT_CONFIG_VERSION,
+        "similarity_config_version": SIMILARITY_CONFIG_VERSION,
         **state,
         "risk_safe_score": round(risk_safe_score, 2),
         **{key: demand.get(key) for key in ("buy_demand_score", "sell_supply_score", "net_demand_score", "urgency_score", "sustainability_score", "trap_risk_score")},
@@ -225,6 +242,7 @@ def build_market_cognition(
             "trend_strength": state.get("trend_strength"),
             "trend_quality_score": state.get("trend_quality_score") or state.get("trend_score"),
             "capital_score": state.get("capital_score"),
+            "capital_direction": _capital_direction(state.get("capital_score")),
             "structure_score": state.get("structure_score"),
             "behavior_score": state.get("behavior_score"),
             "risk_score": state.get("risk_score"),
@@ -236,6 +254,8 @@ def build_market_cognition(
             "urgency_score": demand.get("urgency_score"),
             "sustainability_score": demand.get("sustainability_score"),
             "trap_risk_score": demand.get("trap_risk_score"),
+            "confidence": state.get("confidence"),
+            "data_integrity_score": state.get("data_integrity_score"),
         },
         "experience_match_key": {
             "state_code": state.get("state_code"),

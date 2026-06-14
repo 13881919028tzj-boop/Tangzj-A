@@ -26,6 +26,8 @@ from services.committee_types import (
     member_result,
     normalize_direction,
 )
+from services.experience_library_loader import get_default_experience_library_path, load_experience_library_summary
+from services.experience_matcher import build_experience_query_from_cognition, match_experience
 
 
 BASE_WEIGHTS = {
@@ -195,17 +197,32 @@ def _aggregate_old_votes(
 
 def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     cognition = data.get("market_cognition") or decision.get("market_cognition") or {}
+    symbol = str(decision.get("symbol") or data.get("symbol") or cognition.get("symbol") or "").upper()
+    ticker = data.get("ticker") or {}
     state_code = str(cognition.get("state_code") or "")
-    reason = "经验库未接入，当前版本弃权。"
+    query = build_experience_query_from_cognition(symbol, cognition, ticker=ticker)
+    library_summary = load_experience_library_summary()
+    match = match_experience(query)
+    library_path = library_summary.get("path") or get_default_experience_library_path()
+    reason = match.get("reason") or "经验库未接入，当前经验委员弃权。"
     if state_code:
-        reason = f"当前状态码 {state_code} 已生成；经验库未接入，等待9.4后参与投票。"
+        reason = f"当前状态码 {state_code} 已生成；{reason}"
+    if library_summary.get("warnings"):
+        reason = f"{reason}；{'; '.join(str(item) for item in library_summary.get('warnings', [])[:2])}"
     return {
         **abstain_member("经验委员", "experience", reason),
         "enabled": False,
-        "experience_library_version": "none",
+        "experience_library_available": bool(library_summary.get("available")),
+        "experience_library_path": library_path,
+        "experience_library_status": library_summary,
+        "experience_library_version": library_summary.get("experience_version") or "none",
         "sample_count": 0,
         "state_code": state_code,
+        "state_vector_summary": query.get("state_vector_summary"),
+        "symbol_group": query.get("symbol_group"),
+        "experience_query": query,
         "similar_sample_count": 0,
+        "matched_sample_count": 0,
         "win_rate_30m": None,
         "win_rate_60m": None,
         "avg_return_30m": None,
@@ -214,6 +231,7 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
         "max_profit": None,
         "experience_score": None,
         "experience_confidence": 0,
+        "match_result": match,
     }
 
 
@@ -427,7 +445,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2",
+        "version": "AI模型 9.2.3",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,

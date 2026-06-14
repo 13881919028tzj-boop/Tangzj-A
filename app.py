@@ -114,6 +114,12 @@ from services.manual_position_override import (
 )
 from services.market_cognition_engine import build_market_cognition
 from services.market_cognition_recorder import save_market_cognition_snapshot
+from services.cognition_snapshot_validator import (
+    build_snapshot_validation_report,
+    save_snapshot_validation_report,
+)
+from services.experience_library_loader import load_experience_library_summary
+from services.experience_matcher import build_experience_query_from_cognition
 from services.market_risk_radar import analyze_market_risk_radar
 from services.market_scanner import scan_market_opportunities
 from services.local_api_server import get_local_api_port, start_local_api_server
@@ -264,9 +270,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2"
+APP_TITLE = "AI模型 9.2.3"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2 市场认知量化与经验库数据标准版"
+VERSION = "AI模型 9.2.3 经验库数据契约与读取接口预留版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -3107,6 +3113,153 @@ def render_html(html: str) -> None:
     st.markdown(_html_no_code_block(html), unsafe_allow_html=True)
 
 
+def _get_cached_snapshot_validation_report() -> dict[str, Any]:
+    """Build snapshot validation report at most once per minute per session."""
+    cache_key = "_cognition_snapshot_validation_report_cache"
+    now = time.time()
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict) and now - float(cached.get("created_at", 0) or 0) < 60:
+        return cached.get("report") or {}
+    try:
+        report = build_snapshot_validation_report()
+        try:
+            save_snapshot_validation_report(report)
+        except Exception:
+            pass
+    except Exception as exc:
+        report = {
+            "total_snapshots": 0,
+            "valid_snapshots": 0,
+            "invalid_snapshots": 0,
+            "valid_ratio": 0,
+            "avg_quality_score": 0,
+            "avg_data_integrity_score": 0,
+            "avg_confidence": 0,
+            "latest_snapshot_time": "",
+            "latest_state_code": "",
+            "snapshot_dir_size_mb": 0,
+            "disk_risk_status": "UNKNOWN",
+            "experience_sample_compatible_ratio": 0,
+            "recommendation": f"快照验收报告生成失败：{exc}",
+            "missing_field_top10": {},
+            "error_top10": {},
+            "warning_top10": {},
+            "state_code_distribution": {},
+        }
+    st.session_state[cache_key] = {"created_at": now, "report": report}
+    return report
+
+
+def _top_counter_rows(counter: dict[str, Any], key_label: str) -> list[dict[str, Any]]:
+    return [{key_label: key, "次数": value} for key, value in (counter or {}).items()]
+
+
+def render_cognition_snapshot_validation_panel() -> None:
+    """Render market cognition snapshot acceptance summary."""
+    report = _get_cached_snapshot_validation_report()
+    total = int(report.get("total_snapshots") or 0)
+    disk_status = str(report.get("disk_risk_status") or "OK")
+    disk_class = "green" if disk_status == "OK" else "yellow" if disk_status == "WARNING" else "red"
+    compatible_ratio = float(report.get("experience_sample_compatible_ratio") or 0)
+    compatible_class = "green" if compatible_ratio >= 95 else "yellow" if compatible_ratio >= 70 else "red"
+
+    render_html(
+        f"""
+        <div class="app-shell">
+          <div class="module-card">
+            <div class="module-title">市场认知快照验收</div>
+            <div class="module-desc">{escape(str(report.get("recommendation") or "等待快照验收结果。"))}</div>
+          </div>
+        </div>
+        """
+    )
+    render_metric_grid(
+        [
+            ("今日快照", str(report.get("today_snapshots", 0)), ""),
+            ("总快照", str(total), ""),
+            ("有效快照", str(report.get("valid_snapshots", 0)), "green"),
+            ("无效快照", str(report.get("invalid_snapshots", 0)), "red" if int(report.get("invalid_snapshots") or 0) else ""),
+            ("有效率", f"{float(report.get('valid_ratio') or 0):.1f}%", "green" if float(report.get("valid_ratio") or 0) >= 95 else "yellow"),
+            ("平均质量分", f"{float(report.get('avg_quality_score') or 0):.1f}", "green" if float(report.get("avg_quality_score") or 0) >= 80 else "yellow"),
+            ("平均完整度", f"{float(report.get('avg_data_integrity_score') or 0):.1f}", ""),
+            ("平均置信度", f"{float(report.get('avg_confidence') or 0):.1f}", ""),
+            ("最近快照", str(report.get("latest_snapshot_time") or "暂无"), ""),
+            ("最近状态码", str(report.get("latest_state_code") or "暂无"), ""),
+            ("目录大小", f"{float(report.get('snapshot_dir_size_mb') or 0):.2f} MB", disk_class),
+            ("磁盘风险", disk_status, disk_class),
+            ("样本兼容率", f"{compatible_ratio:.1f}%", compatible_class),
+        ]
+    )
+    if total <= 0:
+        st.info("暂无市场认知快照，请等待系统运行生成。")
+        return
+    if disk_status == "DANGER":
+        st.error("快照目录过大，建议检查写入频率和保留天数。验证器不会自动删除任何数据。")
+    elif disk_status == "WARNING":
+        st.warning("快照目录已超过100MB，建议继续观察增长速度。")
+
+    with st.expander("缺失字段排行", expanded=False):
+        rows = _top_counter_rows(report.get("missing_field_top10") or {}, "缺失字段")
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.success("未发现主要缺失字段。")
+    with st.expander("错误排行", expanded=False):
+        rows = _top_counter_rows(report.get("error_top10") or {}, "错误")
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.success("未发现主要错误。")
+    with st.expander("状态码分布", expanded=False):
+        rows = _top_counter_rows(report.get("state_code_distribution") or {}, "状态码")[:30]
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无状态码分布。")
+
+
+def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
+    """Render future experience-library contract and current query status."""
+    symbol = str(cognition.get("symbol") or st.session_state.get("current_symbol", "")).upper()
+    query = build_experience_query_from_cognition(symbol, cognition)
+    summary = load_experience_library_summary()
+    status = "可用" if summary.get("available") else "未接入" if not summary.get("manifest_found") else "格式不完整"
+    status_class = "green" if summary.get("available") else "yellow" if summary.get("manifest_found") else "red"
+    state_summary = str(query.get("state_vector_summary") or "状态向量缺失")
+    if len(state_summary) > 180:
+        state_summary = state_summary[:180].rstrip() + "..."
+    render_html(
+        f"""
+        <div class="app-shell">
+          <div class="module-card">
+            <div class="module-title">经验库状态</div>
+            <div class="module-desc">训练工厂生成经验库后，经验委员将按同币种经验 + 同类币种经验 + 全市场经验进行匹配。</div>
+            <div class="committee-grid">
+              <div class="summary-card"><div class="summary-label">经验库状态</div><div class="summary-value {status_class}">{escape(status)}</div></div>
+              <div class="summary-card"><div class="summary-label">单币种经验</div><div class="summary-value {'green' if summary.get('symbol_level_found') else 'red'}">{'已发现' if summary.get('symbol_level_found') else '缺失'}</div></div>
+              <div class="summary-card"><div class="summary-label">同类币种经验</div><div class="summary-value {'green' if summary.get('group_level_found') else 'red'}">{'已发现' if summary.get('group_level_found') else '缺失'}</div></div>
+              <div class="summary-card"><div class="summary-label">全市场经验</div><div class="summary-value {'green' if summary.get('global_level_found') else 'red'}">{'已发现' if summary.get('global_level_found') else '缺失'}</div></div>
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>经验库路径</b><br>{escape(str(summary.get("path", "/data/ai-training-data/experience_library/current/")))}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>当前查询输入</b><br>
+              symbol：{escape(str(query.get("symbol") or "-"))}｜
+              symbol_group：{escape(str(query.get("symbol_group") or "UNKNOWN"))}｜
+              state_code：{escape(str(query.get("state_code") or "-"))}<br>
+              state_vector：{escape(state_summary)}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>经验委员状态</b><br>
+              {escape(str(summary.get("message") or "经验库未接入，当前经验委员弃权。"))}
+            </div>
+          </div>
+        </div>
+        """
+    )
+
+
 def render_market_cognition_panel(cognition: dict[str, Any] | None) -> None:
     """渲染 AI模型 9.2 市场认知区域。"""
     if not cognition:
@@ -3195,6 +3348,7 @@ def render_market_cognition_panel(cognition: dict[str, Any] | None) -> None:
         </div>
         """
     )
+    render_experience_library_status_panel(cognition)
 
 
 def _to_weight_float(value: Any, default: float = 0.0) -> float:
@@ -7556,6 +7710,7 @@ def render_data_dashboard_page() -> None:
 
     with tabs[12]:
         quality = metrics.get("quality") or {}
+        render_cognition_snapshot_validation_panel()
         st.markdown("**数据质量检查**")
         if quality.get("checks"):
             st.dataframe(quality.get("checks"), use_container_width=True, hide_index=True)
