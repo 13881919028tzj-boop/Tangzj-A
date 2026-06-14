@@ -2892,7 +2892,7 @@ def render_kline_system(symbol: str) -> None:
             market_cache.set_ticker_error(f"K线现价刷新失败：{exc!r}")
             snapshot = market_cache.snapshot()
     rows = market_cache.get_klines(symbol, interval)
-    if not rows or live_refresh_due(f"kline:{symbol}:{interval}", 5.0):
+    if not rows or live_refresh_due(f"kline:{symbol}:{interval}", 8.0):
         try:
             refresh_klines_now(symbol, interval)
             rows = market_cache.get_klines(symbol, interval)
@@ -4315,14 +4315,20 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
     render_watchlist_quick_controls(st.session_state.get("current_symbol", symbol), "signals", source="manual")
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
     if fragment:
-        @fragment(run_every="2s")
-        def _live_market_modules() -> None:
+        @fragment(run_every="8s")
+        def _live_kline_module() -> None:
+            live_symbol = st.session_state.get("current_symbol", symbol)
+            render_kline_system(live_symbol)
+
+        _live_kline_module()
+
+        @fragment(run_every="3s")
+        def _live_orderbook_module() -> None:
             live_symbol = st.session_state.get("current_symbol", symbol)
             live_ticker = market_cache.get_ticker(live_symbol) or ticker
-            render_kline_system(live_symbol)
             render_orderbook_system(live_symbol, live_ticker)
 
-        _live_market_modules()
+        _live_orderbook_module()
 
         @fragment(run_every="5s")
         def _live_signal_analysis() -> None:
