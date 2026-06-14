@@ -12,6 +12,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -101,6 +102,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _redact_external_ai_text(value: Any, limit: int = 260) -> str:
+    """Keep UI/log messages useful without exposing URLs, keys or stack detail."""
+    text = str(value or "")
+    text = re.sub(r"([?&]key=)[^&\s)\"']+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(Authorization:\s*Bearer\s+)[^\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(x-goog-api-key['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s)\"']+", "[外部AI接口地址已隐藏]", text)
+    text = re.sub(r"\b[A-Za-z0-9_\-]{24,}\b", "[敏感片段已隐藏]", text)
+    text = " ".join(text.replace("\n", " ").split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
 
 
 def _now_ts() -> float:
@@ -586,13 +601,14 @@ def _call_gemini(prompt: str, cfg: dict[str, Any], api_key: str) -> str:
                 reason = data.get("promptFeedback") or data.get("error") or data
                 errors.append(f"{model}: Gemini返回为空：{reason}")
             except Exception as exc:
-                errors.append(f"{model}: {exc}")
+                errors.append(f"{model}: {_redact_external_ai_text(exc)}")
                 continue
     raise RuntimeError("Gemini连接失败，已尝试多个模型和载荷格式：" + " | ".join(errors[-5:]))
 
 
 def _unavailable_member(provider: str, symbol: str, reason: str, event: str = "影子委员未调用", failed: bool = True) -> dict[str, Any]:
     name = "DeepSeek委员" if provider == "deepseek" else "Gemini委员"
+    safe_reason = _redact_external_ai_text(reason)
     output = {
         "member_name": name,
         "mode": "formal",
@@ -604,14 +620,14 @@ def _unavailable_member(provider: str, symbol: str, reason: str, event: str = "�
         "support_trade": False,
         "veto": False,
         "soft_veto": False,
-        "main_opinion": reason,
+        "main_opinion": safe_reason,
         "chart_bias": "中性",
-        "chart_observation": reason,
-        "reasons": [reason],
+        "chart_observation": safe_reason,
+        "reasons": [safe_reason],
         "risks": ["外部AI不可用时按观望处理，不影响本地系统运行。"],
         "conflicts_found": [],
         "suggested_adjustment": "不调整",
-        "summary": reason,
+        "summary": safe_reason,
         "shadow": False,
         "official": True,
         "participates_in_vote": True,
@@ -620,7 +636,18 @@ def _unavailable_member(provider: str, symbol: str, reason: str, event: str = "�
         "duration_ms": 0,
         "updated_time": _now(),
     }
-    log_external_ai_audit_event(event, provider=provider, symbol=symbol, result="失败" if failed else "未配置", output=output, reason=reason, failed=failed)
+    log_external_ai_audit_event(event, provider=provider, symbol=symbol, result="失败" if failed else "未配置", output=output, reason=safe_reason, failed=failed)
+    return output
+
+
+def _sanitize_external_ai_member(row: dict[str, Any]) -> dict[str, Any]:
+    output = dict(row or {})
+    for key in ["main_opinion", "chart_observation", "summary", "error"]:
+        if key in output:
+            output[key] = _redact_external_ai_text(output.get(key))
+    for key in ["reasons", "risks", "conflicts_found"]:
+        if isinstance(output.get(key), list):
+            output[key] = [_redact_external_ai_text(item) for item in output.get(key, [])]
     return output
 
 
@@ -642,12 +669,14 @@ def _run_provider_shadow(provider: str, data: dict[str, Any]) -> dict[str, Any]:
     if bool(cfg.get("cache_enabled", True)):
         cached = load_cached_external_ai_result(symbol, provider, h)
         if cached:
+            cached = _sanitize_external_ai_member(cached)
             log_external_ai_audit_event("影子委员缓存命中", provider=provider, symbol=symbol, result="缓存", output=cached, context_hash=h, cache_used=True)
             return cached
     limited, reason = _rate_limited(provider, symbol, cfg)
     if limited:
         cached = load_cached_external_ai_result(symbol, provider)
         if cached:
+            cached = _sanitize_external_ai_member(cached)
             cached["source"] = "缓存结果"
             cached["status"] = "限频缓存"
             log_external_ai_audit_event("影子委员限频", provider=provider, symbol=symbol, result="缓存", output=cached, reason=reason, context_hash=h, cache_used=True)
@@ -671,7 +700,7 @@ def _run_provider_shadow(provider: str, data: dict[str, Any]) -> dict[str, Any]:
         return output
     except (TimeoutError, OSError, ValueError, Exception) as exc:
         duration = int((_now_ts() - start) * 1000)
-        output = _unavailable_member(provider, symbol, f"{provider} 暂不可用，系统已继续使用本地策略和委员会判断：{exc}", event="影子委员调用失败")
+        output = _unavailable_member(provider, symbol, f"{provider} 暂不可用，系统已继续使用本地策略和委员会判断：{_redact_external_ai_text(exc)}", event="影子委员调用失败")
         output["duration_ms"] = duration
         return output
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,11 @@ try:
     from services.replay_learning_engine import analyze_replay_learning
 except Exception:  # pragma: no cover
     analyze_replay_learning = None
+
+try:
+    from services.trading_committee_v91 import attach_trading_committee_v91
+except Exception:  # pragma: no cover
+    attach_trading_committee_v91 = None
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -86,6 +92,44 @@ VOTE_TEXT = {
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _safe_committee_text(value: Any, limit: int = 260) -> str:
+    text = str(value or "")
+    leak_markers = [
+        "HTTPSConnectionPool",
+        "NameResolutionError",
+        "Max retries exceeded",
+        "generateContent",
+        "chat/completions",
+        "api.deepseek.com",
+        "generativelanguage.googleapis.com",
+        "api_key",
+        "x-goog-api-key",
+        "Authorization",
+        "Traceback",
+    ]
+    if any(marker.lower() in text.lower() for marker in leak_markers):
+        return "外部AI暂不可用，已按观望处理；本地委员会继续运行。"
+    text = re.sub(r"([?&]key=)[^&\s)\"']+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(Authorization:\s*Bearer\s+)[^\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(x-goog-api-key['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s)\"']+", "[外部接口地址已隐藏]", text)
+    text = re.sub(r"\b[A-Za-z0-9_\-]{24,}\b", "[敏感片段已隐藏]", text)
+    text = re.sub(r"```.*?```", "[代码块已隐藏]", text, flags=re.DOTALL)
+    text = " ".join(text.replace("\n", " ").split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
+
+
+def _external_ai_status_text(row: dict[str, Any], label: str) -> str:
+    status = str(row.get("status") or "等待")
+    vote = str(row.get("vote") or row.get("vote_text") or "观望")
+    risk = str(row.get("risk_level") or "中")
+    if status in {"失败", "未配置", "限频缓存"} or _to_float(row.get("confidence"), 0) <= 0:
+        return f"{label}{status}，按{vote}处理"
+    return f"{label}{status}，投票{vote}，风险{risk}"
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -965,6 +1009,7 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
         main_risks = ["当前暂无强制风险，但仍需控制仓位。"]
     deepseek_vote = next((v for v in member_votes if v.get("member_name") == "DeepSeek委员"), {})
     gemini_vote = next((v for v in member_votes if v.get("member_name") == "Gemini委员"), {})
+    external_ai_summary = f"{_external_ai_status_text(deepseek_vote, 'DeepSeek')}；{_external_ai_status_text(gemini_vote, 'Gemini')}。"
     shadow_summary = "；".join(str(v.get("summary", "")) for v in member_votes if v.get("shadow")) or "观察池与策略验证当前为影子委员，仅作参考。"
     mode_action = {
         "candidate": "当前可进入顺势交易候选；实盘仍需订单预览、Test Order 和人工确认。",
@@ -977,8 +1022,7 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
     if permission in {"candidate", "simulation_or_approval", "watch_candidate"}:
         summary = (
             f"正式委员支持权重{support_weight:.0f}%，观望权重{observe_weight:.0f}%，反对权重{oppose_weight + veto_weight:.0f}%。"
-            f"DeepSeek：{deepseek_vote.get('summary') or deepseek_vote.get('main_opinion') or '暂无'}；"
-            f"Gemini：{gemini_vote.get('summary') or gemini_vote.get('chart_observation') or '暂无'}。"
+            f"{external_ai_summary}"
             f"影子委员参考：{shadow_summary}。硬否决：无。共振等级：{resonance_level}。最终动作：{action}。{mode_action}"
         )
     elif permission == "blocked":
@@ -989,7 +1033,7 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
     else:
         summary = (
             f"正式委员支持权重{support_weight:.0f}%，观望权重{observe_weight:.0f}%，反对权重{oppose_weight + veto_weight:.0f}%。"
-            f"DeepSeek：{deepseek_vote.get('summary') or '暂无'}；Gemini：{gemini_vote.get('summary') or '暂无'}。"
+            f"{external_ai_summary}"
             f"影子委员参考：{shadow_summary}。共振等级：{resonance_level}。最终动作：{action}。{mode_action}"
         )
     soft_veto_members = [v for v in member_votes if v.get("soft_veto")]
@@ -1109,7 +1153,7 @@ def run_committee_meeting(symbol: str, **kwargs: Any) -> dict[str, Any]:
             votes.append(func(data))
         except Exception as exc:
             name = getattr(func, "__name__", "unknown")
-            votes.append(_member("委员异常", "neutral", 20, 85, "反对交易", risks=[f"{name} 分析失败，委员会已降级保守处理：{exc!r}"], summary="部分委员分析失败。"))
+            votes.append(_member("委员异常", "neutral", 20, 85, "反对交易", risks=[f"{name} 分析失败，委员会已降级保守处理：{_safe_committee_text(exc)}"], summary="部分委员分析失败。"))
     for name, func in [("DeepSeek委员", run_deepseek_shadow_member), ("Gemini委员", run_gemini_shadow_member)]:
         try:
             if func:
@@ -1117,10 +1161,23 @@ def run_committee_meeting(symbol: str, **kwargs: Any) -> dict[str, Any]:
             else:
                 votes.append(_member(name, "neutral", 0, 50, "观望", reasons=["外部AI接入口不可用。"], risks=["主系统继续使用本地委员会判断。"], summary=f"{name} 未启用。"))
         except Exception as exc:
-            votes.append(_member(name, "neutral", 0, 65, "观望", reasons=["外部AI调用失败，已自动降级。"], risks=[f"{name} 失败：{exc!r}"], summary=f"{name} 暂不可用，不影响主系统。"))
+            votes.append(_member(name, "neutral", 0, 65, "观望", reasons=["外部AI调用失败，已自动降级。"], risks=[f"{name} 失败：{_safe_committee_text(exc)}"], summary=f"{name} 暂不可用，不影响主系统。"))
     data["member_votes"] = _normalize_members(votes, data)
     decision = generate_chairman_decision(data)
     decision["explanation"] = generate_committee_explanation(decision)
+    if attach_trading_committee_v91:
+        try:
+            decision = attach_trading_committee_v91(data, decision)
+        except Exception as exc:
+            decision["trading_committee_v91"] = {
+                "version": "AI模型 9.1",
+                "final_action": "WAIT",
+                "final_reason": f"9.1交易委员会聚合失败，已保留旧委员会结果：{exc!r}",
+                "members": [],
+                "risk_judge": {"risk_verdict": "WARNING", "blocked": False, "warnings": ["9.1聚合失败，使用旧委员会兼容结果。"]},
+                "position_plan": {"allow_position": False, "reason": "9.1聚合失败。"},
+                "execution_plan": {"execution_allowed": False, "execution_type": "WAIT", "reason": "9.1聚合失败。"},
+            }
     save_committee_decision(decision)
     return decision
 

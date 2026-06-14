@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from html import escape
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
 
 import plotly.graph_objects as go
@@ -260,9 +262,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.0.2"
+APP_TITLE = "AI模型 9.1.1"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.0.2 模拟账户统计与风险计算修复版"
+VERSION = "AI模型 9.1.1 交易委员会页面残留显示修复版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -530,7 +532,7 @@ def render_bootstrap_status() -> None:
         return
     slow_note = "初始化较慢，请检查网络或 Binance API 连接。" if elapsed >= 10 and not st.session_state.get("data_ready") else ""
     st.markdown(
-        f"""
+        dedent(f"""
         <div class="app-shell">
           <div class="status-card">
             <b>系统正在初始化数据...</b><br>
@@ -540,7 +542,7 @@ def render_bootstrap_status() -> None:
             {escape(error or slow_note)}
           </div>
         </div>
-        """,
+        """),
         unsafe_allow_html=True,
     )
 
@@ -886,6 +888,12 @@ def inject_styles() -> None:
           .summary-card { border:1px solid rgba(51,65,85,.72); background:rgba(15,23,42,.72); border-radius:10px; padding:7px; min-height:44px; }
           .summary-label { color:var(--muted); font-size:10px; }
           .summary-value { color:#fff; font-size:14px; font-weight:900; margin-top:3px; overflow-wrap:anywhere; }
+          .committee-summary-panel { border:1px solid var(--border); background:rgba(15,23,42,.74); border-radius:12px; padding:9px; margin-top:8px; }
+          .committee-summary-title { color:#fff; font-size:13px; font-weight:900; margin-bottom:6px; }
+          .committee-summary-strip { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+          .committee-summary-item { border:1px solid rgba(51,65,85,.72); background:rgba(5,11,20,.38); border-radius:9px; padding:6px; min-height:40px; overflow:hidden; }
+          .committee-summary-item .label { color:var(--muted); font-size:9px; line-height:1.1; white-space:nowrap; }
+          .committee-summary-item .value { color:#fff; font-size:12px; line-height:1.18; font-weight:900; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
           .committee-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-top:8px; }
           .committee-vote-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; margin-top:8px; }
           .quick-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px; }
@@ -928,6 +936,11 @@ def inject_styles() -> None:
           .watch-action-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; margin:5px 0 8px; }
           .watch-action-grid div[data-testid="stButton"] > button { width:100%; min-height:25px; font-size:10px; padding:1px 3px; }
           div[data-testid="stButton"] > button { min-height:24px; padding:1px 5px; border-radius:7px; border:1px solid rgba(51,65,85,.78); background:rgba(15,23,42,.9); color:#E5E7EB; font-size:10.5px; font-weight:900; line-height:1.1; }
+          div[data-testid="stExpander"] { background:#0f172a!important; border:1px solid #24324a!important; border-radius:14px!important; color:#e5e7eb!important; overflow:hidden; }
+          div[data-testid="stExpander"] details { background:#0f172a!important; color:#e5e7eb!important; }
+          div[data-testid="stExpander"] summary { background:#0f172a!important; color:#e5e7eb!important; border-radius:12px!important; }
+          div[data-testid="stExpander"] * { color:#e5e7eb; }
+          pre, code { background:#111827!important; color:#e5e7eb!important; border-color:#24324a!important; }
           .status-card { border:1px solid var(--border); background:rgba(15,23,42,.74); border-radius:12px; padding:9px; font-size:12px; line-height:1.6; }
           .error-box { border:1px solid rgba(246,70,93,.42); background:rgba(246,70,93,.12); color:#FCA5A5; border-radius:12px; padding:10px; margin:8px 0; font-size:12px; }
           .kline-head { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px; }
@@ -965,8 +978,8 @@ def inject_styles() -> None:
           @media (min-width:720px) { .block-container { padding:52px 18px 96px; } .module-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .metric-grid,.kline-meta-grid { grid-template-columns:repeat(4,minmax(0,1fr)); } }
           @media (min-width:900px) { .orderbook-grid { grid-template-columns:1fr 1fr; } }
           @media (min-width:1100px) { .module-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
-          @media (max-width:900px) { .side-layout { grid-template-columns:1fr; } .side-stack { grid-template-columns:repeat(2,minmax(0,1fr)); } .terminal-grid,.committee-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .committee-vote-grid { grid-template-columns:1fr; } }
-          @media (max-width:430px) { .market-ticker-inner { grid-template-columns:1.08fr .98fr .72fr .72fr .66fr .66fr; gap:3px; } .ticker-cell { min-height:27px; padding:3px 4px; } .ticker-label { font-size:8px; } .ticker-value { font-size:10px; } .rank-row { grid-template-columns:22px 1.15fr .83fr .66fr .76fr; min-height:21px; font-size:9px; } .opp-row.compact-five { grid-template-columns:1.05fr .6fr .64fr .58fr .62fr; gap:2px; font-size:9px; } .watch-pill { font-size:8px; padding:2px 5px; } .watch-info-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .watch-info-cell:nth-child(2n) { border-right:none; } .watch-action-grid { grid-template-columns:repeat(4,minmax(0,1fr)); gap:3px; } .watch-action-grid div[data-testid="stButton"] > button { font-size:9px; } .terminal-grid,.side-stack,.committee-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px; } .terminal-card,.summary-card { padding:6px; min-height:40px; } .terminal-value,.summary-value { font-size:12px; } .bottom-nav { padding:4px 4px 5px; } .bottom-nav-inner { gap:2px; } .nav-item { flex-basis:42px; min-height:40px; border-radius:8px; font-size:7.5px; } .nav-icon { font-size:12px; } }
+          @media (max-width:900px) { .side-layout { grid-template-columns:1fr; } .side-stack { grid-template-columns:repeat(2,minmax(0,1fr)); } .terminal-grid,.committee-grid,.committee-summary-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .committee-vote-grid { grid-template-columns:1fr; } }
+          @media (max-width:430px) { .market-ticker-inner { grid-template-columns:1.08fr .98fr .72fr .72fr .66fr .66fr; gap:3px; } .ticker-cell { min-height:27px; padding:3px 4px; } .ticker-label { font-size:8px; } .ticker-value { font-size:10px; } .rank-row { grid-template-columns:22px 1.15fr .83fr .66fr .76fr; min-height:21px; font-size:9px; } .opp-row.compact-five { grid-template-columns:1.05fr .6fr .64fr .58fr .62fr; gap:2px; font-size:9px; } .watch-pill { font-size:8px; padding:2px 5px; } .watch-info-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .watch-info-cell:nth-child(2n) { border-right:none; } .watch-action-grid { grid-template-columns:repeat(4,minmax(0,1fr)); gap:3px; } .watch-action-grid div[data-testid="stButton"] > button { font-size:9px; } .terminal-grid,.side-stack,.committee-grid,.committee-summary-strip { grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px; } .terminal-card,.summary-card,.committee-summary-item { padding:6px; min-height:40px; } .terminal-value,.summary-value,.committee-summary-item .value { font-size:12px; } .bottom-nav { padding:4px 4px 5px; } .bottom-nav-inner { gap:2px; } .nav-item { flex-basis:42px; min-height:40px; border-radius:8px; font-size:7.5px; } .nav-icon { font-size:12px; } }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1497,6 +1510,10 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
     """总览页委员会精简窗口。"""
     if not decision:
         return
+    v91 = decision.get("trading_committee_v91") or {}
+    v91_risk = v91.get("risk_judge") or {}
+    v91_position = v91.get("position_plan") or {}
+    v91_execution = v91.get("execution_plan") or {}
     permission = _committee_permission_text(str(decision.get("trade_permission", "rejected")))
     action = str(decision.get("final_action", "继续观察"))
     direction = str(decision.get("final_direction_text", "中性"))
@@ -1524,15 +1541,15 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
               <div class="summary-label">{escape(member_name)} · {member_type} · 权重{_fmt_weight(member_weight)}</div>
               <div class="summary-value {_signal_color(str(member.get("vote", "")))}">{escape(str(member.get("vote", "建议观望")))}</div>
               <div class="module-desc">计入：{escape(member_bucket)}｜方向：{escape(str(member.get("direction_text", "中性")))}｜信心：{member.get("confidence", 0)}｜加权：{escape(str(member.get("weighted_score", 0)))}｜否决：{"是" if member.get("veto") else "否"}</div>
-              <div class="module-desc">理由：{escape(str(reason))}</div>
+              <div class="module-desc">理由：{escape(_safe_committee_text(reason))}</div>
             </div>"""
         )
     veto_status = "已触发" if veto_members else "未触发"
-    st.markdown(
+    render_html(
         f"""
         <div class="app-shell">
           <div class="module-card">
-            <div class="module-title">AI交易委员会</div>
+            <div class="module-title">交易委员会</div>
             <div class="metric-value {_signal_color(action)}">{escape(action)} · {escape(direction)}</div>
             <div class="committee-grid">
               <div class="summary-card"><div class="summary-label">当前交易对象</div><div class="summary-value yellow">{escape(str(decision.get("symbol", "-")))}</div></div>
@@ -1546,8 +1563,12 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">投票统计</div><div class="summary-value">支持{len(supporting)} / 反对{len(opposing)} / 否决{len(veto_members)}</div></div>
               <div class="summary-card"><div class="summary-label">权重投票</div><div class="summary-value yellow">{vote_weight_text}</div></div>
               <div class="summary-card"><div class="summary-label">影子参考</div><div class="summary-value blue">{_fmt_weight(weight_summary['shadow_weight'])}</div></div>
+              <div class="summary-card"><div class="summary-label">9.1交易结论</div><div class="summary-value {_signal_color(str(v91.get("final_action", "WAIT")))}">{escape(str(v91.get("final_action", "WAIT")))} / {escape(str(v91.get("final_direction", "WAIT")))}</div></div>
+              <div class="summary-card"><div class="summary-label">风险裁判</div><div class="summary-value {_signal_color("禁止开仓" if v91_risk.get("blocked") else "支持交易")}">{escape(str(v91_risk.get("risk_verdict", "WAIT")))}</div></div>
+              <div class="summary-card"><div class="summary-label">仓位委员会</div><div class="summary-value yellow">{float(v91_position.get("position_size_pct", 0) or 0):.2f}% / {int(v91_position.get("leverage", 1) or 1)}x</div></div>
+              <div class="summary-card"><div class="summary-label">执行委员会</div><div class="summary-value {_signal_color("支持交易" if v91_execution.get("execution_allowed") else "反对交易")}">{escape(str(v91_execution.get("execution_type", "WAIT")))}</div></div>
             </div>
-            <div class="status-card" style="margin-top:8px;"><b>AI主席总结</b><br>{escape(str(decision.get("chairman_summary", "等待委员会总结。")))}</div>
+            {_render_committee_summary_panel(decision)}
             <details class="status-card" style="margin-top:8px;">
               <summary><b>查看委员意见</b></summary>
               <div class="committee-vote-grid">{"".join(vote_cards)}</div>
@@ -1555,9 +1576,9 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
             <a class="watch-pill" href="?page=signals&symbol={escape(str(decision.get("symbol", "")))}" target="_self" style="margin-top:8px;">查看完整委员会详情</a>
           </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
+    render_committee_full_summary_expander(decision, "查看完整总结")
 
 
 def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]:
@@ -1664,7 +1685,7 @@ def render_sim_overview_window(summary: dict[str, Any]) -> None:
     history = summary.get("history") or []
     last_trade = history[0] if history else {}
     pnl = float(account.get("total_pnl", 0) or 0)
-    st.markdown(
+    render_html(
         f"""
         <div class="app-shell">
           <div class="module-card">
@@ -1682,8 +1703,7 @@ def render_sim_overview_window(summary: dict[str, Any]) -> None:
             <a class="watch-pill" href="?page=trading" target="_self" style="margin-top:8px;">进入模拟交易中心</a>
           </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -2274,7 +2294,7 @@ def render_trade_opportunity_board(rankings: dict[str, list[dict[str, Any]]] | N
         <div class="app-shell">
           <div class="module-card">
             <div class="module-title">实时交易机会榜单</div>
-            <div class="module-desc">交易机会榜是系统所有交易机会的总入口。每个币都会经过AI交易委员会复核；评分达到{trigger_score}分只进入候选，不代表允许真实下单。榜单会持续显示入榜价、现价、委员会判断、冷却和候选状态。</div>
+            <div class="module-desc">交易机会榜是系统所有交易机会的总入口。每个币都会经过交易委员会复核；评分达到{trigger_score}分只进入候选，不代表允许真实下单。榜单会持续显示入榜价、现价、委员会判断、冷却和候选状态。</div>
           </div>
         </div>
         """,
@@ -2482,7 +2502,7 @@ def render_watchlist(rankings: dict[str, list[dict[str, Any]]]) -> None:
                 unsafe_allow_html=True,
             )
     if candidates:
-        st.markdown('<div class="module-title" style="margin-top:10px;">AI交易委员会候选</div>', unsafe_allow_html=True)
+        st.markdown('<div class="module-title" style="margin-top:10px;">交易委员会候选</div>', unsafe_allow_html=True)
         for row in candidates:
             st.markdown(
                 f'<div class="status-card" style="margin-top:6px;"><b>{escape(str(row.get("symbol", "-")))}</b>｜观察评分 {row.get("watch_score", 0)}｜{escape(str(row.get("local_strategy_action", "-")))}｜{escape(str(row.get("strategy_name", "-")))}<br>{escape(str(row.get("main_reason", "")))}<br>主要风险：{escape(str(row.get("main_risk", "")))}</div>',
@@ -3029,9 +3049,48 @@ def _signal_color(value: str) -> str:
     return "blue"
 
 
+def _safe_committee_text(value: Any, limit: int = 260) -> str:
+    """Redact keys/URLs/code-like blobs before rendering committee text."""
+    text = str(value or "")
+    leak_markers = [
+        "HTTPSConnectionPool",
+        "NameResolutionError",
+        "Max retries exceeded",
+        "generateContent",
+        "chat/completions",
+        "api.deepseek.com",
+        "generativelanguage.googleapis.com",
+        "api_key",
+        "x-goog-api-key",
+        "Authorization",
+        "Traceback",
+    ]
+    if any(marker.lower() in text.lower() for marker in leak_markers):
+        return "外部AI暂不可用，已按观望处理；本地委员会继续运行。"
+    text = re.sub(r"([?&]key=)[^&\s)\"']+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(Authorization:\s*Bearer\s+)[^\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(x-goog-api-key['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1[已隐藏]", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s)\"']+", "[外部接口地址已隐藏]", text)
+    text = re.sub(r"\b[A-Za-z0-9_\-]{24,}\b", "[敏感片段已隐藏]", text)
+    text = re.sub(r"```.*?```", "[代码块已隐藏]", text, flags=re.DOTALL)
+    text = " ".join(text.replace("\n", " ").split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
+
+
 def _render_numbered(items: list[str]) -> str:
     """渲染紧凑编号解释。"""
-    return "".join(f"<li>{escape(str(item))}</li>" for item in items)
+    return "".join(f"<li>{escape(_safe_committee_text(item))}</li>" for item in items)
+
+
+def _html_no_code_block(html: str) -> str:
+    """Remove leading indentation so Markdown never treats HTML as a code block."""
+    return "\n".join(line.lstrip() for line in dedent(str(html)).splitlines()).strip()
+
+
+def render_html(html: str) -> None:
+    st.markdown(_html_no_code_block(html), unsafe_allow_html=True)
 
 
 def _to_weight_float(value: Any, default: float = 0.0) -> float:
@@ -3694,10 +3753,136 @@ def _committee_permission_text(permission: str) -> str:
     return mapping.get(permission, permission or "等待决议")
 
 
+def _committee_brief_summary(decision: dict[str, Any]) -> str:
+    """Compact summary for signal/overview bars."""
+    v91 = decision.get("trading_committee_v91") or {}
+    risk = v91.get("risk_judge") or {}
+    action = str(decision.get("final_action") or v91.get("final_action") or "等待决议")
+    direction = str(decision.get("final_direction_text") or v91.get("final_direction") or "中性")
+    confidence = decision.get("committee_confidence", v91.get("final_confidence", 0))
+    risk_score = decision.get("committee_risk_score", risk.get("risk_score", 0))
+    risk_verdict = str(risk.get("risk_verdict") or ("BLOCK" if decision.get("veto_members") else "PASS"))
+    permission = _committee_permission_text(str(decision.get("trade_permission", "")))
+    veto_members = list(decision.get("veto_members") or [])
+    veto_text = f"｜否决：{'、'.join(str(x) for x in veto_members[:3])}" if veto_members else ""
+    return (
+        f"{action}｜方向：{direction}｜许可：{permission}｜"
+        f"置信度：{confidence}/100｜风险：{risk_score}/100｜风险裁判：{risk_verdict}{veto_text}"
+    )
+
+
+def _committee_summary_fields(decision: dict[str, Any]) -> list[tuple[str, str, str]]:
+    v91 = decision.get("trading_committee_v91") or {}
+    risk = v91.get("risk_judge") or {}
+    action = str(decision.get("final_action") or v91.get("final_action") or "等待决议")
+    direction = str(decision.get("final_direction_text") or v91.get("final_direction") or "中性")
+    permission = _committee_permission_text(str(decision.get("trade_permission", "")))
+    confidence = str(decision.get("committee_confidence", v91.get("final_confidence", 0)))
+    risk_score = str(decision.get("committee_risk_score", risk.get("risk_score", 0)))
+    risk_verdict = str(risk.get("risk_verdict") or ("BLOCK" if decision.get("veto_members") else "PASS"))
+    veto_members = list(decision.get("veto_members") or [])
+    veto_text = "、".join(str(x) for x in veto_members[:2]) if veto_members else "未触发"
+    return [
+        ("结论", action, _signal_color(action)),
+        ("方向", direction, _signal_color(direction)),
+        ("许可", permission, _signal_color(action)),
+        ("置信度", f"{confidence}/100", "blue"),
+        ("风险", f"{risk_score}/100", _signal_color("禁止开仓" if risk_verdict == "BLOCK" else str(risk_score))),
+        ("风险裁判", risk_verdict, _signal_color("禁止开仓" if risk_verdict == "BLOCK" else "支持交易")),
+        ("否决", veto_text, _signal_color("禁止开仓" if veto_members else "支持交易")),
+    ]
+
+
+def _committee_full_summary_rows(decision: dict[str, Any]) -> list[tuple[str, str]]:
+    weight_summary = _committee_weight_summary(decision)
+    v91 = decision.get("trading_committee_v91") or {}
+    risk = v91.get("risk_judge") or {}
+    position = v91.get("position_plan") or {}
+    execution = v91.get("execution_plan") or {}
+    external_ai = decision.get("external_ai") or {}
+    deepseek = external_ai.get("deepseek") or {}
+    gemini = external_ai.get("gemini") or {}
+    return [
+        ("正式权重", f"支持{_fmt_weight(weight_summary['support_weight'])} / 观望{_fmt_weight(weight_summary['neutral_weight'])} / 反对{_fmt_weight(weight_summary['oppose_weight'] + weight_summary['veto_weight'])}"),
+        ("共振等级", str(decision.get("resonance_text", "无共振"))),
+        ("最终动作", str(decision.get("final_action", "等待决议"))),
+        ("交易许可", _committee_permission_text(str(decision.get("trade_permission", "")))),
+        ("风险裁判", f"{risk.get('risk_verdict', 'WAIT')} / 风险{risk.get('risk_score', decision.get('committee_risk_score', 0))}/100"),
+        ("否决来源", "、".join(str(x) for x in list(decision.get("veto_members") or [])) or "未触发"),
+        ("仓位委员会", f"{position.get('position_size_pct', 0)}% / {position.get('leverage', 1)}x"),
+        ("执行委员会", str(execution.get("execution_type", "WAIT"))),
+        ("DeepSeek", f"{deepseek.get('status', '等待')} / {deepseek.get('vote', '观望')} / 风险{deepseek.get('risk_level', '中')}"),
+        ("Gemini", f"{gemini.get('status', '等待')} / {gemini.get('vote', '观望')} / 风险{gemini.get('risk_level', '中')}"),
+        ("下一步", str((decision.get("explanation") or {}).get("next_condition") or decision.get("invalid_condition") or "等待下一轮数据确认")),
+    ]
+
+
+def _render_committee_summary_panel(decision: dict[str, Any]) -> str:
+    cards = "".join(
+        f"""<div class="committee-summary-item">
+          <div class="label">{escape(label)}</div>
+          <div class="value {color}" title="{escape(str(value))}">{escape(str(value))}</div>
+        </div>"""
+        for label, value, color in _committee_summary_fields(decision)
+    )
+    return dedent(f"""
+      <div class="committee-summary-panel">
+        <div class="committee-summary-title">交易委员会总结</div>
+        <div class="committee-summary-strip">{cards}</div>
+      </div>
+    """)
+
+
+def render_committee_full_summary_expander(decision: dict[str, Any], label: str = "查看完整委员会总结") -> None:
+    with st.expander(label, expanded=False):
+        for row_label, value in _committee_full_summary_rows(decision):
+            st.markdown(f"**{row_label}**：{_safe_committee_text(value, 220)}")
+
+
+def _render_trading_committee_v91(decision: dict[str, Any]) -> str:
+    """Render the AI_MODEL 9.1 committee structure while keeping legacy fields."""
+    v91 = decision.get("trading_committee_v91") or {}
+    if not v91:
+        return '<div class="status-card">9.1交易委员会结构等待下一轮决议生成。</div>'
+    risk = v91.get("risk_judge") or {}
+    position = v91.get("position_plan") or {}
+    execution = v91.get("execution_plan") or {}
+    members_html = "".join(
+        f"""<div class="summary-card">
+          <div class="summary-label">{escape(str(member.get("name", "委员")))} · {escape(str(member.get("role", "-")))}</div>
+          <div class="summary-value {_signal_color(str(member.get("vote", "")))}">{escape(str(member.get("vote", "ABSTAIN")))} / {escape(str(member.get("direction", "WAIT")))}</div>
+          <div class="module-desc">评分：{float(member.get("score", 0) or 0):.1f}｜Confidence：{float(member.get("confidence", 0) or 0):.1f}｜DataIntegrity：{float(member.get("data_integrity_score", 0) or 0):.1f}</div>
+          <div class="module-desc">{escape(_safe_committee_text(member.get("reason", "")))}</div>
+        </div>"""
+        for member in list(v91.get("members") or [])
+    ) or '<div class="status-card">暂无9.1委员结果。</div>'
+    shadow_count = len(list(v91.get("shadow_members") or []))
+    return dedent(f"""
+    <details class="status-card" style="margin-top:8px;" open>
+      <summary><b>AI模型 9.1 交易委员会结构</b></summary>
+      <div class="committee-grid" style="margin-top:8px;">
+        <div class="summary-card"><div class="summary-label">最终结论</div><div class="summary-value {_signal_color(str(v91.get("final_action", "WAIT")))}">{escape(str(v91.get("final_action", "WAIT")))} / {escape(str(v91.get("final_direction", "WAIT")))}</div></div>
+        <div class="summary-card"><div class="summary-label">交易价值评分</div><div class="summary-value blue">{float(v91.get("trade_value_score", 0) or 0):.1f} / 100</div></div>
+        <div class="summary-card"><div class="summary-label">最终置信度</div><div class="summary-value blue">{float(v91.get("final_confidence", 0) or 0):.1f} / 100</div></div>
+        <div class="summary-card"><div class="summary-label">数据完整度</div><div class="summary-value yellow">{float(v91.get("final_data_integrity_score", 0) or 0):.1f} / 100</div></div>
+        <div class="summary-card"><div class="summary-label">风险裁判</div><div class="summary-value {_signal_color("禁止开仓" if risk.get("blocked") else "支持交易")}">{escape(str(risk.get("risk_verdict", "WAIT")))}</div></div>
+        <div class="summary-card"><div class="summary-label">风险评分</div><div class="summary-value yellow">{float(risk.get("risk_score", 0) or 0):.1f} / 100</div></div>
+        <div class="summary-card"><div class="summary-label">仓位委员会</div><div class="summary-value {_signal_color("支持交易" if position.get("allow_position") else "反对交易")}">{float(position.get("position_size_pct", 0) or 0):.2f}% / {int(position.get("leverage", 1) or 1)}x</div></div>
+        <div class="summary-card"><div class="summary-label">执行委员会</div><div class="summary-value {_signal_color("支持交易" if execution.get("execution_allowed") else "反对交易")}">{escape(str(execution.get("execution_type", "WAIT")))}</div></div>
+        <div class="summary-card"><div class="summary-label">影子委员</div><div class="summary-value blue">{shadow_count} 个，仅参考</div></div>
+      </div>
+      <div class="status-card" style="margin-top:8px;"><b>风险裁判理由</b><br>{escape(_safe_committee_text(risk.get("block_reason") or "未触发阻断。"))}<br>{escape(_safe_committee_text("；".join(str(x) for x in list(risk.get("warnings") or [])[:4])))}</div>
+      <div class="status-card" style="margin-top:8px;"><b>仓位委员会</b><br>{escape(_safe_committee_text(position.get("reason", "等待仓位建议。")))}</div>
+      <div class="status-card" style="margin-top:8px;"><b>执行委员会</b><br>{escape(_safe_committee_text(execution.get("reason", "等待执行计划。")))}</div>
+      <div class="committee-vote-grid" style="margin-top:8px;">{members_html}</div>
+    </details>
+    """)
+
+
 def render_ai_committee_decision(decision: dict[str, Any]) -> None:
-    """渲染 AI交易委员会最终决议与委员投票。"""
+    """渲染交易委员会最终决议与委员投票。"""
     if not decision:
-        st.warning("AI交易委员会暂时无法完成完整分析，已等待下一轮数据。")
+        st.warning("交易委员会暂时无法完成完整分析，已等待下一轮数据。")
         return
     permission = str(decision.get("trade_permission", "rejected"))
     action = str(decision.get("final_action", "继续观察"))
@@ -3748,11 +3933,11 @@ def render_ai_committee_decision(decision: dict[str, Any]) -> None:
         veto_status = "已触发"
         veto_html = "风险否决已触发，委员会禁止开仓。否决委员：" + "、".join(escape(str(name)) for name in veto_members)
         veto_class = "red"
-    st.markdown(
+    render_html(
         f"""
         <div class="app-shell">
           <div class="module-card">
-            <div class="module-title">AI交易委员会最终决议</div>
+            <div class="module-title">交易委员会最终决议</div>
             <div class="metric-value {_signal_color(action)}">{escape(action)} · {escape(direction)}</div>
             <div class="module-desc">委员会读取本地策略、趋势、资金、盘口、清算、大单、风险雷达和观察池状态，只生成决议和模拟候选，不执行交易。</div>
             <div class="committee-grid">
@@ -3769,10 +3954,8 @@ def render_ai_committee_decision(decision: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">投票统计</div><div class="summary-value">支持{len(supporting)} / 反对{len(opposing)} / 否决{len(veto_members)}</div></div>
               <div class="summary-card"><div class="summary-label">正式权重统计</div><div class="summary-value yellow">{weight_vote_text}</div></div>
             </div>
-            <div class="status-card" style="margin-top:8px;">
-              <b>AI主席总结</b><br>
-              {escape(str(decision.get("chairman_summary", "等待委员会形成最终总结。")))}
-            </div>
+            {_render_trading_committee_v91(decision)}
+            {_render_committee_summary_panel(decision)}
             <div class="status-card {veto_class}" style="margin-top:8px;">
               <b>风险否决状态</b><br>{veto_html}
             </div>
@@ -3782,65 +3965,55 @@ def render_ai_committee_decision(decision: dict[str, Any]) -> None:
               硬否决：{escape("已触发" if hard.get("blocked") else "未触发")}｜软否决：{escape(soft_text)}<br>
               权重结果：{escape(weight_vote_text)}｜直接决策权重：{escape(_fmt_weight(weight_summary["direct_weight"]))}｜配置总权重：{escape(_fmt_weight(weight_summary["total_config_weight"]))}
             </div>
-            <details class="status-card" style="margin-top:8px;">
-              <summary><b>委员会权重</b></summary>
-              {escape(weight_text)}
-            </details>
-            <details class="status-card" style="margin-top:8px;" open>
-              <summary><b>按委员权重投票明细</b></summary>
-              <div class="committee-vote-grid" style="margin-top:8px;">{weight_rows_html}</div>
-            </details>
-            <details class="status-card" style="margin-top:8px;" open>
-              <summary><b>外部 AI 正式投票复核</b></summary>
-              <div class="committee-grid" style="margin-top:8px;">
-                <div class="summary-card"><div class="summary-label">DeepSeek状态</div><div class="summary-value {_signal_color("反对交易" if deepseek.get("status") == "失败" else "支持交易")}">{escape(str(deepseek.get("status", "等待")))}</div></div>
-                <div class="summary-card"><div class="summary-label">DeepSeek意见</div><div class="summary-value">{escape(str(deepseek.get("vote", "观望")))} / {escape(str(deepseek.get("direction_text", "中性")))}</div></div>
-                <div class="summary-card"><div class="summary-label">DeepSeek耗时</div><div class="summary-value">{escape(str(deepseek.get("duration_ms", 0)))} ms</div></div>
-                <div class="summary-card"><div class="summary-label">Gemini状态</div><div class="summary-value {_signal_color("反对交易" if gemini.get("status") == "失败" else "支持交易")}">{escape(str(gemini.get("status", "等待")))}</div></div>
-                <div class="summary-card"><div class="summary-label">Gemini意见</div><div class="summary-value">{escape(str(gemini.get("vote", "观望")))} / {escape(str(gemini.get("direction_text", "中性")))}</div></div>
-                <div class="summary-card"><div class="summary-label">Gemini耗时</div><div class="summary-value">{escape(str(gemini.get("duration_ms", 0)))} ms</div></div>
-                <div class="summary-card"><div class="summary-label">外部AI一致性</div><div class="summary-value yellow">{escape(str(ai_consensus.get("agreement", "数据不足")))}</div></div>
-                <div class="summary-card"><div class="summary-label">综合风险</div><div class="summary-value {_signal_color(str(ai_consensus.get("combined_risk_level", "中")))}">{escape(str(ai_consensus.get("combined_risk_level", "中")))}</div></div>
-                <div class="summary-card"><div class="summary-label">建议调整</div><div class="summary-value yellow">{escape(str(ai_consensus.get("suggested_adjustment", "不调整")))}</div></div>
-              </div>
-              <div class="status-card" style="margin-top:8px;">
-                <b>DeepSeek委员（正式投票）</b>｜来源：{escape(str(deepseek.get("source", "降级结果")))}｜软否决：{escape("是" if deepseek.get("soft_veto") else "否")}<br>
-                {escape(str(deepseek_summary))}<br>
-                理由：<ol style="padding-left:18px;margin:6px 0 0 0;">{deepseek_reasons}</ol>
-                风险：<ol style="padding-left:18px;margin:6px 0 0 0;">{deepseek_risks}</ol>
-              </div>
-              <div class="status-card" style="margin-top:8px;">
-                <b>Gemini委员（正式投票）</b>｜来源：{escape(str(gemini.get("source", "降级结果")))}｜软否决：{escape("是" if gemini.get("soft_veto") else "否")}<br>
-                {escape(str(gemini_summary))}<br>
-                理由：<ol style="padding-left:18px;margin:6px 0 0 0;">{gemini_reasons}</ol>
-                风险：<ol style="padding-left:18px;margin:6px 0 0 0;">{gemini_risks}</ol>
-              </div>
-              <div class="status-card" style="margin-top:8px;"><b>外部AI综合：</b>{escape(str(ai_consensus.get("summary", "外部AI参与正式投票，但不直接执行交易。")))}</div>
-              外部 AI 当前参与正式权重投票，但不能直接执行交易，不能绕过风险委员和实盘安全委员。
-            </details>
             <div class="status-card" style="margin-top:8px;">支持：{escape("、".join(supporting) if supporting else "暂无明确支持委员")}<br>反对/观望：{escape("、".join(opposing) if opposing else "暂无明确反对委员")}<br>否决：{escape("、".join(veto_members) if veto_members else "无")}</div>
-            <details class="status-card" style="margin-top:8px;" open>
-              <summary><b>委员会解释</b></summary>
-              为什么通过或不通过：{escape(str(explanation.get("why_pass_or_not", "")))}<br>
-              当前最大风险：{escape(str(explanation.get("max_risk", "")))}<br>
-              下一步观察条件：{escape(str(explanation.get("next_condition", "")))}<br>
-              信号失效条件：{escape(str(explanation.get("invalid_condition", decision.get("invalid_condition", ""))))}
-            </details>
-            <details class="status-card" style="margin-top:8px;">
-              <summary><b>主要理由 / 主要风险 / 最终警告</b></summary>
-              <div class="module-grid" style="margin-top:8px;">
-                <div class="status-card"><b>主要理由</b><ol style="padding-left:18px;margin:6px 0 0 0;">{reasons_html}</ol></div>
-                <div class="status-card"><b>主要风险</b><ol style="padding-left:18px;margin:6px 0 0 0;">{risks_html}</ol></div>
-                <div class="status-card"><b>最终警告</b><ol style="padding-left:18px;margin:6px 0 0 0;">{warnings_html}</ol></div>
-              </div>
-            </details>
           </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
-    st.markdown('<div class="app-shell"><div class="module-card"><div class="module-title">委员投票明细</div><div class="module-desc">每个委员独立判断，风险委员拥有最高否决权。</div>', unsafe_allow_html=True)
+    render_committee_full_summary_expander(decision, "查看完整委员会总结")
+
+    with st.expander("委员会权重", expanded=False):
+        st.markdown(_safe_committee_text(weight_text, 500))
+
+    with st.expander("按委员权重投票明细", expanded=True):
+        for row in list(weight_summary.get("rows") or []):
+            st.markdown(
+                f"**{row.get('name', '委员')}**｜{row.get('vote', '观望')}｜"
+                f"权重 {_fmt_weight(float(row.get('weight', 0) or 0))}｜计入 {row.get('bucket', '-')}｜"
+                f"方向 {row.get('direction', '中性')}｜信心 {row.get('confidence', 0)}｜"
+                f"weighted_score {row.get('weighted_score', 0)}"
+            )
+        if not list(weight_summary.get("rows") or []):
+            st.markdown("暂无委员权重明细。")
+
+    with st.expander("外部 AI 正式投票复核", expanded=True):
+        st.markdown(f"**DeepSeek**：{deepseek.get('status', '等待')}｜{deepseek.get('vote', '观望')}｜方向 {deepseek.get('direction_text', '中性')}｜耗时 {deepseek.get('duration_ms', 0)} ms")
+        st.markdown(f"**Gemini**：{gemini.get('status', '等待')}｜{gemini.get('vote', '观望')}｜方向 {gemini.get('direction_text', '中性')}｜耗时 {gemini.get('duration_ms', 0)} ms")
+        st.markdown(f"**一致性**：{ai_consensus.get('agreement', '数据不足')}｜综合风险 {ai_consensus.get('combined_risk_level', '中')}｜建议 {ai_consensus.get('suggested_adjustment', '不调整')}")
+        st.markdown(f"**DeepSeek摘要**：{_safe_committee_text(deepseek_summary, 260)}")
+        st.markdown(f"**Gemini摘要**：{_safe_committee_text(gemini_summary, 260)}")
+        st.markdown(f"**外部AI综合**：{_safe_committee_text(ai_consensus.get('summary', '外部AI参与正式投票，但不直接执行交易。'), 260)}")
+        st.markdown("外部 AI 当前参与正式权重投票，但不能直接执行交易，不能绕过风险委员和实盘安全委员。")
+
+    with st.expander("委员会解释", expanded=True):
+        st.markdown(f"**为什么通过或不通过**：{_safe_committee_text(explanation.get('why_pass_or_not', ''), 260)}")
+        st.markdown(f"**当前最大风险**：{_safe_committee_text(explanation.get('max_risk', ''), 260)}")
+        st.markdown(f"**下一步观察条件**：{_safe_committee_text(explanation.get('next_condition', ''), 260)}")
+        st.markdown(f"**信号失效条件**：{_safe_committee_text(explanation.get('invalid_condition', decision.get('invalid_condition', '')), 260)}")
+
+    with st.expander("主要理由 / 主要风险 / 最终警告", expanded=False):
+        st.markdown("**主要理由**")
+        for item in list(decision.get("main_reasons") or []):
+            st.markdown(f"- {_safe_committee_text(item, 220)}")
+        st.markdown("**主要风险**")
+        for item in list(decision.get("main_risks") or []):
+            st.markdown(f"- {_safe_committee_text(item, 220)}")
+        st.markdown("**最终警告**")
+        for item in list(decision.get("final_warnings") or []):
+            st.markdown(f"- {_safe_committee_text(item, 220)}")
+
+    render_html('<div class="app-shell"><div class="module-card"><div class="module-title">委员投票明细</div><div class="module-desc">每个委员独立判断，风险委员拥有最高否决权。</div>')
     for member in list(decision.get("member_votes") or []):
         member_name = str(member.get("member_name", "委员"))
         vote = str(member.get("vote", "建议观望"))
@@ -3851,21 +4024,20 @@ def render_ai_committee_decision(decision: dict[str, Any]) -> None:
         member_reasons = _render_numbered(list(member.get("reasons") or []))
         member_risks = _render_numbered(list(member.get("risks") or []))
         with st.expander(f"{member_name}｜{member_type}｜{vote}｜权重 {_fmt_weight(member_weight)}｜计入 {member_bucket}｜否决 {veto}", expanded=False):
-            st.markdown(
+            render_html(
                 f"""
                 <div class="status-card">
                   身份：{escape(member_type)}｜权重：{_fmt_weight(member_weight)}｜计入：{escape(member_bucket)}｜否决：{escape(veto)}<br>
                   方向：{escape(str(member.get("direction_text", "中性")))}<br>
                   vote_strength：{escape(str(member.get("vote_strength", 0)))}｜weighted_score：{escape(str(member.get("weighted_score", 0)))}｜软警告：{escape("是" if member.get("soft_warning") else "否")}<br>
                   风险：{escape(str(member.get("risk_level", "中")))}<br>
-                  总结：{escape(str(member.get("summary", "")))}<br>
+                  总结：{escape(_safe_committee_text(member.get("summary", "")))}<br>
                   <b>理由</b><ol style="padding-left:18px;margin:6px 0 0 0;">{member_reasons}</ol>
                   <b>风险</b><ol style="padding-left:18px;margin:6px 0 0 0;">{member_risks}</ol>
                 </div>
-                """,
-                unsafe_allow_html=True,
+                """
             )
-    st.markdown("</div></div>", unsafe_allow_html=True)
+    render_html("</div></div>")
 
 
 def render_sim_signal_linkage(decision: dict[str, Any]) -> None:
@@ -4494,7 +4666,7 @@ def render_trading() -> None:
               <div class="summary-card"><div class="summary-label">模拟订单状态</div><div class="summary-value">{escape("已有待触发订单" if any(o.get("symbol") == symbol for o in orders) else "未创建订单")}</div></div>
               <div class="summary-card"><div class="summary-label">模拟持仓状态</div><div class="summary-value">{escape("已有同币种持仓" if any(p.get("symbol") == symbol for p in positions) else "无同币种持仓")}</div></div>
             </div>
-            <div class="status-card" style="margin-top:8px;">AI主席总结：{escape(str(signal.get("chairman_summary", "等待委员会总结。")))}</div>
+            <div class="status-card" style="margin-top:8px;">AI主席总结：{escape(_safe_committee_text(signal.get("chairman_summary", "等待委员会总结。"), 420))}</div>
             """,
             unsafe_allow_html=True,
         )
@@ -4533,7 +4705,7 @@ def render_trading() -> None:
                   止损：{format_waiting_price(pos.get("stop_loss"))}　止盈1：{format_waiting_price(pos.get("take_profit_1"))}　止盈2：{format_waiting_price(pos.get("take_profit_2"))}<br>
                   R倍数：{f"{r_value:+.2f}R" if r_value is not None else "暂无"}　持仓：{escape(str(holding.get("text", "0分钟")))}　止盈1：{"已触发" if pos.get("tp1_hit") else "未触发"}　保本止损：{"已移动" if pos.get("moved_stop_to_breakeven") else "未移动"}<br>
                   委员会：{escape(str(pos.get("committee_action", "等待")))} / 置信度{pos.get("committee_confidence", 0)} / 风险{pos.get("committee_risk_score", 0)}<br>
-                  AI主席摘要：{escape(str((pos.get("committee_snapshot") or {}).get("chairman_summary", pos.get("open_reason", "暂无摘要"))))}
+                  AI主席摘要：{escape(_safe_committee_text((pos.get("committee_snapshot") or {}).get("chairman_summary", pos.get("open_reason", "暂无摘要")), 420))}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -4585,7 +4757,7 @@ def render_trading() -> None:
                 st.rerun()
             with oc2.expander("查看委员会信号摘要", expanded=False):
                 snapshot = order.get("committee_snapshot") or {}
-                st.markdown(f"主席总结：{snapshot.get('chairman_summary') or order.get('reason') or '暂无'}")
+                st.markdown(f"主席总结：{escape(_safe_committee_text(snapshot.get('chairman_summary') or order.get('reason') or '暂无', 420))}", unsafe_allow_html=True)
                 st.markdown(f"置信度：{snapshot.get('committee_confidence', 0)}｜风险：{snapshot.get('risk_score', 0)}｜风险收益比：{snapshot.get('risk_reward_ratio')}")
         st.markdown("</div></div>", unsafe_allow_html=True)
 
@@ -4907,7 +5079,7 @@ def render_learning() -> None:
                   <b>{escape(str(row.get("symbol", "")))}</b>｜{escape("空单" if row.get("direction") == "short" else "多单")}｜{escape(str(row.get("close_reason", "")))}｜
                   <span class="{_signal_color("支持交易" if pnl >= 0 else "反对交易")}">{pnl:+.2f} USDT</span><br>
                   委员会动作：{escape(str(row.get("committee_action", "暂无")))}｜策略：{escape(str(row.get("strategy_name", "暂无")))}｜风险收益比：{escape(str(row.get("risk_reward_ratio", "暂无")))}<br>
-                  主席总结：{escape(str(row.get("chairman_summary", "暂无")))}
+                  主席总结：{escape(_safe_committee_text(row.get("chairman_summary", "暂无"), 420))}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -5356,7 +5528,7 @@ def render_live_trading_center() -> None:
             if plan.get("manual_override"):
                 st.warning("你选择的真实订单金额高于系统建议金额。该行为将被记录为人工干预，并在复盘中单独标记。")
             for row_name, airow in [("DeepSeek", external_ai.get("deepseek") or {}), ("Gemini", external_ai.get("gemini") or {})]:
-                st.caption(f"{row_name}影子意见：{airow.get('vote', '观望')}｜风险 {airow.get('risk_level', '中')}｜建议 {airow.get('suggested_adjustment', '不调整')}｜{airow.get('summary', '暂无')}")
+                st.caption(f"{row_name}影子意见：{airow.get('vote', '观望')}｜风险 {airow.get('risk_level', '中')}｜建议 {airow.get('suggested_adjustment', '不调整')}｜{_safe_committee_text(airow.get('summary', '暂无'), 260)}")
             if any((external_ai.get(k) or {}).get("soft_veto") for k in ["deepseek", "gemini"]):
                 st.warning("外部AI存在风险提醒，继续操作将被记录为人工风险确认。")
             if not validation.get("ok"):
@@ -6610,8 +6782,8 @@ def _render_approval_card(approval: dict[str, Any], compact: bool = False) -> No
             <div class="status-card">
               有效期：{escape(str(approval.get("expires_at", "-")))}｜
               用户选择金额：{escape(str(approval.get("user_selected_amount") or "未选择"))}<br>
-              DeepSeek：{escape(str(deep.get("vote", "暂无")))}｜风险 {escape(str(deep.get("risk_level", "-")))}｜{escape(str(deep.get("summary", "暂无")))}<br>
-              Gemini：{escape(str(gemini.get("vote", "暂无")))}｜风险 {escape(str(gemini.get("risk_level", "-")))}｜{escape(str(gemini.get("summary", "暂无")))}
+              DeepSeek：{escape(str(deep.get("vote", "暂无")))}｜风险 {escape(str(deep.get("risk_level", "-")))}｜{escape(_safe_committee_text(deep.get("summary", "暂无")))}<br>
+              Gemini：{escape(str(gemini.get("vote", "暂无")))}｜风险 {escape(str(gemini.get("risk_level", "-")))}｜{escape(_safe_committee_text(gemini.get("summary", "暂无")))}
             </div>
             """,
             unsafe_allow_html=True,
