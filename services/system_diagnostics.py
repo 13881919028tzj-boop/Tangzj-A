@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ SPOT_BASE_URL = "https://api.binance.com"
 SPOT_FALLBACK_BASE_URL = "https://data-api.binance.vision"
 FUTURES_BASE_URL = "https://fapi.binance.com"
 REQUEST_TIMEOUT = 12
+_BASE_BAN_UNTIL: dict[str, float] = {}
 
 
 def _now() -> str:
@@ -65,6 +67,25 @@ def log_binance_request(level: str, path: str, params: dict[str, Any] | None, re
     )
 
 
+def _ban_message_until(message: str) -> float:
+    match = re.search(r"banned until (\d{10,13})", message)
+    if not match:
+        return 0.0
+    raw = int(match.group(1))
+    return raw / 1000 if raw > 10_000_000_000 else float(raw)
+
+
+def _record_binance_ban(root: str, message: str) -> None:
+    until = _ban_message_until(message)
+    if until > time.time():
+        _BASE_BAN_UNTIL[root] = until
+
+
+def is_binance_base_banned(root: str) -> bool:
+    """Return whether a Binance base URL is in the local ban circuit breaker."""
+    return _BASE_BAN_UNTIL.get(root, 0.0) > time.time()
+
+
 def safe_binance_rest_get(
     path: str,
     params: dict[str, Any] | None = None,
@@ -80,11 +101,20 @@ def safe_binance_rest_get(
     for index, root in enumerate([base_url, fallback_base_url] if fallback_base_url else [base_url]):
         if not root:
             continue
+        banned_until = _BASE_BAN_UNTIL.get(root, 0.0)
+        if banned_until > time.time():
+            last_error = f"{root} 已被 Binance 临时封禁，跳过请求至 {datetime.fromtimestamp(banned_until).strftime('%Y-%m-%d %H:%M:%S')}"
+            log_binance_request("WARNING", path, params, "熔断跳过", last_error, 0, root)
+            continue
         url = f"{root}{path}"
         started = time.perf_counter()
         try:
             response = requests.get(url, params=params, timeout=timeout, headers=headers, verify=verify)
             elapsed = int((time.perf_counter() - started) * 1000)
+            if response.status_code in {418, 429}:
+                reason = response.text[:500]
+                _record_binance_ban(root, reason)
+                raise RuntimeError(f"HTTP {response.status_code} Binance限流/封禁: {reason}")
             response.raise_for_status()
             data = response.json()
             log_binance_request("INFO", path, params, "正常", f"HTTP {response.status_code}", elapsed, root)
@@ -92,6 +122,7 @@ def safe_binance_rest_get(
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             last_error = repr(exc)
+            _record_binance_ban(root, last_error)
             level = "WARNING" if index == 0 and fallback_base_url else "ERROR"
             log_binance_request(level, path, params, "异常", last_error, elapsed, root)
     raise RuntimeError(f"Binance公共请求失败 path={path} params={params} error={last_error}")

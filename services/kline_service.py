@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from services.system_diagnostics import safe_binance_rest_get
+from services.system_diagnostics import is_binance_base_banned, safe_binance_rest_get
 
 
 BINANCE_PUBLIC_BASE_URL = "https://api.binance.com"
@@ -42,6 +42,8 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> list[dict[str, A
         "limit": max(20, min(int(limit), 1000)),
     }
     try:
+        if is_binance_base_banned(BINANCE_PUBLIC_BASE_URL):
+            raise RuntimeError("spot_public_temporarily_banned")
         raw_rows = _request_public("/api/v3/klines", params)
         data_source = "spot_rest"
     except Exception as spot_exc:

@@ -9,10 +9,11 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from services.system_diagnostics import safe_binance_rest_get
+from services.system_diagnostics import is_binance_base_banned, safe_binance_rest_get
 
 
 BINANCE_PUBLIC_BASE_URL = "https://api.binance.com"
+BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 REQUEST_TIMEOUT = 3
 
 
@@ -53,7 +54,24 @@ def _with_cumulative(levels: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def get_orderbook(symbol: str, limit: int = 20) -> dict[str, Any]:
     """获取指定交易对象盘口订单簿。"""
     normalized_symbol = str(symbol or "").upper().strip()
-    data = _request_public("/api/v3/depth", {"symbol": normalized_symbol, "limit": max(5, min(limit, 100))})
+    params = {"symbol": normalized_symbol, "limit": max(5, min(limit, 100))}
+    try:
+        if is_binance_base_banned(BINANCE_PUBLIC_BASE_URL):
+            raise RuntimeError("spot_public_temporarily_banned")
+        data = _request_public("/api/v3/depth", params)
+        data_source = "spot_depth"
+    except Exception as spot_exc:
+        try:
+            data = safe_binance_rest_get(
+                "/fapi/v1/depth",
+                params,
+                base_url=BINANCE_FUTURES_BASE_URL,
+                fallback_base_url=None,
+                timeout=REQUEST_TIMEOUT,
+            )
+            data_source = "futures_depth_fallback"
+        except Exception as futures_exc:
+            raise RuntimeError(f"盘口REST获取失败 symbol={normalized_symbol} spot={spot_exc!r} futures={futures_exc!r}") from futures_exc
     bids = _with_cumulative([_normalize_level(level) for level in data.get("bids", [])[:10]])
     asks = _with_cumulative([_normalize_level(level) for level in data.get("asks", [])[:10]])
     if not bids or not asks:
@@ -67,6 +85,7 @@ def get_orderbook(symbol: str, limit: int = 20) -> dict[str, Any]:
         "updated_at": datetime.now().strftime("%H:%M:%S"),
         "status": "正常",
         "error": "",
+        "source": data_source,
     }
 
 

@@ -10,6 +10,7 @@ import json
 import os
 import time
 from html import escape
+from pathlib import Path
 from typing import Any
 
 import plotly.graph_objects as go
@@ -36,7 +37,9 @@ from services.approval_center import (
 )
 from services.background_refresher import (
     refresh_klines_now,
+    refresh_orderbook_now,
     refresh_symbol_now,
+    refresh_whales_now,
     start_background_refresher,
 )
 from services.binance_public import get_all_24hr_tickers, get_24hr_ticker
@@ -257,12 +260,25 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.0"
+APP_TITLE = "AI模型 9.0.1"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.0 交易版"
+VERSION = "AI模型 9.0.1 实时行情缓存桥接 + 持仓现价刷新 + 信号链路修复版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
+SIGNAL_CHAIN_LOG = LOG_DIR / "signal_chain_debug.log"
+
+
+def append_debug_log(path: Path, message: str) -> None:
+    """Write short diagnostics without secrets."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
 
 NAV_ITEMS = [
     ("总览", "home", "⌂"),
@@ -570,6 +586,18 @@ def on_symbol_change() -> None:
     set_current_symbol(st.session_state.selected_symbol, source="manual_select")
 
 
+def is_user_selected_symbol_source(source: Any | None = None) -> bool:
+    """判断当前交易对象是否来自用户点击、URL或搜索，避免被机会榜自动覆盖。"""
+    value = str(source if source is not None else st.session_state.get("current_symbol_source", "")).strip()
+    if not value:
+        return False
+    return (
+        value in {"manual_select", "url_param", "opportunity_board_click"}
+        or value.endswith("_search")
+        or value.startswith("watch_")
+    )
+
+
 def set_current_symbol(symbol: str, source: str = "manual_select") -> None:
     """写入全局唯一当前交易对象，并同步顶部、K线、盘口、信号和委员会对象。"""
     normalized = str(symbol or "").upper().strip()
@@ -588,13 +616,29 @@ def set_current_symbol(symbol: str, source: str = "manual_select") -> None:
     st.session_state["selected_opportunity_symbol"] = normalized if source == "opportunity_board_click" else st.session_state.get("selected_opportunity_symbol", "")
     market_cache.set_current_symbol(normalized)
     market_cache.request_refresh()
+    refresh_errors: list[str] = []
     try:
         if not market_cache.get_ticker(normalized):
             refresh_symbol_now(normalized)
+    except Exception as exc:
+        refresh_errors.append(f"Ticker：{exc!r}")
+    try:
         if len(market_cache.get_klines(normalized, market_cache.get_kline_interval())) < 60:
             refresh_klines_now(normalized, market_cache.get_kline_interval())
     except Exception as exc:
-        st.session_state["last_error"] = f"切换交易对象后数据刷新失败：{exc!r}"
+        refresh_errors.append(f"K线：{exc!r}")
+    try:
+        if not market_cache.get_orderbook(normalized):
+            refresh_orderbook_now(normalized)
+    except Exception as exc:
+        refresh_errors.append(f"盘口：{exc!r}")
+    try:
+        if not market_cache.get_whales(normalized):
+            refresh_whales_now(normalized)
+    except Exception as exc:
+        refresh_errors.append(f"大单：{exc!r}")
+    if refresh_errors:
+        st.session_state["last_error"] = "切换交易对象后部分数据刷新失败：" + "；".join(refresh_errors[:4])
     try:
         st.query_params["page"] = st.session_state.get("active_page", "home")
         st.query_params["symbol"] = normalized
@@ -604,6 +648,12 @@ def set_current_symbol(symbol: str, source: str = "manual_select") -> None:
 
 def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]] | None = None) -> None:
     """默认锚定机会榜TOP1；TOP1不满足时切换到已进入候选的币。"""
+    if is_user_selected_symbol_source():
+        current = str(st.session_state.get("current_symbol", "")).upper().strip()
+        st.session_state["committee_active_symbol"] = current
+        st.session_state["committee_target_symbol"] = current
+        st.session_state["committee_anchor_source"] = "用户手动查看"
+        return
     status = get_fast_opportunity_status()
     settings = status.get("settings") or {}
     if not bool(settings.get("ENABLE_COMMITTEE_ANCHOR_TOP1", True)):
@@ -629,7 +679,8 @@ def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]]
     if not top1_satisfies and candidate:
         selected_target = str(candidate.get("symbol", target)).upper().strip()
         selected_source = "candidate_auto_switch"
-    if selected_target != str(st.session_state.get("current_symbol", "")).upper():
+    current_source = str(st.session_state.get("current_symbol_source", ""))
+    if selected_target != str(st.session_state.get("current_symbol", "")).upper() and current_source in {"", "default_bootstrap", "opportunity_top1_default", "candidate_auto_switch"}:
         set_current_symbol(selected_target, source=selected_source)
     st.session_state["committee_active_symbol"] = selected_target
     st.session_state["committee_target_symbol"] = selected_target
@@ -727,6 +778,18 @@ def format_price(value: Any) -> str:
     if number >= 1:
         return f"{number:,.4f}"
     return f"{number:,.8f}".rstrip("0").rstrip(".")
+
+
+def format_waiting_price(value: Any) -> str:
+    number = safe_number(value)
+    if number is None or number <= 0:
+        return "等待价格刷新"
+    return format_price(number)
+
+
+def valid_price(value: Any) -> float | None:
+    number = safe_number(value)
+    return number if number is not None and number > 0 else None
 
 
 def format_percent(value: Any) -> str:
@@ -987,8 +1050,8 @@ def score_color(value: Any, good_at: int, warn_at: int | None = None) -> str:
 
 def build_ai_status(scores: dict[str, Any]) -> tuple[str, str]:
     """首页AI建议状态，避免把已开发模块显示成待接入。"""
-    opportunity = scores.get("opportunity_score")
-    risk = scores.get("risk_score")
+    opportunity = safe_score(scores.get("opportunity_score"))
+    risk = safe_score(scores.get("risk_score"))
     if opportunity is None or risk is None:
         return "计算中", "yellow"
     if risk >= 85:
@@ -1077,12 +1140,58 @@ def _find_opportunity_row(symbol: str, rankings: dict[str, list[dict[str, Any]]]
     return None
 
 
+def live_refresh_due(key: str, seconds: float) -> bool:
+    """Session-local throttle for live server-side refreshes."""
+    now = time.monotonic()
+    refresh_times = st.session_state.setdefault("_live_refresh_times", {})
+    last = float(refresh_times.get(key, 0) or 0)
+    if now - last < seconds:
+        return False
+    refresh_times[key] = now
+    return True
+
+
+def ticker_from_rankings(symbol: str, rankings: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any] | None:
+    """Build a lightweight ticker from ranking rows when live ticker cache is cold."""
+    row = _find_opportunity_row(symbol, rankings)
+    if not row:
+        return None
+    price = safe_number(row.get("last_price"), safe_number(row.get("current_price"), safe_number(row.get("price"))))
+    if price is None or price <= 0:
+        return None
+    return {
+        "symbol": str(row.get("symbol") or symbol).upper().strip(),
+        "last_price": price,
+        "price_change_percent": safe_number(row.get("price_change_percent"), 0) or 0,
+        "quote_volume": safe_number(row.get("quote_volume"), 0) or 0,
+        "volume": safe_number(row.get("volume"), 0) or 0,
+        "updated_at": row.get("updated_at") or "来自机会榜缓存",
+        "price_status": "ranking",
+    }
+
+
+def get_effective_ticker(symbol: str, rankings: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any] | None:
+    """Read live ticker first, then bridge from rankings if needed."""
+    normalized = str(symbol or "").upper().strip()
+    ticker = market_cache.get_ticker(normalized)
+    if ticker:
+        ticker.setdefault("price_status", "live")
+        return ticker
+    fallback = ticker_from_rankings(normalized, rankings)
+    if fallback:
+        market_cache.set_ticker(normalized, fallback)
+        append_debug_log(SIGNAL_CHAIN_LOG, f"ticker_bridge_from_rankings symbol={normalized}")
+        return fallback
+    return None
+
+
 def render_fixed_market_bar(symbol: str) -> None:
     """渲染前端实时顶部状态栏，不触发 Streamlit 每秒重绘。"""
     try:
         live_symbol = str(st.session_state.get("current_symbol") or symbol or "BTCUSDT").upper().strip()
         interval = market_cache.get_kline_interval()
-        ticker = market_cache.get_ticker(live_symbol)
+        rankings = market_cache.get_rankings()
+        ticker = get_effective_ticker(live_symbol, rankings)
         if not ticker:
             try:
                 ticker = get_24hr_ticker(live_symbol)
@@ -1090,12 +1199,25 @@ def render_fixed_market_bar(symbol: str) -> None:
             except Exception:
                 ticker = None
         kline_rows = market_cache.get_klines(live_symbol, interval)
+        orderbook = market_cache.get_orderbook(live_symbol)
+        whale = market_cache.get_whales(live_symbol)
         scores = local_scores(ticker, kline_rows) or {}
-        opportunity_row = _find_opportunity_row(live_symbol, market_cache.get_rankings())
+        opportunity_row = _find_opportunity_row(live_symbol, rankings)
         committee_summary = (opportunity_row or {}).get("committee_summary") or {}
         final_opp = (opportunity_row or {}).get("final_opportunity_score", scores.get("opportunity_score"))
         risk_value = (opportunity_row or {}).get("risk_score", scores.get("risk_score"))
-        ai_advice = committee_summary.get("final_action") or scores.get("trend_label") or "计算中"
+        status_bits = []
+        if not ticker:
+            status_bits.append("等待实时价格")
+        if len(kline_rows) < 80:
+            status_bits.append(f"K线{len(kline_rows)}/80")
+        if not orderbook:
+            status_bits.append("盘口等待刷新")
+        if not whale:
+            status_bits.append("暂无明显大单")
+        data_status = "｜".join(status_bits) or "数据实时"
+        ai_advice = committee_summary.get("final_action") or scores.get("trend_label") or data_status
+        update_time = escape(str((ticker or {}).get("updated_at") or market_cache.snapshot().get("last_update_time") or "等待更新"))
         price = format_price((ticker or {}).get("last_price"))
         change_number = safe_number((ticker or {}).get("price_change_percent"))
         change = format_percent(change_number)
@@ -1124,7 +1246,7 @@ def render_fixed_market_bar(symbol: str) -> None:
       <div class="ticker-cell"><div class="ticker-label">当前交易对象</div><div class="ticker-value" id="symbol">{live_symbol}</div></div>
       <div class="ticker-cell"><div class="ticker-label">当前价格</div><div class="ticker-value" id="price">{price}</div></div>
       <div class="ticker-cell"><div class="ticker-label">涨跌幅</div><div class="ticker-value {change_class}" id="change">{change}</div></div>
-      <div class="ticker-cell"><div class="ticker-label">AI建议</div><div class="ticker-value yellow">{escape(str(ai_advice))}</div></div>
+      <div class="ticker-cell"><div class="ticker-label">AI建议 / 状态</div><div class="ticker-value yellow" title="{escape(data_status)}｜更新：{update_time}">{escape(str(ai_advice))}</div></div>
       <div class="ticker-cell"><div class="ticker-label">风险评分</div><div class="ticker-value {risk_class}">{format_score(risk_value)}</div></div>
       <div class="ticker-cell"><div class="ticker-label">机会评分</div><div class="ticker-value {opp_class}">{format_score(final_opp)}</div></div>
     </div></div>
@@ -1142,14 +1264,14 @@ def render_fixed_market_bar(symbol: str) -> None:
       }}
       async function tick() {{
         try {{
-          const data = await fetchTopbarJson(`/api/ticker?symbol=${{symbol}}`);
+          const data = await fetchTopbarJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
           const change = Number(data.price_change_percent);
           priceEl.textContent = fmtPrice(data.last_price);
           changeEl.textContent = Number.isFinite(change) ? `${{change > 0 ? "+" : ""}}${{change.toFixed(2)}}%` : "重试中";
           changeEl.className = Number.isFinite(change) ? `ticker-value ${{change >= 0 ? "green" : "red"}}` : "ticker-value yellow";
         }} catch (err) {{
-          priceEl.textContent = "获取失败";
-          changeEl.textContent = "重试中";
+          priceEl.textContent = err && err.message ? err.message : "获取失败";
+          changeEl.textContent = "等待刷新";
           changeEl.className = "ticker-value yellow";
         }}
       }}
@@ -1166,22 +1288,52 @@ def frontend_api_client_js(function_name: str = "fetchLocalApiJson") -> str:
     return (
         """
       const LOCAL_API_PORT = "__PORT__";
-      const LOCAL_API_BASES = [
-        `${window.location.protocol}//${window.location.hostname}:${LOCAL_API_PORT}`,
-        `http://127.0.0.1:${LOCAL_API_PORT}`
-      ];
-      async function __FN__(path) {
-        let lastErr = null;
-        for (const base of LOCAL_API_BASES) {
+      function getCleanLocalApiBase() {
+        let protocol = "";
+        let hostname = "";
+        const readLocation = (loc) => {
           try {
-            const res = await fetch(`${base}${path}`, {cache:"no-store"});
-            if (res.ok) return await res.json();
-            lastErr = new Error(`HTTP ${res.status}`);
-          } catch (err) {
-            lastErr = err;
-          }
+            if (!protocol && /^https?:$/.test(loc.protocol || "")) protocol = loc.protocol;
+            if (!hostname && loc.hostname) hostname = loc.hostname;
+          } catch (_) {}
+        };
+        readLocation(window.location);
+        try {
+          if (window.parent && window.parent !== window) readLocation(window.parent.location);
+        } catch (_) {}
+        if ((!hostname || !/^https?:$/.test(protocol)) && document.referrer) {
+          try {
+            const ref = new URL(document.referrer);
+            if (!protocol && /^https?:$/.test(ref.protocol || "")) protocol = ref.protocol;
+            if (!hostname && ref.hostname) hostname = ref.hostname;
+          } catch (_) {}
         }
-        throw lastErr || new Error("local api unavailable");
+        if (!/^https?:$/.test(protocol)) protocol = "http:";
+        if (!hostname) throw new Error("无法识别当前公网主机，前端行情API地址生成失败");
+        return `${protocol}//${hostname}:${LOCAL_API_PORT}`;
+      }
+      function buildLocalApiUrl(path) {
+        const apiBase = getCleanLocalApiBase();
+        const parsed = new URL(String(path || "/"), apiBase);
+        const url = new URL(`${parsed.pathname}${parsed.search}`, apiBase);
+        url.username = "";
+        url.password = "";
+        return url.toString();
+      }
+      async function __FN__(path) {
+        try {
+          const res = await fetch(buildLocalApiUrl(path), {cache:"no-store"});
+          let data = {};
+          try { data = await res.json(); } catch (_) { data = {}; }
+          if (res.ok && data.ok !== false) return data;
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        } catch (err) {
+          const message = err && err.message ? err.message : "本地行情API不可用";
+          if (/URL is not valid|user credentials/i.test(message)) {
+            throw new Error("前端行情API地址无效，请检查公网访问地址和API端口");
+          }
+          throw new Error(message);
+        }
       }
         """
         .replace("__PORT__", port)
@@ -1269,7 +1421,7 @@ def build_current_local_strategy(symbol: str, ticker: dict[str, Any] | None) -> 
     live_symbol = str(symbol or st.session_state.get("current_symbol", "BTCUSDT")).upper().strip()
     interval = market_cache.get_kline_interval()
     rows = market_cache.get_klines(live_symbol, interval)
-    live_ticker = market_cache.get_ticker(live_symbol) or ticker
+    live_ticker = get_effective_ticker(live_symbol) or ticker
     current_price = live_ticker.get("last_price") if live_ticker else None
     orderbook_analysis = analyze_orderbook(market_cache.get_orderbook(live_symbol), current_price)
     analysis = build_signal_analysis(live_ticker, rows, orderbook_analysis)
@@ -1301,7 +1453,7 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
     interval = market_cache.get_kline_interval()
     rows = market_cache.get_klines(live_symbol, interval)
     passed_symbol = str((ticker or {}).get("symbol") or "").upper().strip()
-    live_ticker = market_cache.get_ticker(live_symbol) or (ticker if passed_symbol == live_symbol else None)
+    live_ticker = get_effective_ticker(live_symbol) or (ticker if passed_symbol == live_symbol else None)
     current_price = live_ticker.get("last_price") if live_ticker else None
     orderbook_analysis = analyze_orderbook(market_cache.get_orderbook(live_symbol), current_price)
     analysis = build_signal_analysis(live_ticker, rows, orderbook_analysis)
@@ -1448,6 +1600,7 @@ def build_sim_price_map(current_symbol: str, summary: dict[str, Any] | None = No
     """收集模拟交易需要的当前价格。"""
     symbols = {str(current_symbol or st.session_state.get("current_symbol", "BTCUSDT")).upper()}
     summary = summary or get_sim_account_summary()
+    rows = list(summary.get("positions") or []) + list(summary.get("orders") or [])
     for row in list(summary.get("positions") or []) + list(summary.get("orders") or []):
         symbol = str(row.get("symbol", "")).upper()
         if symbol:
@@ -1455,8 +1608,52 @@ def build_sim_price_map(current_symbol: str, summary: dict[str, Any] | None = No
     prices: dict[str, float] = {}
     for symbol in symbols:
         ticker = market_cache.get_ticker(symbol) or {}
-        prices[symbol] = float(ticker.get("last_price") or 0)
+        price = valid_price(ticker.get("last_price"))
+        if price is None:
+            old = next((row for row in rows if str(row.get("symbol") or "").upper() == symbol), {})
+            price = valid_price(old.get("current_price"))
+        if price is not None:
+            prices[symbol] = price
     return prices
+
+
+def refresh_sim_positions_lightweight(summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Refresh only simulated position/order symbols before rendering positions."""
+    summary = summary or get_sim_account_summary()
+    rows = list(summary.get("positions") or []) + list(summary.get("orders") or [])
+    symbols = sorted({str(row.get("symbol") or "").upper().strip() for row in rows if row.get("symbol")})
+    price_map: dict[str, float] = {}
+    statuses: dict[str, str] = {}
+    success = 0
+    missing = 0
+    for symbol in symbols:
+        ticker = market_cache.get_ticker(symbol)
+        if not ticker:
+            try:
+                refresh_symbol_now(symbol)
+                ticker = market_cache.get_ticker(symbol)
+            except Exception as exc:
+                append_debug_log(POSITION_PRICE_LOG, f"position_page_refresh_failed symbol={symbol} error={repr(exc)}")
+        price = safe_number((ticker or {}).get("last_price"), 0) or 0
+        if price > 0:
+            price_map[symbol] = price
+            statuses[symbol] = str((ticker or {}).get("price_status") or "live")
+            success += 1
+        else:
+            old = next((row for row in rows if str(row.get("symbol") or "").upper() == symbol), {})
+            fallback = safe_number(old.get("current_price"), 0) or 0
+            price_map[symbol] = fallback
+            statuses[symbol] = "stale" if fallback > 0 else "missing"
+            missing += 1
+    if symbols:
+        append_debug_log(POSITION_PRICE_LOG, f"position_page_update symbols={len(symbols)} success={success} missing={missing}")
+        try:
+            update_simulation(price_map, [], statuses)
+            summary = get_sim_account_summary()
+        except Exception as exc:
+            append_debug_log(POSITION_PRICE_LOG, f"position_page_update_simulation_failed error={repr(exc)}")
+            st.warning(f"持仓价格刷新失败：{exc!r}")
+    return summary
 
 
 def render_sim_overview_window(summary: dict[str, Any]) -> None:
@@ -2509,6 +2706,7 @@ def frontend_kline_html(symbol: str, interval: str, visible_mas: list[str], char
       const followLatest = {str(bool(follow_latest)).lower()};
       const statusEl = document.getElementById("status");
       let rows = [];
+      let klineMessage = "";
       let userInteracted = false;
       let listenerBound = false;
       const chart = document.getElementById("chart");
@@ -2607,11 +2805,13 @@ def frontend_kline_html(symbol: str, interval: str, visible_mas: list[str], char
         return {{scrollZoom: chartInteractive, displayModeBar:false, responsive:true, doubleClick:"reset", staticPlot: !chartInteractive}};
       }}
       async function fetchKlines() {{
-        const data = await fetchKlineJson(`/api/klines?symbol=${{symbol}}&interval=${{interval}}`);
-        rows = Array.isArray(data) ? data.map(r => ({{openTime:r.openTime, open:Number(r.open), high:Number(r.high), low:Number(r.low), close:Number(r.close), volume:Number(r.volume), closeTime:r.closeTime}})) : [];
+        const data = await fetchKlineJson(`/api/klines?symbol=${{encodeURIComponent(symbol)}}&interval=${{encodeURIComponent(interval)}}`);
+        klineMessage = data.message || "";
+        const payloadRows = Array.isArray(data) ? data : (data.rows || []);
+        rows = payloadRows.map(r => ({{openTime:r.openTime, open:Number(r.open), high:Number(r.high), low:Number(r.low), close:Number(r.close), volume:Number(r.volume), closeTime:r.closeTime}}));
       }}
       async function fetchTickerPatch() {{
-        const data = await fetchKlineJson(`/api/ticker?symbol=${{symbol}}`);
+        const data = await fetchKlineJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
         const price = Number(data.last_price);
         if (!rows.length || !Number.isFinite(price)) return;
         const last = rows[rows.length - 1];
@@ -2634,10 +2834,10 @@ def frontend_kline_html(symbol: str, interval: str, visible_mas: list[str], char
             await draw();
             statusEl.textContent = "K线实时更新中";
           }} else {{
-            statusEl.textContent = "等待本地K线缓存...";
+            statusEl.textContent = klineMessage || "等待本地K线缓存...";
           }}
         }} catch (err) {{
-          statusEl.textContent = "K线获取失败，正在重试";
+          statusEl.textContent = err && err.message ? err.message : "K线获取失败，正在重试";
         }}
       }}
       async function fastLoop() {{
@@ -2645,9 +2845,9 @@ def frontend_kline_html(symbol: str, interval: str, visible_mas: list[str], char
           if (!rows.length) await fetchKlines();
           await fetchTickerPatch();
           await draw();
-          statusEl.textContent = `实时：${{new Date().toLocaleTimeString()}}`;
+          statusEl.textContent = rows.length ? `实时：${{new Date().toLocaleTimeString()}}` : (klineMessage || "K线正在后台刷新");
         }} catch (err) {{
-          statusEl.textContent = "实时更新失败，重试中";
+          statusEl.textContent = err && err.message ? err.message : "实时更新失败，重试中";
         }}
       }}
       async function slowLoop() {{
@@ -2684,7 +2884,22 @@ def render_kline_system(symbol: str) -> None:
     """渲染专业实时K线系统。"""
     snapshot = market_cache.snapshot()
     interval = market_cache.get_kline_interval()
+    if live_refresh_due(f"ticker:{symbol}", 2.0):
+        try:
+            refresh_symbol_now(symbol)
+            snapshot = market_cache.snapshot()
+        except Exception as exc:
+            market_cache.set_ticker_error(f"K线现价刷新失败：{exc!r}")
+            snapshot = market_cache.snapshot()
     rows = market_cache.get_klines(symbol, interval)
+    if not rows or live_refresh_due(f"kline:{symbol}:{interval}", 5.0):
+        try:
+            refresh_klines_now(symbol, interval)
+            rows = market_cache.get_klines(symbol, interval)
+            snapshot = market_cache.snapshot()
+        except Exception as exc:
+            market_cache.set_kline_error(f"K线服务端刷新失败：{exc!r}")
+            snapshot = market_cache.snapshot()
     st.markdown('<div id="kline-area"></div>', unsafe_allow_html=True)
     st.markdown(
         f"""<div class="app-shell"><div class="kline-card">
@@ -2706,25 +2921,17 @@ def render_kline_system(symbol: str) -> None:
         error = snapshot.get("kline_last_error") or "正在获取K线数据"
         left, right = st.columns([2.15, .85])
         with left:
-            components.html(
-                frontend_kline_html(symbol, interval, st.session_state.ma_visibility, st.session_state.chart_interactive, st.session_state.follow_latest),
-                height=635,
-                scrolling=False,
-            )
+            st.markdown(f'<div class="pending">{escape(str(error))}</div>', unsafe_allow_html=True)
         with right:
             st.markdown(f'<div class="side-stack"><div class="summary-card"><div class="summary-label">K线缓存</div><div class="summary-value yellow">{escape(str(error))}</div></div><div class="summary-card"><div class="summary-label">当前周期</div><div class="summary-value">{interval}</div></div><div class="summary-card"><div class="summary-label">历史查看模式</div><div class="summary-value blue">{"跟随最新" if st.session_state.follow_latest else "手动浏览"}</div></div></div>', unsafe_allow_html=True)
         st.markdown("</div></div>", unsafe_allow_html=True)
         return
-    meta = build_kline_meta(rows)
+    fig, meta = build_kline_figure(symbol, interval, rows, st.session_state.ma_visibility, st.session_state.follow_latest, st.session_state.chart_interactive)
     cross = meta["cross"]
     cross_text = cross["label"] if cross["type"] == "none" else f"{cross['label']}｜{cross['time'].strftime('%Y-%m-%d %H:%M:%S')}"
     left, right = st.columns([2.15, .85])
     with left:
-        components.html(
-            frontend_kline_html(symbol, interval, st.session_state.ma_visibility, st.session_state.chart_interactive, st.session_state.follow_latest),
-            height=635,
-            scrolling=False,
-        )
+        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": bool(st.session_state.chart_interactive), "displayModeBar": False, "responsive": True})
     with right:
         st.markdown(
             f"""<div class="side-stack">
@@ -2767,6 +2974,48 @@ def _large_order_text(title: str, large_order: dict[str, Any] | None) -> str:
     distance = large_order.get("distance_percent")
     distance_text = f"{distance:.2f}%" if distance is not None else "待确认"
     return f'{title}：{large_order.get("price_text")} / {large_order.get("quantity_text")} / 距离 {distance_text}'
+
+
+def _whale_order_text(order: dict[str, Any] | None, empty_text: str) -> str:
+    """格式化大单订单文本，兼容后端不同字段。"""
+    if not order:
+        return empty_text
+    amount = order.get("amount")
+    if amount in (None, "") and not order.get("amount_text"):
+        return empty_text
+    price_text = order.get("price_text") or format_price(order.get("price"))
+    quantity_text = order.get("quantity_text") or format_compact(order.get("quantity"))
+    amount_text = order.get("amount_text") or format_compact(amount)
+    return f"{price_text} / {quantity_text} / {amount_text}"
+
+
+def _whale_trade_rows_html(whale: dict[str, Any] | None) -> str:
+    """渲染最新大单或最新成交列表。"""
+    if not whale:
+        return '<div class="status-card">大单数据正在初始化。</div>'
+    rows = list(whale.get("latest") or [])
+    showing_recent = False
+    if not rows:
+        rows = list(whale.get("recent_trades") or [])
+        showing_recent = bool(rows)
+    rows = rows[:6]
+    if not rows:
+        return '<div class="status-card">当前暂无达到阈值的大单，等待下一轮成交同步。</div>'
+    note = '<div class="status-card">当前未触发大单阈值，以下显示最新成交。</div>' if showing_recent else ""
+    body = "".join(
+        f"""<div class="orderbook-row">
+          <div class="{ "green" if str(row.get("direction")) == "主动买入" else "red" }">{escape(str(row.get("time", "-")))}</div>
+          <div>{escape(str(row.get("direction", "-")))}</div>
+          <div class="ob-right">{escape(str(row.get("price_text") or format_price(row.get("price"))))}</div>
+          <div class="ob-right">{escape(str(row.get("amount_text") or format_compact(row.get("amount"))))}</div>
+        </div>"""
+        for row in rows
+    )
+    return (
+        note
+        + '<div class="orderbook-row header"><div>时间</div><div>方向</div><div class="ob-right">价格</div><div class="ob-right">金额</div></div>'
+        + body
+    )
 
 
 def _signal_color(value: str) -> str:
@@ -3101,7 +3350,8 @@ def frontend_orderbook_html(symbol: str) -> str:
         document.getElementById("whaleCounts").textContent = valueOr(whale.buy_sell_count_text, `买入 ${{buyCount}} 笔 / 卖出 ${{sellCount}} 笔`);
         document.getElementById("whaleStats").textContent =
           `1分钟：大单${{num(s1.count)}}笔｜净流入 ${{fmtAmount(s1.net_amount)}}　5分钟：买入 ${{fmtAmount(buyAmount)}}｜卖出 ${{fmtAmount(sellAmount)}}｜净流入 ${{fmtAmount(net)}}　15分钟：大单${{num(s15.count)}}笔｜净流入 ${{fmtAmount(net15)}}`;
-        const rows = (whale.latest || []).slice(0,5);
+        const rows = ((whale.latest || []).length ? whale.latest : (whale.recent_trades || [])).slice(0,5);
+        const showingRecentTrades = !(whale.latest || []).length && rows.length;
         const buyRows = (whale.latest || []).filter(t => t.direction === "主动买入");
         const sellRows = (whale.latest || []).filter(t => t.direction !== "主动买入");
         const maxBuy = buyRows.reduce((m,t)=>Number(t.amount || 0)>Number(m.amount||0)?t:m, {{}});
@@ -3120,6 +3370,10 @@ def frontend_orderbook_html(symbol: str) -> str:
           const cls = t.direction === "主动买入" ? "green" : "red";
           return `<div class="whale-row"><div>${{t.time || "-"}}</div><div class="${{cls}}">${{t.direction || "-"}}</div><div>${{t.price_text || "-"}}</div><div>${{t.amount_text || "-"}}</div></div>`;
         }}).join("") : '<div class="whale-note">当前暂无达到阈值的大单，但成交数据正常。</div>';
+        if (showingRecentTrades) {{
+          document.getElementById("whaleRows").innerHTML =
+            '<div class="whale-note">当前未触发大单阈值，以下显示最新成交。</div>' + document.getElementById("whaleRows").innerHTML;
+        }}
         const debug = whale.debug || {{}};
         document.getElementById("whaleDebug").innerHTML =
           `当前交易对象：${{valueOr(debug.symbol, whale.symbol || symbol)}}<br>` +
@@ -3138,9 +3392,9 @@ def frontend_orderbook_html(symbol: str) -> str:
       async function update() {{
         try {{
           const [depth, ticker, whale] = await Promise.all([
-            fetchOrderbookJson(`/api/orderbook?symbol=${{symbol}}`),
-            fetchOrderbookJson(`/api/ticker?symbol=${{symbol}}`),
-            fetchOrderbookJson(`/api/whales?symbol=${{symbol}}`)
+            fetchOrderbookJson(`/api/orderbook?symbol=${{encodeURIComponent(symbol)}}`),
+            fetchOrderbookJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`),
+            fetchOrderbookJson(`/api/whales?symbol=${{encodeURIComponent(symbol)}}`)
           ]);
           const bids = cumulative((depth.bids || []).map(l => [l.price_text ?? l.price, l.quantity_text ?? l.quantity]).slice(0,10));
           const asks = cumulative((depth.asks || []).map(l => [l.price_text ?? l.price, l.quantity_text ?? l.quantity]).slice(0,10));
@@ -3156,8 +3410,9 @@ def frontend_orderbook_html(symbol: str) -> str:
           document.getElementById("sellBar").style.width = `${{sellRatio}}%`;
           document.getElementById("buyRatio").textContent = `${{buyRatio.toFixed(1)}}%`;
           document.getElementById("sellRatio").textContent = `${{sellRatio.toFixed(1)}}%`;
-          document.getElementById("obState").textContent = buyRatio > 58 ? "买盘强势" : sellRatio > 58 ? "卖盘强势" : "多空均衡";
-          document.getElementById("bias").textContent = buyRatio > sellRatio ? "多头占优" : sellRatio > buyRatio ? "空头占优" : "均衡";
+          const hasDepth = bids.length > 0 && asks.length > 0;
+          document.getElementById("obState").textContent = hasDepth ? (buyRatio > 58 ? "买盘强势" : sellRatio > 58 ? "卖盘强势" : "多空均衡") : "后台刷新中";
+          document.getElementById("bias").textContent = hasDepth ? (buyRatio > sellRatio ? "多头占优" : sellRatio > buyRatio ? "空头占优" : "均衡") : "等待盘口";
           const largeBid = bids.reduce((m,r)=>Number(r.qty)>Number(m.qty||0)?r:m, {{}});
           const largeAsk = asks.reduce((m,r)=>Number(r.qty)>Number(m.qty||0)?r:m, {{}});
           document.getElementById("largeBid").textContent = largeBid.price ? `${{clean(largeBid.price)}} / ${{clean(largeBid.qty)}}` : "--";
@@ -3167,7 +3422,7 @@ def frontend_orderbook_html(symbol: str) -> str:
           const chgEl = document.getElementById("change");
           chgEl.textContent = Number.isFinite(chg) ? `${{chg > 0 ? "+" : ""}}${{chg.toFixed(2)}}%` : "正在获取";
           chgEl.className = Number.isFinite(chg) ? (chg >= 0 ? "green" : "red") : "yellow";
-          document.getElementById("status").innerHTML = depth.error ? `盘口数据获取失败<br>${{depth.error}}` : `状态：实时<br>更新时间：${{new Date().toLocaleTimeString()}}<br>ID：${{depth.lastUpdateId || depth.last_update_id || "-"}}`;
+          document.getElementById("status").innerHTML = hasDepth ? `状态：实时<br>更新时间：${{new Date().toLocaleTimeString()}}<br>ID：${{depth.lastUpdateId || depth.last_update_id || "-"}}` : `状态：后台刷新中<br>${{depth.message || "等待盘口缓存"}}`;
           updateWhales(whale);
         }} catch (err) {{
           document.getElementById("status").innerHTML = "盘口数据获取失败<br>正在重试";
@@ -3182,10 +3437,27 @@ def frontend_orderbook_html(symbol: str) -> str:
 def render_orderbook_system(symbol: str, ticker: dict[str, Any] | None) -> None:
     """渲染盘口订单簿系统。"""
     live_symbol = st.session_state.get("current_symbol", symbol)
-    components.html(frontend_orderbook_html(live_symbol), height=1080, scrolling=False)
-    return
     live_ticker = market_cache.get_ticker(live_symbol) or ticker
+    if not live_ticker or live_refresh_due(f"ticker:{live_symbol}", 2.0):
+        try:
+            refresh_symbol_now(live_symbol)
+            live_ticker = market_cache.get_ticker(live_symbol) or ticker
+        except Exception as exc:
+            market_cache.set_ticker_error(f"盘口价格刷新失败：{exc!r}")
     orderbook = market_cache.get_orderbook(live_symbol)
+    if not orderbook or live_refresh_due(f"orderbook:{live_symbol}", 2.0):
+        try:
+            refresh_orderbook_now(live_symbol)
+            orderbook = market_cache.get_orderbook(live_symbol)
+        except Exception as exc:
+            market_cache.set_orderbook_error(f"盘口服务端刷新失败：{exc!r}")
+    whale = market_cache.get_whales(live_symbol)
+    if not whale or live_refresh_due(f"whale:{live_symbol}", 5.0):
+        try:
+            refresh_whales_now(live_symbol)
+            whale = market_cache.get_whales(live_symbol)
+        except Exception as exc:
+            market_cache.set_whale_error(f"大单服务端刷新失败：{exc!r}")
     snapshot = market_cache.snapshot()
     current_price = live_ticker.get("last_price") if live_ticker else None
     change = live_ticker.get("price_change_percent") if live_ticker else None
@@ -3208,39 +3480,90 @@ def render_orderbook_system(symbol: str, ticker: dict[str, Any] | None) -> None:
         unsafe_allow_html=True,
     )
     if not orderbook:
-        error = snapshot.get("orderbook_last_error") or "正在获取盘口数据"
+        error = escape(str(snapshot.get("orderbook_last_error") or "正在获取盘口数据"))
         st.markdown(f'<div class="pending">{error}</div></div></div>', unsafe_allow_html=True)
-        return
-    ask_rows = "".join(_orderbook_level_html(level, "ask", max_quantity, analysis.get("large_ask")) for level in visible_asks)
-    bid_rows = "".join(_orderbook_level_html(level, "bid", max_quantity, analysis.get("large_bid")) for level in visible_bids)
-    change_class = "green" if change is not None and change >= 0 else "red" if change is not None else "yellow"
-    buy_ratio = float(analysis.get("buy_ratio", 0) or 0)
-    sell_ratio = float(analysis.get("sell_ratio", 0) or 0)
+    else:
+        ask_rows = "".join(_orderbook_level_html(level, "ask", max_quantity, analysis.get("large_ask")) for level in visible_asks)
+        bid_rows = "".join(_orderbook_level_html(level, "bid", max_quantity, analysis.get("large_bid")) for level in visible_bids)
+        change_class = "green" if change is not None and change >= 0 else "red" if change is not None else "yellow"
+        buy_ratio = float(analysis.get("buy_ratio", 0) or 0)
+        sell_ratio = float(analysis.get("sell_ratio", 0) or 0)
+        st.markdown(
+            f"""<div class="orderbook-grid">
+              <div class="orderbook-table">
+                <div class="orderbook-row header"><div>卖盘价格</div><div class="ob-right">数量</div><div class="ob-right">累计</div></div>
+                {ask_rows}
+                <div class="last-price-box"><div class="last-price">{format_price(current_price)}</div><div class="{change_class}">{format_percent(change)}</div></div>
+                <div class="orderbook-row header"><div>买盘价格</div><div class="ob-right">数量</div><div class="ob-right">累计</div></div>
+                {bid_rows}
+              </div>
+              <div>
+                <div class="ratio-bar"><div class="ratio-buy" style="width:{buy_ratio:.2f}%;"></div><div class="ratio-sell" style="width:{sell_ratio:.2f}%;"></div></div>
+                <div class="orderbook-summary">
+                  <div class="metric-box"><div class="metric-label">买盘</div><div class="metric-value green">{buy_ratio:.1f}%</div></div>
+                  <div class="metric-box"><div class="metric-label">卖盘</div><div class="metric-value red">{sell_ratio:.1f}%</div></div>
+                  <div class="metric-box"><div class="metric-label">盘口状态</div><div class="metric-value yellow">{analysis.get("status", "等待数据")}</div></div>
+                  <div class="metric-box"><div class="metric-label">多空倾向</div><div class="metric-value blue">{analysis.get("bias", "等待数据")}</div></div>
+                  <div class="metric-box"><div class="metric-label">支撑位</div><div class="metric-value green">{analysis.get("support_level") or "待确认"}</div></div>
+                  <div class="metric-box"><div class="metric-label">压力位</div><div class="metric-value red">{analysis.get("resistance_level") or "待确认"}</div></div>
+                </div>
+                <div class="status-card" style="margin-top:8px;">
+                  {_large_order_text("大买单", analysis.get("large_bid"))}<br>
+                  {_large_order_text("大卖单", analysis.get("large_ask"))}
+                </div>
+              </div>
+            </div></div></div>""",
+            unsafe_allow_html=True,
+        )
+    whale = whale or {}
+    whale_stats = whale.get("stats") or {}
+    stats_5m = whale_stats.get("5m") or {}
+    stats_15m = whale_stats.get("15m") or {}
+    whale_score = whale.get("whale_score", whale.get("score", 0))
+    whale_level = whale.get("whale_score_text") or whale.get("level") or ("暂无大单" if not whale else "等待数据")
+    whale_direction = whale.get("whale_direction") or whale.get("status") or "等待数据"
+    net_5m = whale.get("net_inflow_5m", stats_5m.get("net_amount", 0))
+    net_15m = whale.get("net_inflow_15m", stats_15m.get("net_amount", 0))
+    buy_amount = whale.get("active_buy_amount", stats_5m.get("buy_amount", 0))
+    sell_amount = whale.get("active_sell_amount", stats_5m.get("sell_amount", 0))
+    raw_trade_count = whale.get("raw_trade_count") or (whale.get("debug") or {}).get("raw_trade_count") or 0
+    whale_update_time = whale.get("updated_time") or whale.get("updated_at") or snapshot.get("whale_last_update_time", "初始化中")
+    whale_error = snapshot.get("whale_last_error") if not whale else whale.get("error")
     st.markdown(
-        f"""<div class="orderbook-grid">
-          <div class="orderbook-table">
-            <div class="orderbook-row header"><div>卖盘价格</div><div class="ob-right">数量</div><div class="ob-right">累计</div></div>
-            {ask_rows}
-            <div class="last-price-box"><div class="last-price">{format_price(current_price)}</div><div class="{change_class}">{format_percent(change)}</div></div>
-            <div class="orderbook-row header"><div>买盘价格</div><div class="ob-right">数量</div><div class="ob-right">累计</div></div>
-            {bid_rows}
-          </div>
-          <div>
-            <div class="ratio-bar"><div class="ratio-buy" style="width:{buy_ratio:.2f}%;"></div><div class="ratio-sell" style="width:{sell_ratio:.2f}%;"></div></div>
-            <div class="orderbook-summary">
-              <div class="metric-box"><div class="metric-label">买盘</div><div class="metric-value green">{buy_ratio:.1f}%</div></div>
-              <div class="metric-box"><div class="metric-label">卖盘</div><div class="metric-value red">{sell_ratio:.1f}%</div></div>
-              <div class="metric-box"><div class="metric-label">盘口状态</div><div class="metric-value yellow">{analysis.get("status", "等待数据")}</div></div>
-              <div class="metric-box"><div class="metric-label">多空倾向</div><div class="metric-value blue">{analysis.get("bias", "等待数据")}</div></div>
-              <div class="metric-box"><div class="metric-label">支撑位</div><div class="metric-value green">{analysis.get("support_level") or "待确认"}</div></div>
-              <div class="metric-box"><div class="metric-label">压力位</div><div class="metric-value red">{analysis.get("resistance_level") or "待确认"}</div></div>
-            </div>
-            <div class="status-card" style="margin-top:8px;">
-              {_large_order_text("大买单", analysis.get("large_bid"))}<br>
-              {_large_order_text("大卖单", analysis.get("large_ask"))}
-            </div>
-          </div>
-        </div></div></div>""",
+        f"""<div class="app-shell"><div class="module-card">
+        <div class="module-title">大单监控 / 大资金行为面板</div>
+        <div class="module-desc">{escape(str(live_symbol))}｜服务端直读缓存｜成交源：{escape(str(whale.get("source", "Binance Futures aggTrades") if whale else "初始化中"))}</div>
+        <div class="metric-grid">
+          <div class="metric-box"><div class="metric-label">大单强度</div><div class="metric-value yellow">{escape(str(whale_score))} / 100 · {escape(str(whale_level))}</div></div>
+          <div class="metric-box"><div class="metric-label">大单方向</div><div class="metric-value blue">{escape(str(whale_direction))}</div></div>
+          <div class="metric-box"><div class="metric-label">庄家行为</div><div class="metric-value blue">{escape(str(whale.get("dealer_behavior", "无明显行为") if whale else "等待数据"))}</div></div>
+          <div class="metric-box"><div class="metric-label">风险提示</div><div class="metric-value yellow">{escape(str(whale.get("risk_tip", "等待确认") if whale else "等待首次缓存"))}</div></div>
+          <div class="metric-box"><div class="metric-label">5分钟净流入</div><div class="metric-value {_signal_color("资金流入" if float(net_5m or 0) >= 0 else "资金恐慌")}">{format_compact(net_5m)}</div></div>
+          <div class="metric-box"><div class="metric-label">15分钟净流入</div><div class="metric-value {_signal_color("资金流入" if float(net_15m or 0) >= 0 else "资金恐慌")}">{format_compact(net_15m)}</div></div>
+          <div class="metric-box"><div class="metric-label">主动买入金额</div><div class="metric-value green">{format_compact(buy_amount)}</div></div>
+          <div class="metric-box"><div class="metric-label">主动卖出金额</div><div class="metric-value red">{format_compact(sell_amount)}</div></div>
+          <div class="metric-box"><div class="metric-label">最大买单</div><div class="metric-value green">{escape(_whale_order_text(whale.get("largest_buy_order"), "暂无大买单"))}</div></div>
+          <div class="metric-box"><div class="metric-label">最大卖单</div><div class="metric-value red">{escape(_whale_order_text(whale.get("largest_sell_order"), "暂无大卖单"))}</div></div>
+          <div class="metric-box"><div class="metric-label">买入/卖出笔数</div><div class="metric-value">{escape(str(whale.get("buy_sell_count_text", "等待数据")))}</div></div>
+          <div class="metric-box"><div class="metric-label">更新时间</div><div class="metric-value">{escape(str(whale_update_time))}</div></div>
+        </div>
+        <div class="status-card" style="margin-top:8px;">
+          <b>大单综合结论</b><br>
+          {escape(str(whale.get("explanation", "大单数据正在同步。" if not whale_error else whale_error)))}
+        </div>
+        <details class="status-card" style="margin-top:8px;" open>
+          <summary><b>最新大单 / 最新成交</b></summary>
+          <div style="margin-top:8px;">{_whale_trade_rows_html(whale)}</div>
+        </details>
+        <details class="status-card" style="margin-top:8px;">
+          <summary><b>大单调试信息</b></summary>
+          当前交易对象：{escape(str(live_symbol))}<br>
+          原始成交条数：{escape(str(raw_trade_count))}<br>
+          5分钟统计：买入 {format_compact(stats_5m.get("buy_amount", 0))} / 卖出 {format_compact(stats_5m.get("sell_amount", 0))} / 净流入 {format_compact(stats_5m.get("net_amount", 0))}<br>
+          15分钟统计：净流入 {format_compact(stats_15m.get("net_amount", 0))}<br>
+          错误信息：{escape(str(whale_error or "无"))}
+        </details>
+        </div></div>""",
         unsafe_allow_html=True,
     )
 
@@ -3676,14 +3999,26 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
     symbol = st.session_state.get("current_symbol", symbol)
     interval = market_cache.get_kline_interval()
     rows = market_cache.get_klines(symbol, interval)
-    live_ticker = market_cache.get_ticker(symbol) or ticker
+    live_ticker = get_effective_ticker(symbol) or ticker
     current_price = live_ticker.get("last_price") if live_ticker else None
-    orderbook_analysis = analyze_orderbook(market_cache.get_orderbook(symbol), current_price)
+    orderbook = market_cache.get_orderbook(symbol)
+    orderbook_analysis = analyze_orderbook(orderbook, current_price)
     analysis = build_signal_analysis(live_ticker, rows, orderbook_analysis)
     derivatives = market_cache.get_derivatives(symbol)
     capital = analyze_capital_structure(derivatives, live_ticker, analysis)
     liquidation = analyze_liquidation_risk(live_ticker, rows, derivatives, orderbook_analysis, analysis)
     whale = market_cache.get_whales(symbol)
+    signal_missing = []
+    if not live_ticker:
+        signal_missing.append("实时价格等待刷新")
+    if len(rows) < 80:
+        signal_missing.append(f"K线数据不足：当前 {len(rows)} 根 / 需要 80 根")
+    if not orderbook:
+        signal_missing.append("盘口等待刷新")
+    if not whale:
+        signal_missing.append("暂无明显大单")
+    if signal_missing:
+        append_debug_log(SIGNAL_CHAIN_LOG, f"signal_chain_missing symbol={symbol} reasons={' | '.join(signal_missing)}")
     dealer = analyze_dealer_behavior(whale, derivatives, orderbook_analysis, analysis, liquidation)
     radar = analyze_market_risk_radar(live_ticker, rows, derivatives, capital, liquidation, whale, dealer, orderbook_analysis, analysis)
     strategy = build_local_strategy(
@@ -3766,7 +4101,9 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
     )
 
     data_status = ""
-    if not analysis.get("ready"):
+    if signal_missing:
+        data_status = f'<div class="status-card" style="margin-bottom:8px;color:#F0B90B;">{"<br>".join(escape(str(item)) for item in signal_missing)}</div>'
+    elif not analysis.get("ready"):
         data_status = f'<div class="status-card" style="margin-bottom:8px;color:#F0B90B;">{escape(str(analysis["message"]))}</div>'
 
     render_local_strategy_decision(strategy)
@@ -3976,16 +4313,27 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
     """信号页。"""
     render_page_head("signals")
     render_watchlist_quick_controls(st.session_state.get("current_symbol", symbol), "signals", source="manual")
-    render_kline_system(symbol)
-    render_orderbook_system(symbol, ticker)
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
     if fragment:
+        @fragment(run_every="2s")
+        def _live_market_modules() -> None:
+            live_symbol = st.session_state.get("current_symbol", symbol)
+            live_ticker = market_cache.get_ticker(live_symbol) or ticker
+            render_kline_system(live_symbol)
+            render_orderbook_system(live_symbol, live_ticker)
+
+        _live_market_modules()
+
         @fragment(run_every="5s")
         def _live_signal_analysis() -> None:
-            render_signal_analysis(symbol, ticker)
+            live_symbol = st.session_state.get("current_symbol", symbol)
+            live_ticker = market_cache.get_ticker(live_symbol) or ticker
+            render_signal_analysis(live_symbol, live_ticker)
 
         _live_signal_analysis()
     else:
+        render_kline_system(symbol)
+        render_orderbook_system(symbol, ticker)
         render_signal_analysis(symbol, ticker)
 
 
@@ -3994,11 +4342,11 @@ def render_trading() -> None:
     render_page_head("trading")
     symbol = st.session_state.get("current_symbol", "BTCUSDT")
     ticker = market_cache.get_ticker(symbol)
-    price = float((ticker or {}).get("last_price") or 0)
+    price = valid_price((ticker or {}).get("last_price"))
     decision = build_current_committee_decision(symbol, ticker)
     signal = committee_decision_to_sim_signal(decision)
     price_map = build_sim_price_map(symbol)
-    if price > 0:
+    if price is not None:
         price_map[symbol] = price
     settings = load_settings()
     if settings.get("mode") == "auto":
@@ -4011,7 +4359,7 @@ def render_trading() -> None:
     history = summary.get("history", [])
     events = summary.get("events", [])
     stats = summary.get("stats", {})
-    ok, reject_reasons = validate_signal_for_simulation(signal, {symbol: price})
+    ok, reject_reasons = validate_signal_for_simulation(signal, {symbol: price or 0})
 
     def money(value: Any) -> str:
         return f"{float(value or 0):,.2f} USDT"
@@ -4035,15 +4383,16 @@ def render_trading() -> None:
             return "已到期"
         return seconds_text(remaining)
 
-    def distance_to_entry(order: dict[str, Any], current_price: float) -> str:
-        low = float(order.get("entry_zone_low", 0) or 0)
-        high = float(order.get("entry_zone_high", 0) or 0)
-        if current_price <= 0 or low <= 0 or high <= 0:
-            return "价格不可用"
-        if low <= current_price <= high:
+    def distance_to_entry(order: dict[str, Any], current_price: Any) -> str:
+        price_value = valid_price(current_price)
+        low = valid_price(order.get("entry_zone_low"))
+        high = valid_price(order.get("entry_zone_high"))
+        if price_value is None or low is None or high is None:
+            return "等待价格刷新"
+        if low <= price_value <= high:
             return "已进入入场区"
-        target = low if current_price < low else high
-        return f"{abs(current_price - target) / current_price * 100:.2f}%"
+        target = low if price_value < low else high
+        return f"{abs(price_value - target) / price_value * 100:.2f}%"
 
     st.markdown(
         '<div class="app-shell"><div class="module-card warning-box"><b>模拟交易安全提示</b><br>当前为模拟交易，不会使用真实资金，不会执行真实订单。所有订单、持仓和盈亏均为本地模拟数据。</div></div>',
@@ -4142,7 +4491,9 @@ def render_trading() -> None:
         )
         if ok:
             st.success("该委员会信号当前满足模拟交易风控条件。")
-            if st.button("加入模拟候选 / 创建模拟订单", use_container_width=True):
+            if price is None:
+                st.warning("等待价格刷新，暂不创建模拟订单。")
+            elif st.button("加入模拟候选 / 创建模拟订单", use_container_width=True):
                 order = create_pending_sim_order(signal, price)
                 if order:
                     st.success("已创建本地模拟订单。")
@@ -4158,7 +4509,7 @@ def render_trading() -> None:
         if not positions:
             st.markdown('<div class="status-card">当前暂无模拟持仓。</div>', unsafe_allow_html=True)
         for pos in positions:
-            pos_price = price_map.get(str(pos.get("symbol", "")), float(pos.get("current_price", 0) or 0))
+            pos_price = valid_price(price_map.get(str(pos.get("symbol", "")))) or valid_price(pos.get("current_price"))
             pnl = float(pos.get("unrealized_pnl", 0) or 0)
             pnl_class = "green" if pnl >= 0 else "red"
             r_value = calculate_position_r_multiple(pos, pos_price)
@@ -4167,10 +4518,10 @@ def render_trading() -> None:
                 f"""
                 <div class="status-card">
                   <b>{kline_symbol_link(pos.get("symbol"), str(pos.get("symbol")))}</b>｜{direction_text(pos.get("direction"))}｜模拟持仓｜{pos.get("status")}<br>
-                  开仓：{format_price(pos.get("entry_price"))}　当前：{format_price(pos_price)}　数量：{float(pos.get("quantity", 0) or 0):.6f}<br>
+                  开仓：{format_waiting_price(pos.get("entry_price"))}　当前：{format_waiting_price(pos_price)}　数量：{float(pos.get("quantity", 0) or 0):.6f}<br>
                   模拟保证金：{money(pos.get("margin_usdt"))}　名义仓位：{money(pos.get("notional_usdt"))}　模拟杠杆：{pos.get("leverage", 1)}x<br>
                   浮动盈亏：<span class="{pnl_class}">{pnl:+.2f} USDT / {float(pos.get("unrealized_pnl_pct", 0) or 0):+.2f}%</span>　已实现：{money(pos.get("realized_pnl"))}<br>
-                  止损：{format_price(pos.get("stop_loss"))}　止盈1：{format_price(pos.get("take_profit_1"))}　止盈2：{format_price(pos.get("take_profit_2"))}<br>
+                  止损：{format_waiting_price(pos.get("stop_loss"))}　止盈1：{format_waiting_price(pos.get("take_profit_1"))}　止盈2：{format_waiting_price(pos.get("take_profit_2"))}<br>
                   R倍数：{f"{r_value:+.2f}R" if r_value is not None else "暂无"}　持仓：{escape(str(holding.get("text", "0分钟")))}　止盈1：{"已触发" if pos.get("tp1_hit") else "未触发"}　保本止损：{"已移动" if pos.get("moved_stop_to_breakeven") else "未移动"}<br>
                   委员会：{escape(str(pos.get("committee_action", "等待")))} / 置信度{pos.get("committee_confidence", 0)} / 风险{pos.get("committee_risk_score", 0)}<br>
                   AI主席摘要：{escape(str((pos.get("committee_snapshot") or {}).get("chairman_summary", pos.get("open_reason", "暂无摘要"))))}
@@ -4179,10 +4530,10 @@ def render_trading() -> None:
                 unsafe_allow_html=True,
             )
             pc1, pc2, pc3, pc4 = st.columns(4)
-            if pc1.button("全部平仓", key=f"close_all_{pos.get('position_id')}", use_container_width=True):
+            if pc1.button("全部平仓", key=f"close_all_{pos.get('position_id')}", use_container_width=True, disabled=pos_price is None):
                 close_sim_position(str(pos.get("position_id")), "用户手动平仓", pos_price)
                 st.rerun()
-            if pc2.button("平仓50%", key=f"close_half_{pos.get('position_id')}", use_container_width=True):
+            if pc2.button("平仓50%", key=f"close_half_{pos.get('position_id')}", use_container_width=True, disabled=pos_price is None):
                 close_sim_position(str(pos.get("position_id")), "用户手动平仓50%", pos_price, ratio=0.5)
                 st.rerun()
             if pc3.button("止损到保本", key=f"breakeven_{pos.get('position_id')}", use_container_width=True):
@@ -4206,13 +4557,13 @@ def render_trading() -> None:
         if not orders:
             st.markdown('<div class="status-card">当前暂无待触发模拟订单。</div>', unsafe_allow_html=True)
         for order in orders[:50]:
-            order_price = price_map.get(str(order.get("symbol", "")), 0)
+            order_price = valid_price(price_map.get(str(order.get("symbol", ""))))
             st.markdown(
                 f"""
                 <div class="status-card">
                   <b>{kline_symbol_link(order.get("symbol"), str(order.get("symbol")))}</b>｜{direction_text(order.get("direction"))}｜{escape(str(order.get("action", "")))}｜待触发模拟订单<br>
-                  当前价格：{format_price(order_price)}　入场区间：{format_price(order.get("entry_zone_low"))} - {format_price(order.get("entry_zone_high"))}　距离入场区：{escape(distance_to_entry(order, float(order_price or 0)))}<br>
-                  止损：{format_price(order.get("stop_loss"))}　止盈1：{format_price(order.get("take_profit_1"))}　止盈2：{format_price(order.get("take_profit_2"))}<br>
+                  当前价格：{format_waiting_price(order_price)}　入场区间：{format_waiting_price(order.get("entry_zone_low"))} - {format_waiting_price(order.get("entry_zone_high"))}　距离入场区：{escape(distance_to_entry(order, order_price))}<br>
+                  止损：{format_waiting_price(order.get("stop_loss"))}　止盈1：{format_waiting_price(order.get("take_profit_1"))}　止盈2：{format_waiting_price(order.get("take_profit_2"))}<br>
                   建议仓位：{escape(str(order.get("position_pct", "0%")))}　预计保证金：{money(order.get("margin_usdt"))}　名义仓位：{money(order.get("notional_usdt"))}<br>
                   创建：{escape(str(order.get("created_time", "")))}　剩余有效期：{escape(remaining_text(order))}　来源：{escape(str(order.get("source", "AI交易委员会")))}
                 </div>
@@ -4335,7 +4686,7 @@ def render_trading() -> None:
 def render_positions() -> None:
     """持仓页。"""
     render_page_head("positions")
-    summary = get_sim_account_summary()
+    summary = refresh_sim_positions_lightweight(get_sim_account_summary())
     account = summary.get("account") or {}
     positions = summary.get("positions") or []
     orders = summary.get("orders") or []
@@ -4358,7 +4709,7 @@ def render_positions() -> None:
         <div class="app-shell"><div class="module-grid">
           <div class="module-card"><div class="module-title">当前模拟持仓</div>
             <div class="module-desc">详细平仓、止损到保本等操作在交易页完成。</div>
-            {"".join(f'<div class="status-card" style="margin-top:6px;">{kline_symbol_link(pos.get("symbol"), str(pos.get("symbol")))}｜{escape(str(pos.get("direction", "-")))}｜{escape(str(pos.get("status", "-")))}｜数量 {float(pos.get("quantity", 0) or 0):.6f}｜入场 {format_price(pos.get("entry_price"))}</div>' for pos in positions[:20]) or '<div class="status-card" style="margin-top:6px;">当前暂无模拟持仓。</div>'}
+            {"".join(f'<div class="status-card" style="margin-top:6px;">{kline_symbol_link(pos.get("symbol"), str(pos.get("symbol")))}｜{escape(str(pos.get("direction", "-")))}｜{escape(str(pos.get("status", "-")))}｜数量 {float(pos.get("quantity", 0) or 0):.6f}<br>入场 {format_waiting_price(pos.get("entry_price"))}｜当前 {format_waiting_price(pos.get("current_price"))}｜浮盈 {float(pos.get("unrealized_pnl", 0) or 0):+.4f} USDT / {float(pos.get("unrealized_pnl_pct", 0) or 0):+.2f}%<br>价格状态 {escape(str(pos.get("price_status", "missing")))}｜最后价格更新时间 {escape(str(pos.get("last_price_update") or pos.get("update_time") or "等待刷新"))}</div>' for pos in positions[:20]) or '<div class="status-card" style="margin-top:6px;">当前暂无模拟持仓。</div>'}
           </div>
           <div class="module-card"><div class="module-title">待触发模拟订单</div>
             {"".join(f'<div class="status-card" style="margin-top:6px;">{kline_symbol_link(order.get("symbol"), str(order.get("symbol")))}｜{escape(str(order.get("direction", "-")))}｜{escape(str(order.get("action", "-")))}｜入场区 {format_price(order.get("entry_zone_low"))} - {format_price(order.get("entry_zone_high"))}</div>' for order in orders[:20]) or '<div class="status-card" style="margin-top:6px;">当前暂无待触发模拟订单。</div>'}
@@ -7109,7 +7460,7 @@ def main() -> None:
     refresh_page_data()
     symbols = market_cache.get_symbols(FALLBACK_SYMBOLS)
     has_full_symbol_list = len(symbols) > len(FALLBACK_SYMBOLS)
-    if has_full_symbol_list and st.session_state.current_symbol not in symbols:
+    if has_full_symbol_list and st.session_state.current_symbol not in symbols and not is_user_selected_symbol_source():
         set_current_symbol(symbols[0])
     rankings = market_cache.get_rankings()
     anchor_current_symbol_to_fast_top1(rankings)
@@ -7120,6 +7471,8 @@ def main() -> None:
     ticker = market_cache.get_ticker(current_symbol)
     kline_rows = market_cache.get_klines(current_symbol, interval)
     scores = local_scores(ticker, kline_rows)
+    start_local_api_server()
+    start_background_refresher()
     inject_styles()
     render_fixed_market_bar(current_symbol)
     render_error(snapshot)
@@ -7129,8 +7482,6 @@ def main() -> None:
         st.rerun()
     render_page(st.session_state.active_page, current_symbol, ticker, rankings, snapshot, symbols, scores)
     render_bottom_nav()
-    start_background_refresher()
-    start_local_api_server()
 
 
 if __name__ == "__main__":

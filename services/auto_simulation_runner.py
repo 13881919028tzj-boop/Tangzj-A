@@ -8,9 +8,11 @@ exchange order API is used here.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from services import market_cache
+from services.binance_public import get_24hr_ticker
 from services.fast_opportunity_engine import collect_top10_opportunities, run_committee_top10_precheck
 from services.sim_trade_engine import (
     get_open_positions,
@@ -24,6 +26,18 @@ from services.sim_trade_engine import (
 
 _LAST_RUN_AT = 0.0
 _MIN_INTERVAL_SECONDS = 3.0
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
+_LAST_PRICE_STATUS: dict[str, str] = {}
+
+
+def _debug_log(message: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with POSITION_PRICE_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -68,19 +82,51 @@ def _price(row: dict[str, Any]) -> float:
     )
 
 
+def _fetch_live_price(symbol: str) -> float:
+    try:
+        ticker = get_24hr_ticker(symbol)
+        market_cache.set_ticker(symbol, ticker)
+        return _to_float(ticker.get("last_price"), 0)
+    except Exception as exc:
+        _debug_log(f"direct_price_fetch_failed symbol={symbol} error={repr(exc)}")
+        return 0.0
+
+
 def _build_price_map(opportunities: list[dict[str, Any]]) -> dict[str, float]:
     symbols = {str(item.get("symbol") or "").upper() for item in opportunities}
     symbols.update(str(item.get("symbol") or "").upper() for item in get_open_positions())
     symbols.update(str(item.get("symbol") or "").upper() for item in get_pending_orders())
     price_map: dict[str, float] = {}
+    statuses: dict[str, str] = {}
     by_symbol = {str(item.get("symbol") or "").upper(): item for item in opportunities}
     for symbol in symbols:
         if not symbol:
             continue
         ticker = market_cache.get_ticker(symbol) or {}
-        price = _to_float(ticker.get("last_price"), 0) or _price(by_symbol.get(symbol, {}))
-        if price > 0:
-            price_map[symbol] = price
+        price = _to_float(ticker.get("last_price"), 0)
+        status = "live" if price > 0 else "missing"
+        if price <= 0:
+            price = _fetch_live_price(symbol)
+            status = "live" if price > 0 else "missing"
+        if price <= 0:
+            price = _price(by_symbol.get(symbol, {}))
+            status = "ranking" if price > 0 else "missing"
+        if price <= 0:
+            for position in get_open_positions():
+                if str(position.get("symbol") or "").upper() == symbol:
+                    position_price = _to_float(position.get("current_price"))
+                    if position_price > 0:
+                        price = position_price
+                        status = "stale"
+                    break
+        price_map[symbol] = max(price, 0)
+        statuses[symbol] = status
+    global _LAST_PRICE_STATUS
+    _LAST_PRICE_STATUS = statuses
+    live_count = len([s for s in statuses.values() if s in {"live", "ranking"}])
+    missing_count = len([s for s in statuses.values() if s == "missing"])
+    stale_count = len([s for s in statuses.values() if s == "stale"])
+    _debug_log(f"build_price_map symbols={len(price_map)} live={live_count} stale={stale_count} missing={missing_count}")
     return price_map
 
 
@@ -152,7 +198,8 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
             signal = _signal_from_precheck(precheck)
             if signal:
                 signals.append(signal)
-    summary = update_simulation(price_map, signals)
+    summary = update_simulation(price_map, signals, _LAST_PRICE_STATUS)
+    _debug_log(f"update_simulation signals={len(signals)} prices={len(price_map)}")
     if signals:
         log_sim_event("后台自动模拟扫描", content=f"本轮候选 {len(signals)} 个，已交给模拟风控执行。")
     return {"ok": True, "signals": len(signals), "prices": len(price_map), "summary": summary}

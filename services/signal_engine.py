@@ -197,11 +197,12 @@ def build_signal_analysis(
 ) -> dict[str, Any]:
     """生成市场结构、评分、交易建议与信号解释。"""
     if not ticker or len(rows) < 80:
+        message = "实时价格等待刷新。" if not ticker else f"K线数据不足：当前 {len(rows)} 根 / 需要 80 根。"
         return {
             "ready": False,
-            "message": "K线数据积累不足，暂无法完成完整信号分析。",
-            "market_structure": "等待数据",
-            "structure_explanation": "等待更多K线与盘口数据同步。",
+            "message": message,
+            "market_structure": "实时价格等待刷新" if not ticker else "K线数据不足",
+            "structure_explanation": message,
             "trend_score": 0,
             "trend_level": "中性",
             "trend_explanation": "数据不足，暂不判断趋势。",

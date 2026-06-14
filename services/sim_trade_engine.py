@@ -29,6 +29,8 @@ HISTORY_CSV_PATH = DATA_DIR / "sim_trade_history.csv"
 LOG_PATH = DATA_DIR / "sim_trade_log.json"
 EQUITY_JSON_PATH = DATA_DIR / "sim_equity_curve.json"
 EQUITY_CSV_PATH = DATA_DIR / "sim_equity_curve.csv"
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
 
 
 DEFAULT_SETTINGS = {
@@ -96,6 +98,15 @@ def _read_json(path: Path, default: Any) -> Any:
 def _write_json(path: Path, data: Any) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _debug_price_log(message: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with POSITION_PRICE_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{_now()} {message}\n")
+    except Exception:
+        pass
 
 
 def log_sim_event(event_type: str, symbol: str = "", direction: str = "", price: float | None = None, content: str = "", reason: str = "") -> None:
@@ -262,7 +273,7 @@ def calculate_long_short_exposure(positions: list[dict[str, Any]] | None = None)
 
 def calculate_account_drawdown(account: dict[str, Any]) -> tuple[float, float]:
     equity = _to_float(account.get("equity"), 0)
-    max_equity = max(_to_float(account.get("max_equity"), equity), equity)
+    max_equity = max(_to_float(account.get("max_equity"), equity) or 0.0, equity)
     current = (max_equity - equity) / max_equity * 100 if max_equity else 0.0
     return current, max(_to_float(account.get("max_drawdown"), 0), current)
 
@@ -287,7 +298,8 @@ def enrich_sim_account(account: dict[str, Any] | None, positions: list[dict[str,
     account["unrealized_pnl"] = unrealized
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized
     account["equity"] = _to_float(account.get("available_balance"), 0) + used_margin + unrealized
-    account["max_equity"] = max(_to_float(account.get("max_equity"), account.get("initial_balance")), _to_float(account.get("equity"), 0))
+    initial_balance = _to_float(account.get("initial_balance"), 0) or 0.0
+    account["max_equity"] = max(_to_float(account.get("max_equity"), initial_balance) or 0.0, _to_float(account.get("equity"), 0) or 0.0)
     account["current_drawdown"], account["max_drawdown"] = calculate_account_drawdown(account)
     initial = _to_float(account.get("initial_balance"), 1)
     account["return_pct"] = (account["equity"] - initial) / initial * 100 if initial else 0
@@ -452,6 +464,7 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
 
 
 def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> dict[str, Any] | None:
+    current_price = _to_float(current_price, 0)
     settings = load_settings()
     account = load_sim_account()
     current_prices = {str(signal.get("symbol", "")).upper(): current_price}
@@ -543,6 +556,8 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "open_time": _now(),
         "open_ts": _ts(),
         "update_time": _now(),
+        "last_price_update": _now(),
+        "price_status": "live",
         "stop_loss": _to_float(order.get("stop_loss"), 0),
         "take_profit_1": _to_float(order.get("take_profit_1"), 0),
         "take_profit_2": _to_float(order.get("take_profit_2"), 0),
@@ -787,21 +802,36 @@ def check_pending_orders(current_prices: dict[str, float]) -> None:
     save_orders(remaining)
 
 
-def update_sim_positions(current_prices: dict[str, float]) -> None:
+def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[str, str] | None = None) -> None:
     positions = load_positions()
     account = load_sim_account()
     unrealized_total = 0.0
     external_position_change = False
+    live_count = 0
+    stale_count = 0
+    missing_count = 0
     for position in positions:
         if position.get("status") not in {"open", "partially_closed"}:
             continue
         symbol = str(position.get("symbol", ""))
         price = get_current_price(symbol, current_prices)
+        status = str((price_statuses or {}).get(symbol) or ("live" if price > 0 else "missing"))
         if price <= 0:
+            position["price_status"] = "missing"
+            position["last_price_update"] = position.get("last_price_update") or ""
+            missing_count += 1
             continue
+        if status == "missing":
+            status = "stale"
+        if status == "stale":
+            stale_count += 1
+        else:
+            live_count += 1
         pnl_info = calculate_position_pnl(position, price)
         pnl = _to_float(pnl_info.get("unrealized_pnl"), 0)
         position["current_price"] = price
+        position["price_status"] = status
+        position["last_price_update"] = _now()
         position["unrealized_pnl"] = pnl
         position["unrealized_pnl_pct"] = _to_float(pnl_info.get("unrealized_pnl_pct"), 0)
         position["unrealized_pnl_pct_notional"] = _to_float(pnl_info.get("unrealized_pnl_pct_notional"), 0)
@@ -810,12 +840,15 @@ def update_sim_positions(current_prices: dict[str, float]) -> None:
         position["update_time"] = _now()
         unrealized_total += pnl
         direction = str(position.get("direction"))
-        if check_stop_loss(position, price):
+        can_auto_exit = status in {"live", "ranking", "stale"}
+        if can_auto_exit and check_stop_loss(position, price):
+            _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=stop_loss price={price} status={status}")
             close_sim_position(position["position_id"], "触发止损", price)
             external_position_change = True
             continue
         take_profit_hit = check_take_profit(position, price)
-        if take_profit_hit == "tp1":
+        if can_auto_exit and take_profit_hit == "tp1":
+            _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_1 price={price} status={status}")
             partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
             position["tp1_hit"] = True
             if load_settings().get("move_sl_to_breakeven", True):
@@ -823,7 +856,8 @@ def update_sim_positions(current_prices: dict[str, float]) -> None:
                 position["moved_stop_to_breakeven"] = True
                 log_sim_event("移动止损到保本", symbol, direction, price, reason="止盈1已触发。")
             external_position_change = True
-        if take_profit_hit == "tp2":
+        if can_auto_exit and take_profit_hit == "tp2":
+            _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_2 price={price} status={status}")
             position["tp2_hit"] = True
             close_sim_position(position["position_id"], "触发止盈2", price)
             external_position_change = True
@@ -840,12 +874,14 @@ def update_sim_positions(current_prices: dict[str, float]) -> None:
     account["unrealized_pnl"] = unrealized_total
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized_total
     account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + unrealized_total
-    account["max_equity"] = max(_to_float(account.get("max_equity"), account.get("initial_balance")), _to_float(account.get("equity"), 0))
+    initial_balance = _to_float(account.get("initial_balance"), 0) or 0.0
+    account["max_equity"] = max(_to_float(account.get("max_equity"), initial_balance) or 0.0, _to_float(account.get("equity"), 0) or 0.0)
     max_equity = _to_float(account.get("max_equity"), 0)
     account["max_drawdown"] = max(_to_float(account.get("max_drawdown"), 0), (max_equity - _to_float(account.get("equity"), 0)) / max_equity * 100 if max_equity else 0)
     account["return_pct"] = (account["equity"] - _to_float(account.get("initial_balance"), 0)) / _to_float(account.get("initial_balance"), 1) * 100
     save_positions(positions)
     save_sim_account(account)
+    _debug_price_log(f"update_sim_positions positions={len([p for p in positions if p.get('status') in {'open', 'partially_closed'}])} live={live_count} stale={stale_count} missing={missing_count}")
 
 
 def process_committee_signals(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -871,9 +907,9 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
     return results
 
 
-def update_simulation(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def update_simulation(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None, price_statuses: dict[str, str] | None = None) -> dict[str, Any]:
     check_pending_orders(current_prices)
-    update_sim_positions(current_prices)
+    update_sim_positions(current_prices, price_statuses)
     process_results = process_committee_signals(current_prices, signals)
     return get_sim_account_summary(process_results=process_results)
 

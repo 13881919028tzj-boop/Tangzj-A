@@ -247,8 +247,12 @@ def get_whale_snapshot(symbol: str, ticker: dict[str, Any] | None = None, deriva
     score = _whale_score(stats["15m"], price_change, oi_change)
     latest_buy = [trade for trade in whales if trade["direction"] == "主动买入"]
     latest_sell = [trade for trade in whales if trade["direction"] == "主动卖出"]
+    recent_buy = [trade for trade in trades if trade["direction"] == "主动买入"]
+    recent_sell = [trade for trade in trades if trade["direction"] == "主动卖出"]
     largest_buy = max(latest_buy, key=lambda trade: trade["amount"], default=None)
     largest_sell = max(latest_sell, key=lambda trade: trade["amount"], default=None)
+    largest_recent_buy = max(recent_buy, key=lambda trade: trade["amount"], default=None)
+    largest_recent_sell = max(recent_sell, key=lambda trade: trade["amount"], default=None)
     stats_5m = stats["5m"]
     stats_15m = stats["15m"]
     total_5m = _to_float(stats_5m.get("buy_amount")) + _to_float(stats_5m.get("sell_amount"))
@@ -273,6 +277,7 @@ def get_whale_snapshot(symbol: str, ticker: dict[str, Any] | None = None, deriva
         "raw_trade_count": len(raw) if isinstance(raw, list) else 0,
         "trade_count": len(trades),
         "latest": whales[:8],
+        "recent_trades": trades[:8],
         "stats": stats,
         "status": status,
         "explanation": explanation,
@@ -289,8 +294,8 @@ def get_whale_snapshot(symbol: str, ticker: dict[str, Any] | None = None, deriva
         "net_inflow_15m": stats_15m["net_amount"],
         "active_buy_amount": stats_5m["buy_amount"],
         "active_sell_amount": stats_5m["sell_amount"],
-        "largest_buy_order": largest_buy or {},
-        "largest_sell_order": largest_sell or {},
+        "largest_buy_order": largest_buy or largest_recent_buy or {},
+        "largest_sell_order": largest_sell or largest_recent_sell or {},
         "buy_whale_count": stats_5m["buy_count"],
         "sell_whale_count": stats_5m["sell_count"],
         "buy_sell_count_text": f"买入 {stats_5m['buy_count']} 笔 / 卖出 {stats_5m['sell_count']} 笔",

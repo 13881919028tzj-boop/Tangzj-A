@@ -14,16 +14,21 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
+from typing import Any
 
 from services.binance_public import (
     get_all_24hr_tickers,
     get_24hr_ticker,
     get_exchange_info_symbols,
+    normalize_ticker,
 )
 from services.kline_service import get_klines
 from services.market_scanner import scan_market_opportunities
 from services.fast_opportunity_engine import (
+    collect_top10_opportunities,
     get_fast_opportunity_settings,
+    get_fast_opportunity_status,
     process_top1_fast_opportunity,
 )
 from services.auto_simulation_runner import run_auto_simulation_cycle
@@ -37,6 +42,27 @@ from services import market_cache
 
 _STARTED = False
 _START_LOCK = threading.Lock()
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+LIVE_CACHE_LOG = LOG_DIR / "live_cache_debug.log"
+MAX_PRIORITY_REFRESH_PER_LOOP = 4
+
+
+def _debug_log(path: Path, message: str) -> None:
+    """Append a short runtime diagnostic line without secrets."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
+def _standard_ticker(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ranking/public ticker rows before writing the ticker cache."""
+    ticker = normalize_ticker(row)
+    if not ticker.get("symbol"):
+        ticker["symbol"] = str(row.get("symbol") or "").upper().strip()
+    return ticker
 
 
 def _fallback_symbols(primary: str) -> list[str]:
@@ -139,6 +165,13 @@ def _refresh_rankings(symbols: list[str]) -> None:
     try:
         valid_symbols = set(symbols)
         tickers = get_all_24hr_tickers(valid_symbols)
+        synced = 0
+        for ticker_row in tickers:
+            symbol = str(ticker_row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            market_cache.set_ticker(symbol, _standard_ticker(ticker_row))
+            synced += 1
         rankings = {
             "gainers": sorted(tickers, key=lambda item: item["price_change_percent"], reverse=True)[:10],
             "losers": sorted(tickers, key=lambda item: item["price_change_percent"])[:10],
@@ -146,6 +179,7 @@ def _refresh_rankings(symbols: list[str]) -> None:
         }
         rankings.update(scan_market_opportunities(tickers))
         market_cache.set_rankings(rankings)
+        _debug_log(LIVE_CACHE_LOG, f"rankings_refresh tickers={len(tickers)} ticker_cache_synced={synced}")
         try:
             sync_watchlist_from_rankings(rankings)
         except Exception as watch_exc:
@@ -181,7 +215,7 @@ def _worker() -> None:
 
             market_cache.mark_status_ok()
             fast_settings = get_fast_opportunity_settings()
-            ranking_seconds = max(3, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 3) or 3))
+            ranking_seconds = max(60, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 60) or 60))
             if now - last_ranking_refresh >= ranking_seconds:
                 _refresh_rankings(symbols)
                 last_ranking_refresh = now
@@ -192,18 +226,84 @@ def _worker() -> None:
 
 
 def _ticker_worker() -> None:
-    """行情 ticker 独立刷新循环。"""
+    """行情 ticker 独立刷新循环。
+    
+    修复：同时刷新当前交易对象和所有开仓持仓的币种行情，
+    确保持仓币种的 ticker 不会过期导致自动卖出失败。
+    """
+    from services.live_auto_pilot import load_live_auto_positions
+    from services.sim_trade_engine import get_open_positions
+
+    def priority_symbols() -> list[str]:
+        positions: list[str] = []
+        others: list[str] = []
+        current_symbol = market_cache.get_current_symbol()
+        if current_symbol:
+            others.append(current_symbol)
+        try:
+            for position in get_open_positions():
+                symbol = str(position.get("symbol") or "").upper().strip()
+                if symbol:
+                    positions.append(symbol)
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"priority_sim_positions_failed error={repr(exc)}")
+        try:
+            for position in load_live_auto_positions(1000):
+                if position.get("status") == "open":
+                    symbol = str(position.get("symbol") or "").upper().strip()
+                    if symbol:
+                        positions.append(symbol)
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"priority_live_auto_positions_failed error={repr(exc)}")
+        rankings = market_cache.get_rankings() or {}
+        try:
+            for row in collect_top10_opportunities(rankings, limit=10):
+                symbol = str(row.get("symbol") or "").upper().strip()
+                if symbol:
+                    others.append(symbol)
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"priority_top10_failed error={repr(exc)}")
+        try:
+            status = get_fast_opportunity_status()
+            candidate_rows = list(status.get("latest_multi_review", []) or [])
+            latest_candidate = status.get("latest_candidate") or {}
+            if latest_candidate:
+                candidate_rows.append(latest_candidate)
+            for row in candidate_rows:
+                symbol = str(row.get("symbol") or "").upper().strip()
+                if symbol:
+                    others.append(symbol)
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"priority_candidates_failed error={repr(exc)}")
+
+        ordered: list[str] = []
+        for group in (positions, others):
+            for symbol in group:
+                if symbol and symbol not in ordered:
+                    ordered.append(symbol)
+        return ordered[:MAX_PRIORITY_REFRESH_PER_LOOP]
+    
     while True:
         started_at = time.monotonic()
         try:
-            current_symbol = market_cache.get_current_symbol()
-            refresh_symbol_now(current_symbol)
+            symbols = priority_symbols()
+            success = 0
+            failed = 0
+            for symbol in symbols:
+                try:
+                    refresh_symbol_now(symbol)
+                    success += 1
+                except Exception as exc:
+                    failed += 1
+                    _debug_log(LIVE_CACHE_LOG, f"priority_refresh_failed symbol={symbol} error={repr(exc)}")
+            _debug_log(LIVE_CACHE_LOG, f"priority_refresh symbols={len(symbols)} success={success} failed={failed}")
+            
             if market_cache.consume_refresh_request():
                 refresh_symbol_now(market_cache.get_current_symbol())
         except Exception as exc:
             print(f"[AI模型7.1.2] 行情后台刷新异常 error={repr(exc)}")
             market_cache.set_error("Binance行情获取失败，请检查网络或稍后重试。")
-        time.sleep(max(0.05, 1.0 - (time.monotonic() - started_at)))
+        time.sleep(max(0.5, 5.0 - (time.monotonic() - started_at)))
 
 
 def _kline_worker() -> None:
@@ -213,7 +313,7 @@ def _kline_worker() -> None:
         started_at = time.monotonic()
         try:
             now = time.monotonic()
-            if now - last_refresh >= 15:
+            if now - last_refresh >= 5:
                 refresh_klines_now(market_cache.get_current_symbol(), market_cache.get_kline_interval())
                 last_refresh = now
             if market_cache.consume_kline_refresh_request():
