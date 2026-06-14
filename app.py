@@ -260,9 +260,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.0.1"
+APP_TITLE = "AI模型 9.0.2"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.0.1 实时行情缓存桥接 + 持仓现价刷新 + 信号链路修复版"
+VERSION = "AI模型 9.0.2 模拟账户统计与风险计算修复版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -2641,7 +2641,7 @@ def build_kline_figure(symbol: str, interval: str, rows: list[dict[str, Any]], v
         margin={"l": 42, "r": 16, "t": 38, "b": 24},
         hovermode="x unified",
         hoverlabel={"bgcolor": "#0F172A", "bordercolor": "#334155", "font": {"color": "#FFFFFF"}},
-        dragmode="pan",
+        dragmode="zoom" if chart_interactive else False,
         uirevision=f"{symbol}-{interval}",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "left", "x": 0},
         xaxis_rangeslider_visible=False,
@@ -4315,12 +4315,15 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
     render_watchlist_quick_controls(st.session_state.get("current_symbol", symbol), "signals", source="manual")
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
     if fragment:
-        @fragment(run_every="8s")
-        def _live_kline_module() -> None:
-            live_symbol = st.session_state.get("current_symbol", symbol)
-            render_kline_system(live_symbol)
+        if st.session_state.get("chart_interactive"):
+            render_kline_system(st.session_state.get("current_symbol", symbol))
+        else:
+            @fragment(run_every="8s")
+            def _live_kline_module() -> None:
+                live_symbol = st.session_state.get("current_symbol", symbol)
+                render_kline_system(live_symbol)
 
-        _live_kline_module()
+            _live_kline_module()
 
         @fragment(run_every="3s")
         def _live_orderbook_module() -> None:
@@ -6683,7 +6686,7 @@ def render_api_external_interface_center() -> None:
         <div class="app-shell">
           <div class="module-card warning-box">
             <b>API 与外部接口中心</b><br>
-            所有密钥必须脱敏管理。页面不会显示 Secret，也不会把 API Key / Secret 发送给 DeepSeek、Gemini 或任何外部模型。
+            所有密钥必须脱敏管理。手机端可直接填写并保存；保存后会自动保留到本机 .env，直到你下次重新填写或手动清除。
           </div>
         </div>
         """,
@@ -6701,7 +6704,7 @@ def render_api_external_interface_center() -> None:
                 ("Live Manual", "默认禁用", "red"),
             ]
         )
-        st.info("密钥会保存到本机 .env。页面只显示脱敏状态，不会显示 Secret，不会写入审计日志。空输入表示保留原值。")
+        st.info("手机端填写后会自动保存到本机 .env，并立即在当前运行进程中生效。页面只显示脱敏状态；空输入表示保留原值。")
         with st.form("binance_secure_api_form"):
             b1, b2 = st.columns(2)
             binance_key = b1.text_input("Binance API Key", value="", type="password", placeholder="留空则不修改")
@@ -6710,7 +6713,7 @@ def render_api_external_interface_center() -> None:
             testnet_key = t1.text_input("Binance Testnet API Key", value="", type="password", placeholder="留空则不修改")
             testnet_secret = t2.text_input("Binance Testnet API Secret", value="", type="password", placeholder="留空则不修改")
             st.caption("建议真实 Binance API 关闭提现权限，并开启 IP 白名单。")
-            if st.form_submit_button("保存交易所 API 到本地 .env", use_container_width=True):
+            if st.form_submit_button("保存并启用交易所 API", use_container_width=True):
                 result = write_secure_api_values(
                     {
                         "BINANCE_API_KEY": binance_key,
@@ -6776,8 +6779,8 @@ def render_api_external_interface_center() -> None:
             a1, a2 = st.columns(2)
             deepseek_key = a1.text_input("DeepSeek API Key", value="", type="password", placeholder="留空则不修改")
             gemini_key = a2.text_input("Gemini API Key", value="", type="password", placeholder="留空则不修改")
-            st.caption("外部 AI 只读取脱敏交易摘要；API Key 不会发送给任何模型。")
-            if st.form_submit_button("保存外部 AI API Key 到本地 .env", use_container_width=True):
+            st.caption("手机端填写后会自动保存并保留到下次修改；外部 AI 只读取脱敏交易摘要，API Key 不会发送给任何模型。空输入表示保留原值。")
+            if st.form_submit_button("保存并启用外部 AI API Key", use_container_width=True):
                 result = write_secure_api_values({"DEEPSEEK_API_KEY": deepseek_key, "GEMINI_API_KEY": gemini_key})
                 (st.success if result.get("ok") else st.warning)(result.get("message"))
                 st.rerun()

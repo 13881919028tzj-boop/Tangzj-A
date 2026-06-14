@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +53,11 @@ def _parse_env_lines() -> tuple[list[str], dict[str, str]]:
 
 
 def read_secure_api_values() -> dict[str, str]:
-    return _parse_env_lines()[1]
+    values = _parse_env_lines()[1]
+    for key in MANAGED_KEYS:
+        if os.environ.get(key):
+            values[key] = str(os.environ.get(key) or "")
+    return values
 
 
 def get_secure_api_status() -> dict[str, Any]:
@@ -95,7 +100,9 @@ def write_secure_api_values(updates: dict[str, str]) -> dict[str, Any]:
         if key in values and key not in written:
             rendered.append(f"{key}={values[key]}")
     ENV_PATH.write_text("\n".join(rendered).rstrip() + "\n", encoding="utf-8")
-    return {"ok": True, "message": "API 密钥已保存到本地 .env。页面只显示脱敏状态。", "updated_keys": list(safe_updates.keys()), "env_path": str(ENV_PATH)}
+    for key, value in safe_updates.items():
+        os.environ[key] = value
+    return {"ok": True, "message": "API 密钥已保存到本地 .env，并已在当前运行进程中立即生效。页面只显示脱敏状态。", "updated_keys": list(safe_updates.keys()), "env_path": str(ENV_PATH)}
 
 
 def clear_secure_api_values(keys: list[str]) -> dict[str, Any]:
@@ -105,6 +112,7 @@ def clear_secure_api_values(keys: list[str]) -> dict[str, Any]:
     lines, values = _parse_env_lines()
     for key in target:
         values.pop(key, None)
+        os.environ.pop(key, None)
     rendered: list[str] = []
     for line in lines:
         raw = line.strip()

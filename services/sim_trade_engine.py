@@ -75,6 +75,28 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _positive_float(value: Any, default: float = 0.0) -> float:
+    number = _to_float(value, default)
+    return number if number > 0 else default
+
+
+def account_initial_balance(account: dict[str, Any] | None = None, settings: dict[str, Any] | None = None) -> float:
+    """Return the canonical initial simulation capital, migrating older account fields."""
+    account = account or {}
+    settings = settings or load_settings()
+    for value in (
+        account.get("initial_balance"),
+        account.get("initial_equity"),
+        settings.get("initial_balance"),
+        account.get("max_equity"),
+        account.get("equity"),
+    ):
+        number = _positive_float(value, 0.0)
+        if number > 0:
+            return number
+    return 1000.0
+
+
 def _read_json(path: Path, default: Any) -> Any:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -179,6 +201,11 @@ def init_sim_account() -> dict[str, Any]:
     if not isinstance(account, dict):
         account = default_account(float(settings.get("initial_balance", 1000)))
         save_sim_account(account)
+    initial_balance = account_initial_balance(account, settings)
+    if _positive_float(account.get("initial_balance"), 0.0) <= 0:
+        account["initial_balance"] = initial_balance
+        account.setdefault("initial_equity", initial_balance)
+        _write_json(ACCOUNT_PATH, account)
     return account
 
 
@@ -288,6 +315,9 @@ def enrich_sim_account(account: dict[str, Any] | None, positions: list[dict[str,
     account = dict(account or default_account())
     positions = positions if positions is not None else get_open_positions()
     orders = orders if orders is not None else get_pending_orders()
+    initial_balance = account_initial_balance(account)
+    account["initial_balance"] = initial_balance
+    account.setdefault("initial_equity", initial_balance)
     unrealized = sum(_to_float(p.get("unrealized_pnl"), 0) for p in positions)
     used_margin = calculate_used_margin(positions)
     long_exposure, short_exposure = calculate_long_short_exposure(positions)
@@ -298,11 +328,9 @@ def enrich_sim_account(account: dict[str, Any] | None, positions: list[dict[str,
     account["unrealized_pnl"] = unrealized
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized
     account["equity"] = _to_float(account.get("available_balance"), 0) + used_margin + unrealized
-    initial_balance = _to_float(account.get("initial_balance"), 0) or 0.0
     account["max_equity"] = max(_to_float(account.get("max_equity"), initial_balance) or 0.0, _to_float(account.get("equity"), 0) or 0.0)
     account["current_drawdown"], account["max_drawdown"] = calculate_account_drawdown(account)
-    initial = _to_float(account.get("initial_balance"), 1)
-    account["return_pct"] = (account["equity"] - initial) / initial * 100 if initial else 0
+    account["return_pct"] = (account["equity"] - initial_balance) / initial_balance * 100 if initial_balance else 0
     account["open_position_count"] = len(positions)
     account["pending_order_count"] = len(orders)
     account["risk_status"] = "locked" if account.get("status") == "stopped" else "warning" if account["current_drawdown"] >= 5 or account["max_drawdown"] >= 8 else "normal"
@@ -874,11 +902,13 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
     account["unrealized_pnl"] = unrealized_total
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized_total
     account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + unrealized_total
-    initial_balance = _to_float(account.get("initial_balance"), 0) or 0.0
+    initial_balance = account_initial_balance(account)
+    account["initial_balance"] = initial_balance
+    account.setdefault("initial_equity", initial_balance)
     account["max_equity"] = max(_to_float(account.get("max_equity"), initial_balance) or 0.0, _to_float(account.get("equity"), 0) or 0.0)
     max_equity = _to_float(account.get("max_equity"), 0)
     account["max_drawdown"] = max(_to_float(account.get("max_drawdown"), 0), (max_equity - _to_float(account.get("equity"), 0)) / max_equity * 100 if max_equity else 0)
-    account["return_pct"] = (account["equity"] - _to_float(account.get("initial_balance"), 0)) / _to_float(account.get("initial_balance"), 1) * 100
+    account["return_pct"] = (account["equity"] - initial_balance) / initial_balance * 100 if initial_balance else 0
     save_positions(positions)
     save_sim_account(account)
     _debug_price_log(f"update_sim_positions positions={len([p for p in positions if p.get('status') in {'open', 'partially_closed'}])} live={live_count} stale={stale_count} missing={missing_count}")
@@ -1006,9 +1036,12 @@ def calculate_sim_stats() -> dict[str, Any]:
 def calculate_account_risk_summary(account: dict[str, Any] | None = None, positions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     account = account or load_sim_account()
     positions = positions if positions is not None else get_open_positions()
-    initial = _to_float(account.get("initial_balance"), 1)
+    equity = _positive_float(account.get("equity"), account_initial_balance(account))
+    initial = account_initial_balance(account)
     total_stop_loss = 0.0
     max_single_loss = 0.0
+    long_exposure, short_exposure = calculate_long_short_exposure(positions)
+    total_exposure = long_exposure + short_exposure
     for position in positions:
         entry = _to_float(position.get("entry_price"), 0)
         stop = _to_float(position.get("stop_loss"), 0)
@@ -1021,22 +1054,49 @@ def calculate_account_risk_summary(account: dict[str, Any] | None = None, positi
             loss = max(0.0, (entry - stop) * qty)
         total_stop_loss += loss
         max_single_loss = max(max_single_loss, loss)
-    risk_pct = total_stop_loss / initial * 100 if initial else 0
+    risk_pct = total_stop_loss / equity * 100 if equity else 0
+    exposure_pct = total_exposure / equity * 100 if equity else 0
+    margin_pct = _to_float(account.get("used_margin"), 0) / equity * 100 if equity else 0
     daily_limit = initial * _to_float(load_settings().get("daily_loss_limit_pct"), 3) / 100
     allowed = account.get("status") == "running" and account.get("risk_status") != "locked"
-    status = "警戒" if risk_pct >= 3 or _to_float(account.get("current_drawdown"), 0) >= 5 else "正常"
+    if risk_pct >= 60:
+        status = "高风险"
+    elif risk_pct >= 40:
+        status = "警戒"
+    elif risk_pct >= 20:
+        status = "注意"
+    else:
+        status = "正常"
     if not allowed:
         status = "锁定"
+    explanation = (
+        f"风险率=预计最大止损亏损 {total_stop_loss:.2f} / 当前权益 {equity:.2f} * 100 = {risk_pct:.2f}%。"
+        f" 名义暴露 {total_exposure:.2f} USDT，占权益 {exposure_pct:.2f}%；保证金占用 {margin_pct:.2f}%。"
+    )
+    if status != "正常":
+        explanation += " 当前模拟账户风险偏高或交易状态未运行，建议暂停新增模拟仓位。"
+    else:
+        explanation += " 当前模拟账户风险处于正常范围。"
     return {
         "status": status,
         "total_risk_usdt": total_stop_loss,
         "total_risk_pct": risk_pct,
+        "risk_denominator": "equity",
+        "risk_formula": "estimated_stop_loss_usdt / equity * 100",
         "max_single_loss": max_single_loss,
+        "equity": equity,
+        "initial_balance": initial,
+        "total_exposure": total_exposure,
+        "long_exposure": long_exposure,
+        "short_exposure": short_exposure,
+        "exposure_pct": exposure_pct,
+        "used_margin": _to_float(account.get("used_margin"), 0),
+        "margin_pct": margin_pct,
         "daily_loss_limit_usdt": daily_limit,
         "available_balance_ok": _to_float(account.get("available_balance"), 0) > 0,
         "near_drawdown_limit": _to_float(account.get("max_drawdown"), 0) >= _to_float(load_settings().get("max_drawdown_limit_pct"), 8) * 0.8,
         "allow_new_position": allowed,
-        "explanation": "当前模拟账户风险处于正常范围。" if status == "正常" else "当前模拟账户风险偏高或交易状态未运行，建议暂停新增模拟仓位。",
+        "explanation": explanation,
     }
 
 
