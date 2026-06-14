@@ -1,0 +1,25 @@
+{
+  "version": "cognition_similarity_weights_v1",
+  "app_version": "AI模型 9.2",
+  "direction_similarity": {
+    "demand": 0.28,
+    "trend": 0.2,
+    "capital": 0.17,
+    "behavior": 0.15,
+    "structure": 0.12,
+    "risk": 0.08
+  },
+  "risk_reward_similarity": {
+    "risk": 0.25,
+    "demand": 0.2,
+    "trend": 0.15,
+    "capital": 0.15,
+    "behavior": 0.15,
+    "structure": 0.1
+  },
+  "notes": [
+    "方向相似度用于未来上涨、下跌、震荡概率匹配。",
+    "止盈止损相似度用于 MAE/MFE、止损和止盈空间匹配。",
+    "两套权重不得混用。"
+  ]
+}

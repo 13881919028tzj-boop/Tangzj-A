@@ -194,12 +194,17 @@ def _aggregate_old_votes(
 
 
 def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    cognition = data.get("market_cognition") or decision.get("market_cognition") or {}
+    state_code = str(cognition.get("state_code") or "")
+    reason = "经验库未接入，当前版本弃权。"
+    if state_code:
+        reason = f"当前状态码 {state_code} 已生成；经验库未接入，等待9.4后参与投票。"
     return {
-        **abstain_member("经验委员", "experience", "经验库未接入，当前版本弃权。"),
+        **abstain_member("经验委员", "experience", reason),
         "enabled": False,
         "experience_library_version": "none",
         "sample_count": 0,
-        "state_code": "",
+        "state_code": state_code,
         "similar_sample_count": 0,
         "win_rate_30m": None,
         "win_rate_60m": None,
@@ -215,7 +220,35 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
 def build_market_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     votes = _pick_votes(decision, {"本地策略委员", "趋势委员", "资金委员"})
     integrity = _integrity_from_inputs(data, ["ticker", "rows", "signal_analysis", "local_strategy"])
-    return _aggregate_old_votes(name="市场委员", role="market", votes=votes, data_integrity_score=integrity, fallback_reason="市场委员数据不足，当前弃权。")
+    cognition = data.get("market_cognition") or decision.get("market_cognition") or {}
+    if cognition:
+        integrity = min(integrity, clamp_score(cognition.get("data_integrity_score"), integrity))
+    result = _aggregate_old_votes(name="市场委员", role="market", votes=votes, data_integrity_score=integrity, fallback_reason="市场委员数据不足，当前弃权。")
+    if cognition:
+        reason_parts = [str(result.get("reason") or "")]
+        reason_parts.append(
+            f"9.2市场认知：状态{cognition.get('state_code', '-')}"
+            f"，趋势质量{cognition.get('trend_quality_score', cognition.get('trend_score', '-'))}"
+            f"，资金{cognition.get('capital_score', '-')}"
+            f"，结构{cognition.get('structure_score', '-')}"
+            f"，需求{cognition.get('demand_score', '-')}"
+            f"；主要矛盾：{cognition.get('main_conflict', '-')}"
+        )
+        result["reason"] = "；".join(part for part in reason_parts if part)
+        result["evidence"] = {
+            **(result.get("evidence") or {}),
+            "market_cognition": {
+                "state_code": cognition.get("state_code"),
+                "trend_direction": cognition.get("trend_direction"),
+                "trend_strength": cognition.get("trend_strength"),
+                "trend_quality_score": cognition.get("trend_quality_score") or cognition.get("trend_score"),
+                "capital_score": cognition.get("capital_score"),
+                "structure_score": cognition.get("structure_score"),
+                "demand_score": cognition.get("demand_score"),
+                "main_conflict": cognition.get("main_conflict"),
+            },
+        }
+    return result
 
 
 def build_orderbook_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
@@ -238,7 +271,14 @@ def build_risk_judge(data: dict[str, Any], decision: dict[str, Any]) -> dict[str
     hard = decision.get("hard_veto_status") or {}
     votes = _pick_votes(decision, {"风险委员", "清算委员", "实盘安全委员"})
     risk_score = clamp_score(decision.get("committee_risk_score"), 80)
+    cognition = data.get("market_cognition") or decision.get("market_cognition") or {}
+    if cognition:
+        risk_score = max(risk_score, clamp_score(cognition.get("risk_score"), 0), clamp_score(cognition.get("trap_risk_score"), 0))
     warnings = list(decision.get("final_warnings") or [])
+    if cognition and clamp_score(cognition.get("trap_risk_score"), 0) >= 65:
+        warnings.append(f"9.2需求引擎提示诱导风险偏高：{cognition.get('trap_risk_score')}")
+    if cognition and clamp_score(cognition.get("data_integrity_score"), 100) < 45:
+        warnings.append("9.2市场认知数据完整度过低，风险裁判保持保守。")
     risk_items = []
     for row in votes:
         risk_items.append(
@@ -263,7 +303,10 @@ def build_risk_judge(data: dict[str, Any], decision: dict[str, Any]) -> dict[str
         "block_reason": "；".join(str(x) for x in (hard.get("reasons") or [])) if blocked else "",
         "warnings": warnings,
         "risk_items": risk_items,
-        "data_integrity_score": _integrity_from_inputs(data, ["ticker", "rows", "orderbook_analysis", "local_strategy"]),
+        "data_integrity_score": min(
+            _integrity_from_inputs(data, ["ticker", "rows", "orderbook_analysis", "local_strategy"]),
+            clamp_score(cognition.get("data_integrity_score"), 100) if cognition else 100,
+        ),
     }
 
 
@@ -384,7 +427,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.1",
+        "version": "AI模型 9.2",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,

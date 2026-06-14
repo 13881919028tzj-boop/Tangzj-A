@@ -112,6 +112,8 @@ from services.manual_position_override import (
     load_manual_position_override_log,
     save_manual_position_override,
 )
+from services.market_cognition_engine import build_market_cognition
+from services.market_cognition_recorder import save_market_cognition_snapshot
 from services.market_risk_radar import analyze_market_risk_radar
 from services.market_scanner import scan_market_opportunities
 from services.local_api_server import get_local_api_port, start_local_api_server
@@ -262,9 +264,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.1.1"
+APP_TITLE = "AI模型 9.2"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.1.1 交易委员会页面残留显示修复版"
+VERSION = "AI模型 9.2 市场认知量化与经验库数据标准版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -1490,6 +1492,17 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
         radar=radar,
         primary_timeframe=interval,
     )
+    market_cognition = build_market_cognition(
+        symbol=live_symbol,
+        ticker=live_ticker,
+        rows=rows,
+        derivatives=derivatives,
+        orderbook_analysis=orderbook_analysis,
+        whale=whale,
+        signal_analysis=analysis,
+        local_strategy=strategy,
+        interval_base=interval,
+    )
     return run_committee_meeting(
         live_symbol,
         ticker=live_ticker,
@@ -1503,6 +1516,7 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
         dealer=dealer,
         radar=radar,
         local_strategy=strategy,
+        market_cognition=market_cognition,
     )
 
 
@@ -3093,6 +3107,96 @@ def render_html(html: str) -> None:
     st.markdown(_html_no_code_block(html), unsafe_allow_html=True)
 
 
+def render_market_cognition_panel(cognition: dict[str, Any] | None) -> None:
+    """渲染 AI模型 9.2 市场认知区域。"""
+    if not cognition:
+        render_html(
+            """
+            <div class="app-shell">
+              <div class="module-card">
+                <div class="module-title">市场认知</div>
+                <div class="status-card">市场认知量化等待数据。</div>
+              </div>
+            </div>
+            """
+        )
+        return
+    state_vector = cognition.get("state_vector") or {}
+    path_30m = cognition.get("path_30m") or {}
+    path_60m = cognition.get("path_60m") or {}
+    missing = cognition.get("missing_fields") or []
+    missing_text = "、".join(escape(str(item)) for item in missing) if missing else "无"
+    status_rows = [
+        ("趋势质量", cognition.get("trend_quality_score") or cognition.get("trend_score"), cognition.get("trend_state"), cognition.get("trend_direction")),
+        ("资金", cognition.get("capital_score"), cognition.get("capital_state"), ""),
+        ("结构", cognition.get("structure_score"), cognition.get("structure_state"), ""),
+        ("行为", cognition.get("behavior_score"), cognition.get("behavior_state"), ""),
+        ("风险", cognition.get("risk_score"), cognition.get("risk_state"), "越高越危险"),
+        ("需求", cognition.get("demand_score"), cognition.get("demand_state"), cognition.get("demand_direction")),
+    ]
+    score_cards = []
+    for label, score, state, extra in status_rows:
+        value = f"{score if score is not None else '-'}"
+        score_cards.append(
+            f"""
+            <div class="summary-card">
+              <div class="summary-label">{escape(str(label))} {escape(str(state or '-'))}</div>
+              <div class="summary-value {_signal_color(str(state or score))}">{escape(value)}</div>
+              <div class="summary-label">{escape(str(extra or ''))}</div>
+            </div>
+            """
+        )
+    render_html(
+        f"""
+        <div class="app-shell">
+          <div class="module-card">
+            <div class="module-title">市场认知</div>
+            <div class="metric-value {_signal_color(str(cognition.get("market_cognition_label", "")))}">
+              {escape(str(cognition.get("state_code", "-")))} · {escape(str(cognition.get("market_cognition_score", "-")))} / 100
+            </div>
+            <div class="module-desc">{escape(str(cognition.get("cognition_summary", "等待市场认知量化。")))}</div>
+            <div class="committee-grid">
+              {''.join(score_cards)}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>需求分析</b><br>
+              买方需求：{escape(str(cognition.get("buy_demand_score", "-")))}｜
+              卖方供给：{escape(str(cognition.get("sell_supply_score", "-")))}｜
+              净需求：{escape(str(cognition.get("net_demand_score", "-")))}<br>
+              紧迫度：{escape(str(cognition.get("urgency_score", "-")))}｜
+              持续性：{escape(str(cognition.get("sustainability_score", "-")))}｜
+              诱导风险：{escape(str(cognition.get("trap_risk_score", "-")))}<br>
+              趋势方向：{escape(str(cognition.get("trend_direction", "-")))}｜
+              趋势强度：{escape(str(cognition.get("trend_strength", "-")))}｜
+              趋势质量：{escape(str(cognition.get("trend_quality_score", cognition.get("trend_score", "-"))))}<br>
+              风险分：{escape(str(cognition.get("risk_score", "-")))}（越高越危险）｜
+              风险安全分：{escape(str(cognition.get("risk_safe_score", "-")))}<br>
+              {escape(str(cognition.get("demand_reason", "")))}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>路径概率（{escape(str(cognition.get("probability_type", "rule_based_v1"))) }）</b><br>
+              30分钟：上涨 {escape(str(path_30m.get("up", "-")))}%｜震荡 {escape(str(path_30m.get("sideways", "-")))}%｜下跌 {escape(str(path_30m.get("down", "-")))}%<br>
+              60分钟：上涨 {escape(str(path_60m.get("up", "-")))}%｜震荡 {escape(str(path_60m.get("sideways", "-")))}%｜下跌 {escape(str(path_60m.get("down", "-")))}%
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>认知要点</b><br>
+              主要矛盾：{escape(str(cognition.get("main_conflict", "-")))}<br>
+              攻击点：{escape(str(cognition.get("attack_point", "-")))}<br>
+              防守点：{escape(str(cognition.get("defense_point", "-")))}<br>
+              失效点：{escape(str(cognition.get("failure_point", "-")))}<br>
+              风险提示：{escape(str(cognition.get("risk_warning", "-")))}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              Confidence：{escape(str(cognition.get("confidence", "-")))}｜
+              DataIntegrity：{escape(str(cognition.get("data_integrity_score", "-")))}｜
+              缺失字段：{missing_text}
+            </div>
+          </div>
+        </div>
+        """
+    )
+
+
 def _to_weight_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -4207,6 +4311,17 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         radar=radar,
         primary_timeframe=interval,
     )
+    market_cognition = build_market_cognition(
+        symbol=symbol,
+        ticker=live_ticker,
+        rows=rows,
+        derivatives=derivatives,
+        orderbook_analysis=orderbook_analysis,
+        whale=whale,
+        signal_analysis=analysis,
+        local_strategy=strategy,
+        interval_base=interval,
+    )
     if is_watched(symbol):
         try:
             update_watchlist_item(symbol, strategy, live_ticker)
@@ -4279,6 +4394,7 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         data_status = f'<div class="status-card" style="margin-bottom:8px;color:#F0B90B;">{escape(str(analysis["message"]))}</div>'
 
     render_local_strategy_decision(strategy)
+    render_market_cognition_panel(market_cognition)
     committee_decision = run_committee_meeting(
         symbol,
         ticker=live_ticker,
@@ -4292,7 +4408,15 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         dealer=dealer,
         radar=radar,
         local_strategy=strategy,
+        market_cognition=market_cognition,
     )
+    market_cognition_with_committee = dict(market_cognition)
+    market_cognition_with_committee["committee_final_action"] = committee_decision.get("final_action")
+    market_cognition_with_committee["committee_trade_value_score"] = (committee_decision.get("trading_committee_v91") or {}).get("trade_value_score")
+    market_cognition_with_committee["risk_judge_verdict"] = ((committee_decision.get("trading_committee_v91") or {}).get("risk_judge") or {}).get("risk_verdict")
+    market_cognition_with_committee["position_plan_summary"] = ((committee_decision.get("trading_committee_v91") or {}).get("position_plan") or {}).get("reason")
+    market_cognition_with_committee["execution_plan_summary"] = ((committee_decision.get("trading_committee_v91") or {}).get("execution_plan") or {}).get("reason")
+    save_market_cognition_snapshot(market_cognition_with_committee)
     render_ai_committee_decision(committee_decision)
     render_sim_signal_linkage(committee_decision)
     render_manual_position_override_panel(committee_decision)
@@ -4486,25 +4610,11 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
     render_page_head("signals")
     render_watchlist_quick_controls(st.session_state.get("current_symbol", symbol), "signals", source="manual")
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+    live_symbol = st.session_state.get("current_symbol", symbol)
+    live_ticker = market_cache.get_ticker(live_symbol) or ticker
+    render_kline_system(live_symbol)
+    render_orderbook_system(live_symbol, live_ticker)
     if fragment:
-        if st.session_state.get("chart_interactive"):
-            render_kline_system(st.session_state.get("current_symbol", symbol))
-        else:
-            @fragment(run_every="8s")
-            def _live_kline_module() -> None:
-                live_symbol = st.session_state.get("current_symbol", symbol)
-                render_kline_system(live_symbol)
-
-            _live_kline_module()
-
-        @fragment(run_every="3s")
-        def _live_orderbook_module() -> None:
-            live_symbol = st.session_state.get("current_symbol", symbol)
-            live_ticker = market_cache.get_ticker(live_symbol) or ticker
-            render_orderbook_system(live_symbol, live_ticker)
-
-        _live_orderbook_module()
-
         @fragment(run_every="5s")
         def _live_signal_analysis() -> None:
             live_symbol = st.session_state.get("current_symbol", symbol)
@@ -4513,9 +4623,7 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
 
         _live_signal_analysis()
     else:
-        render_kline_system(symbol)
-        render_orderbook_system(symbol, ticker)
-        render_signal_analysis(symbol, ticker)
+        render_signal_analysis(live_symbol, live_ticker)
 
 
 def render_trading() -> None:

@@ -1,0 +1,46 @@
+{
+  "version": "market_cognition_weights_v1",
+  "app_version": "AI模型 9.2",
+  "market_cognition_score": {
+    "demand_score": 0.25,
+    "trend_quality_score": 0.18,
+    "capital_score": 0.16,
+    "behavior_score": 0.15,
+    "structure_score": 0.14,
+    "risk_safe_score": 0.12
+  },
+  "risk_safe_score_formula": "100 - risk_score",
+  "path_probability": {
+    "probability_type": "rule_based_v1",
+    "up_raw": {
+      "buy_demand_score": 0.3,
+      "bullish_trend_score": 0.2,
+      "capital_inflow_score": 0.16,
+      "bullish_behavior_score": 0.14,
+      "bullish_structure_score": 0.12,
+      "sustainability_score": 0.08
+    },
+    "down_raw": {
+      "sell_supply_score": 0.3,
+      "bearish_trend_score": 0.2,
+      "capital_outflow_score": 0.16,
+      "bearish_behavior_score": 0.14,
+      "bearish_structure_score": 0.12,
+      "risk_score": 0.08
+    },
+    "sideways_raw": {
+      "range_structure_score": 0.3,
+      "balance_demand_score": 0.25,
+      "low_momentum_score": 0.2,
+      "conflicting_signal_score": 0.15,
+      "data_uncertainty_score": 0.1
+    }
+  },
+  "labels": {
+    "80": "强认知优势",
+    "65": "认知优势",
+    "50": "中性观察",
+    "35": "认知偏弱",
+    "0": "高不确定"
+  }
+}

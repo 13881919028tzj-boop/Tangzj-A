@@ -49,6 +49,11 @@ try:
 except Exception:  # pragma: no cover
     attach_trading_committee_v91 = None
 
+try:
+    from services.market_cognition_engine import build_market_cognition
+except Exception:  # pragma: no cover
+    build_market_cognition = None
+
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 COMMITTEE_LOG_PATH = DATA_DIR / "committee_decision_log.json"
@@ -362,6 +367,7 @@ def collect_committee_inputs(symbol: str, **kwargs: Any) -> dict[str, Any]:
         "dealer": kwargs.get("dealer") or {},
         "radar": kwargs.get("radar") or {},
         "local_strategy": kwargs.get("local_strategy") or {},
+        "market_cognition": kwargs.get("market_cognition") or {},
         "watchlist_item": kwargs.get("watchlist_item") or _find_watchlist_item(symbol),
     }
 
@@ -1135,6 +1141,20 @@ def generate_committee_explanation(data: dict[str, Any]) -> dict[str, Any]:
 def run_committee_meeting(symbol: str, **kwargs: Any) -> dict[str, Any]:
     """运行单个交易对象的委员会会议。"""
     data = collect_committee_inputs(symbol, **kwargs)
+    if not data.get("market_cognition") and build_market_cognition:
+        try:
+            data["market_cognition"] = build_market_cognition(
+                symbol=data.get("symbol") or symbol,
+                ticker=data.get("ticker"),
+                rows=data.get("rows"),
+                derivatives=data.get("derivatives"),
+                orderbook_analysis=data.get("orderbook_analysis"),
+                whale=data.get("whale"),
+                signal_analysis=data.get("signal_analysis"),
+                local_strategy=data.get("local_strategy"),
+            )
+        except Exception:
+            data["market_cognition"] = {}
     member_functions = [
         run_local_strategy_member,
         run_trend_member,
@@ -1164,13 +1184,15 @@ def run_committee_meeting(symbol: str, **kwargs: Any) -> dict[str, Any]:
             votes.append(_member(name, "neutral", 0, 65, "观望", reasons=["外部AI调用失败，已自动降级。"], risks=[f"{name} 失败：{_safe_committee_text(exc)}"], summary=f"{name} 暂不可用，不影响主系统。"))
     data["member_votes"] = _normalize_members(votes, data)
     decision = generate_chairman_decision(data)
+    if data.get("market_cognition"):
+        decision["market_cognition"] = data.get("market_cognition")
     decision["explanation"] = generate_committee_explanation(decision)
     if attach_trading_committee_v91:
         try:
             decision = attach_trading_committee_v91(data, decision)
         except Exception as exc:
             decision["trading_committee_v91"] = {
-                "version": "AI模型 9.1",
+                "version": "AI模型 9.2",
                 "final_action": "WAIT",
                 "final_reason": f"9.1交易委员会聚合失败，已保留旧委员会结果：{exc!r}",
                 "members": [],

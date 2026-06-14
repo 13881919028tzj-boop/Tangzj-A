@@ -1,0 +1,85 @@
+{
+  "version": "market_state_language_v1",
+  "app_version": "AI模型 9.2",
+  "state_dimensions": {
+    "trend": {
+      "code": "T",
+      "name": "Trend",
+      "states": {
+        "T1": "强上涨",
+        "T2": "偏上涨",
+        "T3": "震荡",
+        "T4": "偏下跌",
+        "T5": "强下跌"
+      },
+      "notes": "TrendScore 表示趋势质量，必须同时输出 trend_direction 与 trend_strength。"
+    },
+    "capital": {
+      "code": "C",
+      "name": "Capital",
+      "states": {
+        "C1": "强资金流入",
+        "C2": "健康资金流入",
+        "C3": "资金中性",
+        "C4": "资金流出",
+        "C5": "资金拥挤或异常"
+      }
+    },
+    "structure": {
+      "code": "S",
+      "name": "Structure",
+      "states": {
+        "S1": "有效突破",
+        "S2": "回踩支撑",
+        "S3": "区间震荡",
+        "S4": "假突破风险",
+        "S5": "跌破结构"
+      }
+    },
+    "behavior": {
+      "code": "B",
+      "name": "Behavior",
+      "states": {
+        "B1": "主动买入或吸筹明显",
+        "B2": "买方略占优",
+        "B3": "多空均衡",
+        "B4": "主动卖出或派发明显",
+        "B5": "异常行为或诱导风险"
+      }
+    },
+    "risk": {
+      "code": "R",
+      "name": "Risk",
+      "states": {
+        "R1": "低风险",
+        "R2": "风险可控",
+        "R3": "风险警戒",
+        "R4": "高风险",
+        "R5": "禁止交易风险"
+      },
+      "notes": "RiskScore 越高代表风险越高。"
+    },
+    "demand": {
+      "code": "D",
+      "name": "Demand",
+      "states": {
+        "D1": "买方需求强烈增强",
+        "D2": "买方需求温和增强",
+        "D3": "供需平衡",
+        "D4": "买方需求衰减或卖压增强",
+        "D5": "卖方需求强烈释放"
+      },
+      "notes": "Demand 是核心维度，需求高于价格。"
+    }
+  },
+  "state_code_format": "T?-C?-S?-B?-R?-D?",
+  "score_range": {
+    "min": 0,
+    "max": 100
+  },
+  "directions": [
+    "LONG",
+    "SHORT",
+    "NEUTRAL"
+  ]
+}
