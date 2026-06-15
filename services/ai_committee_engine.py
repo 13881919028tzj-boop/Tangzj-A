@@ -368,6 +368,9 @@ def collect_committee_inputs(symbol: str, **kwargs: Any) -> dict[str, Any]:
         "radar": kwargs.get("radar") or {},
         "local_strategy": kwargs.get("local_strategy") or {},
         "market_cognition": kwargs.get("market_cognition") or {},
+        "experience_library_version": kwargs.get("experience_library_version") or "current",
+        "experience_library_path": kwargs.get("experience_library_path") or "",
+        "experience_library_data_sources": kwargs.get("experience_library_data_sources") or "",
         "watchlist_item": kwargs.get("watchlist_item") or _find_watchlist_item(symbol),
     }
 
@@ -1087,6 +1090,12 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
         "member_votes": member_votes,
         "vote_detail": vote_result,
         "committee_weights": COMMITTEE_WEIGHTS,
+        "experience_library": {
+            "version": data.get("experience_library_version") or "current",
+            "path": data.get("experience_library_path") or "",
+            "data_sources": data.get("experience_library_data_sources") or "",
+            "participates_in_trade_vote": False,
+        },
         "majority_rule": {
             "enabled": True,
             "support_weight": support_weight,

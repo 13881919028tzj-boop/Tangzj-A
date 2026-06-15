@@ -14,6 +14,7 @@ from services.experience_library_loader import (
     check_experience_library_available,
     get_default_experience_library_path,
     load_experience_level_records,
+    resolve_experience_library_path,
 )
 from services.symbol_profile_engine import build_symbol_profile
 
@@ -443,14 +444,15 @@ def _aggregate_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], st
 def _read_candidate_rows(
     level: str,
     experience_library_path: str | None,
+    experience_version: str | None,
     exact_filters: list[tuple[str, str, Any]],
     broad_filters: list[tuple[str, str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[str]]:
-    exact = load_experience_level_records(level, experience_library_path, filters=exact_filters)
+    exact = load_experience_level_records(level, experience_library_path, version=experience_version, filters=exact_filters)
     warnings = list(exact.get("warnings") or [])
     errors = list(exact.get("errors") or [])
     exact_rows = list(exact.get("records") or [])
-    broad = load_experience_level_records(level, experience_library_path, filters=broad_filters)
+    broad = load_experience_level_records(level, experience_library_path, version=experience_version, filters=broad_filters)
     warnings.extend(str(item) for item in list(broad.get("warnings") or []) if item not in warnings)
     errors.extend(str(item) for item in list(broad.get("errors") or []) if item not in errors)
     return exact_rows, list(broad.get("records") or []), warnings, errors
@@ -505,7 +507,7 @@ def _build_expanded_rows(
     return expanded, warnings, counts
 
 
-def _match_level(level: str, query: dict[str, Any], experience_library_path: str | None, top_k: int) -> dict[str, Any]:
+def _match_level(level: str, query: dict[str, Any], experience_library_path: str | None, experience_version: str | None, top_k: int) -> dict[str, Any]:
     symbol = str(query.get("symbol") or "").upper()
     state_code = query.get("state_code")
     groups = _group_query_order(query)
@@ -515,6 +517,7 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
         exact_rows, rows, warnings, errors = _read_candidate_rows(
             level,
             experience_library_path,
+            experience_version,
             [("symbol", "==", symbol), ("state_code", "==", state_code)],
             [("symbol", "==", symbol)],
         )
@@ -532,6 +535,7 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
             found_exact, found, level_warnings, level_errors = _read_candidate_rows(
                 level,
                 experience_library_path,
+                experience_version,
                 [("symbol_group", "==", group), ("state_code", "==", state_code)],
                 [("symbol_group", "==", group)],
             )
@@ -548,6 +552,7 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
         exact_rows, rows, warnings, errors = _read_candidate_rows(
             level,
             experience_library_path,
+            experience_version,
             [("state_code", "==", state_code)],
             [],
         )
@@ -827,8 +832,15 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     }
 
 
-def match_experience(query: dict[str, Any], experience_library_path: str | None = None, top_k: int = 50) -> dict[str, Any]:
-    status = check_experience_library_available(experience_library_path)
+def match_experience(
+    query: dict[str, Any],
+    experience_library_path: str | None = None,
+    top_k: int = 50,
+    experience_version: str | None = None,
+) -> dict[str, Any]:
+    resolved_path, selected_version = resolve_experience_library_path(experience_library_path, experience_version)
+    resolved_path_text = str(resolved_path)
+    status = check_experience_library_available(resolved_path_text, version=selected_version)
     if not status.get("available"):
         reason = "经验库未接入或不可读，当前经验委员弃权。"
         if status.get("warnings"):
@@ -842,6 +854,9 @@ def match_experience(query: dict[str, Any], experience_library_path: str | None 
             "confidence": 0,
             "data_integrity_score": 0,
             "reason": reason,
+            "experience_library_version": selected_version,
+            "experience_version": selected_version,
+            "data_sources": status.get("data_sources"),
             "experience_library_path": status.get("path") or get_default_experience_library_path(),
             "experience_library_status": status,
             "query": query,
@@ -852,9 +867,9 @@ def match_experience(query: dict[str, Any], experience_library_path: str | None 
         }
 
     levels = {
-        "symbol_level": _match_level("symbol_level", query, experience_library_path, top_k),
-        "group_level": _match_level("group_level", query, experience_library_path, top_k),
-        "global_level": _match_level("global_level", query, experience_library_path, top_k),
+        "symbol_level": _match_level("symbol_level", query, resolved_path_text, selected_version, top_k),
+        "group_level": _match_level("group_level", query, resolved_path_text, selected_version, top_k),
+        "global_level": _match_level("global_level", query, resolved_path_text, selected_version, top_k),
     }
     weights = _effective_weights(levels)
     for key, weight in weights.items():
@@ -868,6 +883,9 @@ def match_experience(query: dict[str, Any], experience_library_path: str | None 
         "available": True,
         **blended,
         **vote,
+        "experience_library_version": selected_version,
+        "experience_version": selected_version,
+        "data_sources": status.get("data_sources"),
         "experience_library_path": status.get("path") or get_default_experience_library_path(),
         "experience_library_status": status,
         "query": query,

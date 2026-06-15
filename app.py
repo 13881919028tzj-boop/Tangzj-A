@@ -118,7 +118,14 @@ from services.cognition_snapshot_validator import (
     build_snapshot_validation_report,
     save_snapshot_validation_report,
 )
-from services.experience_library_loader import load_experience_library_summary
+from services.experience_library_loader import (
+    DEFAULT_EXPERIENCE_LIBRARY_VERSION,
+    EXPERIENCE_LIBRARY_LABELS,
+    EXPERIENCE_LIBRARY_VERSIONS,
+    get_experience_library_data_sources,
+    get_experience_library_versions_status,
+    load_experience_library_summary,
+)
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
 from services.market_risk_radar import analyze_market_risk_radar
 from services.market_scanner import scan_market_opportunities
@@ -270,9 +277,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.7"
+APP_TITLE = "AI模型 9.2.8"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.7 经验库相似状态扩展匹配版"
+VERSION = "AI模型 9.2.8 经验库版本选择与Funding_v1读取测试版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -280,6 +287,11 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
 SIGNAL_CHAIN_LOG = LOG_DIR / "signal_chain_debug.log"
 EXPERIENCE_MATCH_LOG = LOG_DIR / "experience_match_debug.log"
+
+
+def get_selected_experience_library_version() -> str:
+    selected = str(st.session_state.get("experience_library_version") or DEFAULT_EXPERIENCE_LIBRARY_VERSION)
+    return selected if selected in EXPERIENCE_LIBRARY_VERSIONS else DEFAULT_EXPERIENCE_LIBRARY_VERSION
 
 
 def append_debug_log(path: Path, message: str) -> None:
@@ -1481,6 +1493,7 @@ def build_current_local_strategy(symbol: str, ticker: dict[str, Any] | None) -> 
 def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None) -> dict[str, Any]:
     """为总览页生成与信号页同源的委员会精简决议。"""
     live_symbol = str(symbol or st.session_state.get("current_symbol", "BTCUSDT")).upper().strip()
+    experience_version = get_selected_experience_library_version()
     interval = market_cache.get_kline_interval()
     rows = market_cache.get_klines(live_symbol, interval)
     passed_symbol = str((ticker or {}).get("symbol") or "").upper().strip()
@@ -1533,6 +1546,9 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
         radar=radar,
         local_strategy=strategy,
         market_cognition=market_cognition,
+        experience_library_version=experience_version,
+        experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
+        experience_library_data_sources=get_experience_library_data_sources(experience_version),
     )
 
 
@@ -1551,6 +1567,10 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
     supporting = list(decision.get("supporting_members") or [])
     opposing = list(decision.get("opposing_members") or [])
     veto_members = list(decision.get("veto_members") or [])
+    experience_library = decision.get("experience_library") or {}
+    committee_experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
+    committee_experience_sources = str(experience_library.get("data_sources") or get_experience_library_data_sources(committee_experience_version))
+    committee_experience_path = str(experience_library.get("path") or EXPERIENCE_LIBRARY_VERSIONS.get(committee_experience_version, ""))
     weight_summary = _committee_weight_summary(decision)
     vote_weight_text = (
         f"支持{_fmt_weight(weight_summary['support_weight'])} / "
@@ -1597,7 +1617,9 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">风险裁判</div><div class="summary-value {_signal_color("禁止开仓" if v91_risk.get("blocked") else "支持交易")}">{escape(str(v91_risk.get("risk_verdict", "WAIT")))}</div></div>
               <div class="summary-card"><div class="summary-label">仓位委员会</div><div class="summary-value yellow">{float(v91_position.get("position_size_pct", 0) or 0):.2f}% / {int(v91_position.get("leverage", 1) or 1)}x</div></div>
               <div class="summary-card"><div class="summary-label">执行委员会</div><div class="summary-value {_signal_color("支持交易" if v91_execution.get("execution_allowed") else "反对交易")}">{escape(str(v91_execution.get("execution_type", "WAIT")))}</div></div>
+              <div class="summary-card"><div class="summary-label">经验库版本</div><div class="summary-value blue">{escape(committee_experience_version)}</div><div class="module-desc">{escape(committee_experience_sources)}｜不参与交易委员会正式投票</div></div>
             </div>
+            <div class="status-card" style="margin-top:8px;"><b>经验库路径</b><br>{escape(committee_experience_path or "-")}</div>
             {_render_committee_summary_panel(decision)}
             <details class="status-card" style="margin-top:8px;">
               <summary><b>查看委员意见</b></summary>
@@ -3231,9 +3253,24 @@ def render_cognition_snapshot_validation_panel() -> None:
 def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     """Render experience-library status and live matching result."""
     symbol = str(cognition.get("symbol") or st.session_state.get("current_symbol", "")).upper()
+    version_statuses = get_experience_library_versions_status()
+    version_options = list(EXPERIENCE_LIBRARY_VERSIONS.keys())
+    current_version = get_selected_experience_library_version()
+    if st.session_state.get("experience_library_version") not in version_options:
+        st.session_state["experience_library_version"] = DEFAULT_EXPERIENCE_LIBRARY_VERSION
+    selected_version = st.selectbox(
+        "经验库版本选择",
+        version_options,
+        index=version_options.index(current_version) if current_version in version_options else 0,
+        format_func=lambda version: (
+            f"{version}：{EXPERIENCE_LIBRARY_LABELS.get(version, version)}"
+            f"（{'可用' if (version_statuses.get(version) or {}).get('available') else '不可用'}）"
+        ),
+        key="experience_library_version",
+    )
     query = build_experience_query_from_cognition(symbol, cognition)
-    summary = load_experience_library_summary()
-    match = match_experience(query)
+    summary = load_experience_library_summary(version=selected_version)
+    match = match_experience(query, experience_version=selected_version)
     market_cognition_state_code = str(cognition.get("state_code") or "")
     experience_query_state_code = str(query.get("experience_query_state_code") or query.get("state_code") or "")
     state_code_consistent = market_cognition_state_code == experience_query_state_code
@@ -3245,6 +3282,15 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         st.warning(f"经验查询 state_code 与市场认知不一致：市场认知 {market_cognition_state_code or '-'}，经验查询 {experience_query_state_code or '-'}")
     status = "可用" if summary.get("available") else "未接入" if not summary.get("manifest_found") else "格式不完整"
     status_class = "green" if summary.get("available") else "yellow" if summary.get("manifest_found") else "red"
+    data_sources = str(summary.get("data_sources") or get_experience_library_data_sources(selected_version))
+    version_rows = "".join(
+        f"""<div class="summary-card">
+          <div class="summary-label">{escape(version)} · {escape(EXPERIENCE_LIBRARY_LABELS.get(version, version))}</div>
+          <div class="summary-value {'green' if (status_item or {}).get('available') else 'red'}">{'可用' if (status_item or {}).get('available') else '不可用'}</div>
+          <div class="module-desc">{escape(str((status_item or {}).get('data_sources') or get_experience_library_data_sources(version)))}｜{escape(str((status_item or {}).get('path') or EXPERIENCE_LIBRARY_VERSIONS.get(version, '')))}</div>
+        </div>"""
+        for version, status_item in version_statuses.items()
+    )
     state_summary = str(query.get("state_vector_summary") or "状态向量缺失")
     if len(state_summary) > 180:
         state_summary = state_summary[:180].rstrip() + "..."
@@ -3324,9 +3370,14 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         <div class="app-shell">
           <div class="module-card">
             <div class="module-title">经验匹配结果</div>
-            <div class="module-desc">经验委员按单币种、同类币种、全市场三层经验匹配当前市场认知，只输出建议和投票。</div>
+            <div class="module-desc">经验委员按单币种、同类币种、全市场三层经验匹配当前市场认知，只输出建议和投票。当前使用：{escape(selected_version)}。</div>
+            <div class="committee-grid">
+              {version_rows}
+            </div>
             <div class="committee-grid">
               <div class="summary-card"><div class="summary-label">经验库状态</div><div class="summary-value {status_class}">{escape(status)}</div></div>
+              <div class="summary-card"><div class="summary-label">当前经验库版本</div><div class="summary-value blue">{escape(selected_version)}</div><div class="module-desc">{escape(EXPERIENCE_LIBRARY_LABELS.get(selected_version, selected_version))}</div></div>
+              <div class="summary-card"><div class="summary-label">data_sources</div><div class="summary-value yellow">{escape(data_sources)}</div></div>
               <div class="summary-card"><div class="summary-label">单币种经验</div><div class="summary-value {'green' if summary.get('symbol_level_found') else 'red'}">{'已发现' if summary.get('symbol_level_found') else '缺失'}</div></div>
               <div class="summary-card"><div class="summary-label">同类币种经验</div><div class="summary-value {'green' if summary.get('group_level_found') else 'red'}">{'已发现' if summary.get('group_level_found') else '缺失'}</div></div>
               <div class="summary-card"><div class="summary-label">全市场经验</div><div class="summary-value {'green' if summary.get('global_level_found') else 'red'}">{'已发现' if summary.get('global_level_found') else '缺失'}</div></div>
@@ -3347,7 +3398,7 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">state_code一致性</div><div class="summary-value {consistency_color}">{escape(consistency_text)}</div><div class="module-desc">市场认知 {escape(market_cognition_state_code or '-')}｜经验查询 {escape(experience_query_state_code or '-')}</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;">
-              <b>经验库路径</b><br>{escape(str(summary.get("path", "/data/ai-training-data/experience_library/current/")))}
+              <b>经验库路径</b><br>{escape(str(summary.get("path", EXPERIENCE_LIBRARY_VERSIONS.get(selected_version, ""))))}
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>当前查询输入</b><br>
@@ -4687,6 +4738,7 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
 
     render_local_strategy_decision(strategy)
     render_market_cognition_panel(market_cognition)
+    experience_version = get_selected_experience_library_version()
     committee_decision = run_committee_meeting(
         symbol,
         ticker=live_ticker,
@@ -4701,6 +4753,9 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         radar=radar,
         local_strategy=strategy,
         market_cognition=market_cognition,
+        experience_library_version=experience_version,
+        experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
+        experience_library_data_sources=get_experience_library_data_sources(experience_version),
     )
     market_cognition_with_committee = dict(market_cognition)
     market_cognition_with_committee["committee_final_action"] = committee_decision.get("final_action")

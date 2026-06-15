@@ -7,7 +7,20 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_EXPERIENCE_LIBRARY_PATH = "/data/ai-training-data/experience_library/current/"
+DEFAULT_EXPERIENCE_LIBRARY_VERSION = "current"
+EXPERIENCE_LIBRARY_VERSIONS = {
+    "current": "/data/ai-training-data/experience_library/current",
+    "funding_v1": "/data/ai-training-data/experience_library/funding_v1",
+}
+EXPERIENCE_LIBRARY_LABELS = {
+    "current": "K线版经验库",
+    "funding_v1": "K线 + Funding 增强版经验库",
+}
+EXPERIENCE_LIBRARY_DATA_SOURCES = {
+    "current": "klines_5m",
+    "funding_v1": "klines_5m + funding_rate",
+}
+DEFAULT_EXPERIENCE_LIBRARY_PATH = EXPERIENCE_LIBRARY_VERSIONS[DEFAULT_EXPERIENCE_LIBRARY_VERSION]
 LEVEL_FILES = {
     "symbol_level": "symbol_level_experience",
     "group_level": "group_level_experience",
@@ -25,8 +38,43 @@ def get_default_experience_library_path() -> str:
     return DEFAULT_EXPERIENCE_LIBRARY_PATH
 
 
-def _base_path(path: str | None = None) -> Path:
-    return Path(path or DEFAULT_EXPERIENCE_LIBRARY_PATH)
+def normalize_experience_library_version(version: str | None = None) -> str:
+    key = str(version or DEFAULT_EXPERIENCE_LIBRARY_VERSION).strip()
+    return key if key in EXPERIENCE_LIBRARY_VERSIONS else DEFAULT_EXPERIENCE_LIBRARY_VERSION
+
+
+def get_experience_library_path(version: str | None = None) -> str:
+    return EXPERIENCE_LIBRARY_VERSIONS[normalize_experience_library_version(version)]
+
+
+def get_experience_library_data_sources(version: str | None = None) -> str:
+    return EXPERIENCE_LIBRARY_DATA_SOURCES.get(normalize_experience_library_version(version), "klines_5m")
+
+
+def resolve_experience_library_path(path: str | None = None, version: str | None = None) -> tuple[Path, str]:
+    selected_version = normalize_experience_library_version(version)
+    if path:
+        raw = str(path).strip()
+        if raw in EXPERIENCE_LIBRARY_VERSIONS:
+            selected_version = normalize_experience_library_version(raw)
+            return Path(EXPERIENCE_LIBRARY_VERSIONS[selected_version]), selected_version
+        for key, mapped_path in EXPERIENCE_LIBRARY_VERSIONS.items():
+            if Path(raw) == Path(mapped_path):
+                selected_version = key
+                break
+        return Path(raw), selected_version
+    return Path(EXPERIENCE_LIBRARY_VERSIONS[selected_version]), selected_version
+
+
+def get_experience_library_versions_status() -> dict[str, dict[str, Any]]:
+    return {
+        version: check_experience_library_available(version=version)
+        for version in EXPERIENCE_LIBRARY_VERSIONS
+    }
+
+
+def _base_path(path: str | None = None, version: str | None = None) -> Path:
+    return resolve_experience_library_path(path, version)[0]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -39,12 +87,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {"_read_error": repr(exc)}
 
 
-def load_experience_manifest(path: str | None = None) -> dict[str, Any]:
-    return _read_json(_base_path(path) / "experience_manifest.json")
+def load_experience_manifest(path: str | None = None, version: str | None = None) -> dict[str, Any]:
+    return _read_json(_base_path(path, version) / "experience_manifest.json")
 
 
-def load_experience_version(path: str | None = None) -> dict[str, Any]:
-    return _read_json(_base_path(path) / "experience_version.json")
+def load_experience_version(path: str | None = None, version: str | None = None) -> dict[str, Any]:
+    return _read_json(_base_path(path, version) / "experience_version.json")
 
 
 def _find_level_file(base: Path, stem: str) -> Path | None:
@@ -92,6 +140,7 @@ def load_experience_level_records(
     level: str,
     path: str | None = None,
     *,
+    version: str | None = None,
     filters: list[tuple[str, str, Any]] | None = None,
     columns: list[str] | None = None,
     limit: int | None = None,
@@ -102,7 +151,7 @@ def load_experience_level_records(
     filter/column boundary here lets the matcher move to partitioned or chunked
     reads without changing its public contract.
     """
-    base = _base_path(path)
+    base, selected_version = resolve_experience_library_path(path, version)
     stem = LEVEL_FILES.get(level)
     if not stem:
         return {"available": False, "records": [], "warnings": [], "errors": [f"未知经验层级：{level}"], "missing_columns": []}
@@ -145,6 +194,8 @@ def load_experience_level_records(
         warnings.append(f"{stem} 字段缺失：{', '.join(missing_columns)}")
     return {
         "available": bool(level_path and not errors),
+        "experience_library_version": selected_version,
+        "data_sources": get_experience_library_data_sources(selected_version),
         "file": str(level_path),
         "records": records,
         "row_count": len(records),
@@ -154,13 +205,20 @@ def load_experience_level_records(
     }
 
 
-def check_experience_library_available(path: str | None = None) -> dict[str, Any]:
+def check_experience_library_available(path: str | None = None, version: str | None = None) -> dict[str, Any]:
     """Return lightweight library status without loading large data files."""
-    base = _base_path(path)
+    base, selected_version = resolve_experience_library_path(path, version)
+    common = {
+        "experience_library_version": selected_version,
+        "version_key": selected_version,
+        "label": EXPERIENCE_LIBRARY_LABELS.get(selected_version, selected_version),
+        "data_sources": get_experience_library_data_sources(selected_version),
+    }
     errors: list[str] = []
     warnings: list[str] = []
     if not base.exists():
         return {
+            **common,
             "available": False,
             "path": str(base),
             "manifest_found": False,
@@ -176,6 +234,7 @@ def check_experience_library_available(path: str | None = None) -> dict[str, Any
         }
     if not base.is_dir():
         return {
+            **common,
             "available": False,
             "path": str(base),
             "manifest_found": False,
@@ -210,6 +269,7 @@ def check_experience_library_available(path: str | None = None) -> dict[str, Any
         available = False
     message = "经验库可用。" if available else "经验库未接入或格式不完整，经验委员保持弃权。"
     return {
+        **common,
         "available": available,
         "path": str(base),
         "manifest_found": manifest_path.exists(),
@@ -225,15 +285,15 @@ def check_experience_library_available(path: str | None = None) -> dict[str, Any
     }
 
 
-def load_experience_library_summary(path: str | None = None) -> dict[str, Any]:
+def load_experience_library_summary(path: str | None = None, version: str | None = None) -> dict[str, Any]:
     """Load only manifest/version and file status. Never loads full datasets."""
-    status = check_experience_library_available(path)
-    manifest = load_experience_manifest(path)
-    version = load_experience_version(path)
+    status = check_experience_library_available(path, version)
+    manifest = load_experience_manifest(path, status.get("experience_library_version"))
+    version_info = load_experience_version(path, status.get("experience_library_version"))
     return {
         **status,
         "manifest": manifest,
-        "version": version,
-        "experience_version": version.get("experience_version") or manifest.get("experience_version") or "none",
-        "generated_at": version.get("generated_at") or manifest.get("generated_at") or "",
+        "version": version_info,
+        "experience_version": version_info.get("experience_version") or manifest.get("experience_version") or "none",
+        "generated_at": version_info.get("generated_at") or manifest.get("generated_at") or "",
     }
