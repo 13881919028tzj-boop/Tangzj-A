@@ -3,7 +3,7 @@
   "restore_sim_auto_on_restart": false,
   "enable_simple_auth": false,
   "app_access_password_set": false,
-  "last_safe_startup_time": "2026-06-14 23:39:23",
+  "last_safe_startup_time": "2026-06-15 02:34:03",
   "last_startup_mode": "READ_ONLY",
   "allow_remote_control": true,
   "safe_startup": true

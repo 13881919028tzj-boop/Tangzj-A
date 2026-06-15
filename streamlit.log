@@ -1,7 +1,7 @@
 
 Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
 
-2026-06-14 22:56:39.947 Uvicorn server started on 0.0.0.0:8501
+2026-06-15 02:33:23.368 Uvicorn server started on 0.0.0.0:8501
 
   You can now view your Streamlit app in your browser.
 
@@ -9,478 +9,70 @@ Collecting usage statistics. To deactivate, set browser.gatherUsageStats to fals
   Network URL: http://108.160.143.92:8501
   External URL: http://108.160.143.92:8501
 
-2026-06-14 22:56:56.408 Please replace `st.components.v1.html` with `st.iframe`.
+2026-06-15 02:34:03.721 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:56:56.644 Please replace `st.components.v1.html` with `st.iframe`.
+2026-06-15 02:34:03.820 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:56:58.335 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.450 Please replace `st.components.v1.html` with `st.iframe`.
+2026-06-15 02:34:24.946 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:57:35.578 Please replace `st.components.v1.html` with `st.iframe`.
+2026-06-15 02:34:25.067 Please replace `st.components.v1.html` with `st.iframe`.
 
 `st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:57:35.619 Please replace `use_container_width` with `width`.
+2026-06-15 02:34:25.251 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.621 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
-Traceback (most recent call last):
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/streamlit/dataframe_util.py", line 961, in convert_pandas_df_to_arrow_bytes
-    table = pa.Table.from_pandas(df)
-  File "pyarrow/table.pxi", line 4768, in pyarrow.lib.Table.from_pandas
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 651, in dataframe_to_arrays
-    arrays = [convert_column(c, f)
-              ~~~~~~~~~~~~~~^^^^^^
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 639, in convert_column
-    raise e
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 633, in convert_column
-    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
-  File "pyarrow/array.pxi", line 390, in pyarrow.lib.array
-  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
-    check_status(NdarrayToArrow(pool, values, mask, from_pandas,
-  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
-pyarrow.lib.ArrowInvalid: ("Could not convert '继续观察，不建议扩大额度' with type str: tried to convert to double", 'Conversion failed for column 数值 with type object')
-2026-06-14 22:57:35.630 Please replace `use_container_width` with `width`.
+2026-06-15 02:34:34.019 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.633 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
-Traceback (most recent call last):
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/streamlit/dataframe_util.py", line 961, in convert_pandas_df_to_arrow_bytes
-    table = pa.Table.from_pandas(df)
-  File "pyarrow/table.pxi", line 4768, in pyarrow.lib.Table.from_pandas
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 651, in dataframe_to_arrays
-    arrays = [convert_column(c, f)
-              ~~~~~~~~~~~~~~^^^^^^
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 639, in convert_column
-    raise e
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 633, in convert_column
-    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
-  File "pyarrow/array.pxi", line 390, in pyarrow.lib.array
-    result = _ndarray_to_array(values, mask, type, c_from_pandas, safe,
-  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
-    check_status(NdarrayToArrow(pool, values, mask, from_pandas,
-  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
-pyarrow.lib.ArrowInvalid: ("Could not convert 'MEGAUSDT' with type str: tried to convert to double", 'Conversion failed for column 数值 with type object')
-2026-06-14 22:57:35.638 Please replace `use_container_width` with `width`.
+2026-06-15 02:34:42.566 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.641 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
-Traceback (most recent call last):
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/streamlit/dataframe_util.py", line 961, in convert_pandas_df_to_arrow_bytes
-    table = pa.Table.from_pandas(df)
-  File "pyarrow/table.pxi", line 4768, in pyarrow.lib.Table.from_pandas
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 651, in dataframe_to_arrays
-    arrays = [convert_column(c, f)
-              ~~~~~~~~~~~~~~^^^^^^
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 639, in convert_column
-    raise e
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 633, in convert_column
-    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
-  File "pyarrow/array.pxi", line 390, in pyarrow.lib.array
-    result = _ndarray_to_array(values, mask, type, c_from_pandas, safe,
-  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
-    check_status(NdarrayToArrow(pool, values, mask, from_pandas,
-  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
-pyarrow.lib.ArrowInvalid: ("Could not convert '-' with type str: tried to convert to double", 'Conversion failed for column 数值 with type object')
-2026-06-14 22:57:35.645 Please replace `use_container_width` with `width`.
+2026-06-15 02:34:50.007 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.646 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
-Traceback (most recent call last):
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/streamlit/dataframe_util.py", line 961, in convert_pandas_df_to_arrow_bytes
-    table = pa.Table.from_pandas(df)
-  File "pyarrow/table.pxi", line 4768, in pyarrow.lib.Table.from_pandas
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 651, in dataframe_to_arrays
-    arrays = [convert_column(c, f)
-              ~~~~~~~~~~~~~~^^^^^^
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 639, in convert_column
-    raise e
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 633, in convert_column
-    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
-  File "pyarrow/array.pxi", line 390, in pyarrow.lib.array
-    result = _ndarray_to_array(values, mask, type, c_from_pandas, safe,
-  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
-    check_status(NdarrayToArrow(pool, values, mask, from_pandas,
-  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
-pyarrow.lib.ArrowTypeError: ("Expected bytes, got a 'int' object", 'Conversion failed for column 数值 with type object')
-2026-06-14 22:57:35.651 Please replace `use_container_width` with `width`.
+2026-06-15 02:34:58.016 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.652 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
-Traceback (most recent call last):
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/streamlit/dataframe_util.py", line 961, in convert_pandas_df_to_arrow_bytes
-    table = pa.Table.from_pandas(df)
-  File "pyarrow/table.pxi", line 4768, in pyarrow.lib.Table.from_pandas
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 651, in dataframe_to_arrays
-    arrays = [convert_column(c, f)
-              ~~~~~~~~~~~~~~^^^^^^
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 639, in convert_column
-    raise e
-  File "/opt/AI_MODEL/.venv/lib/python3.14/site-packages/pyarrow/pandas_compat.py", line 633, in convert_column
-    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
-  File "pyarrow/array.pxi", line 390, in pyarrow.lib.array
-    result = _ndarray_to_array(values, mask, type, c_from_pandas, safe,
-  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
-    check_status(NdarrayToArrow(pool, values, mask, from_pandas,
-  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
-pyarrow.lib.ArrowTypeError: ("Expected bytes, got a 'int' object", 'Conversion failed for column 数值 with type object')
-2026-06-14 22:57:35.658 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:07.357 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.670 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:17.263 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.681 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:22.255 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.683 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:30.147 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.686 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:38.168 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:35.688 Please replace `use_container_width` with `width`.
+2026-06-15 02:35:46.840 Please replace `use_container_width` with `width`.
 
 `use_container_width` will be removed after 2025-12-31.
 
 For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:57:56.731 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:57:56.885 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:58:06.019 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:58:06.124 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 22:58:06.556 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:58:32.694 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:58:39.097 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:58:47.336 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:58:55.196 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:59:03.807 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 22:59:14.446 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:01:55.043 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:01:55.190 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:01:55.344 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:02:04.143 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:02:12.370 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:02:20.877 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:02:29.103 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-Invalid HTTP request received.
-Invalid HTTP request received.
-2026-06-14 23:18:24.095 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:18:24.212 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:18:24.419 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:18:33.128 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:18:33.806 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:18:47.649 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:18:49.161 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:18:57.191 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:19:05.238 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:19:13.282 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:19:30.900 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:20:48.804 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:20:49.020 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:15.046 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:30.435 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:30.719 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:55.927 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:56.136 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:21:56.287 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:05.000 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:13.334 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:21.007 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:29.004 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:37.312 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:44.988 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:22:53.307 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:23:01.417 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:23:09.496 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:23:17.551 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:34:57.058 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:34:57.184 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:34:57.415 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:07.700 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:07.818 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:17.516 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:17.678 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:17.874 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:26.846 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:35.034 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:42.791 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:50.803 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:35:54.610 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:55.059 Please replace `st.components.v1.html` with `st.iframe`.
-
-`st.components.v1.html` will be removed after 2026-06-01.
-2026-06-14 23:35:58.905 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:10.681 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:15.051 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:22.974 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:30.830 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:38.811 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:47.034 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:36:55.213 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:37:02.778 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:37:11.030 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-2026-06-14 23:37:20.523 Please replace `use_container_width` with `width`.
-
-`use_container_width` will be removed after 2025-12-31.
-
-For `use_container_width=True`, use `width='stretch'`. For `use_container_width=False`, use `width='content'`.
-[AI模型7.1.2] 前端行情API已启动 host=0.0.0.0 port=8765
-  Stopping...
