@@ -270,9 +270,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.6"
+APP_TITLE = "AI模型 9.2.7"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.6 经验匹配一致性与单币种fallback校准版"
+VERSION = "AI模型 9.2.7 经验库相似状态扩展匹配版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -3252,6 +3252,8 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         match_type = str(level.get("match_type") or "NONE").upper()
         if match_type == "EXACT_STATE_CODE":
             return "exact命中"
+        if match_type == "EXPANDED_SIMILAR":
+            return "精确+扩展命中"
         if match_type == "SIMILAR_STATE_CODE":
             return "相似状态命中"
         if match_type == "VECTOR_NEAREST":
@@ -3276,6 +3278,12 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     group_level = match.get("group_level") or {}
     global_level = match.get("global_level") or {}
     total_samples = int(float(match.get("matched_sample_count") or 0))
+    exact_samples = int(float(match.get("exact_sample_count") or 0))
+    similar_samples = int(float(match.get("similar_state_sample_count") or 0))
+    vector_samples = int(float(match.get("vector_nearest_sample_count") or 0))
+    avg_similarity = float(match.get("avg_similarity") or 0)
+    used_match_layers_text = "、".join(str(x) for x in list(match.get("used_match_layers") or [])) or "无"
+    expansion_note = str(match.get("match_expansion_note") or "")
     sample_level = str(match.get("sample_confidence_level") or "等待样本")
     participation_status = str(match.get("experience_participation_status") or ("弃权" if match.get("vote") == "ABSTAIN" else "谨慎参与"))
     abstain_reason = str(match.get("abstain_reason") or match.get("sample_confidence_note") or "")
@@ -3286,6 +3294,9 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
           <b>{escape(label)}</b><br>
           状态：{escape(_match_label(level, label == "单币种经验"))}｜
           样本：{int(float(level.get("matched_sample_count") or 0))}｜
+          exact：{int(float(level.get("exact_sample_count") or 0))}｜
+          相似：{int(float(level.get("similar_state_sample_count") or 0))}｜
+          向量：{int(float(level.get("vector_nearest_sample_count") or 0))}｜
           匹配：{escape(str(level.get("match_type") or "-"))}｜
           命中状态码：{escape(str(level.get("matched_state_code") or "-"))}｜
           Layer：{escape(str(level.get("layer") or level.get("scope_type") or "-"))}｜
@@ -3325,6 +3336,10 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               {_level_card("同类币种匹配", group_level)}
               {_level_card("全市场匹配", global_level)}
               <div class="summary-card"><div class="summary-label">总样本</div><div class="summary-value blue">{total_samples}</div><div class="module-desc">单币种 {int(float(symbol_level.get("matched_sample_count") or 0))}｜同类 {int(float(group_level.get("matched_sample_count") or 0))}｜全市场 {int(float(global_level.get("matched_sample_count") or 0))}</div></div>
+              <div class="summary-card"><div class="summary-label">精确状态样本</div><div class="summary-value blue">{exact_samples}</div><div class="module-desc">exact_state_code</div></div>
+              <div class="summary-card"><div class="summary-label">相似状态样本</div><div class="summary-value yellow">{similar_samples}</div><div class="module-desc">similar_state_code，相似度≥70优先≥80</div></div>
+              <div class="summary-card"><div class="summary-label">向量近邻样本</div><div class="summary-value yellow">{vector_samples}</div><div class="module-desc">vector_nearest，按状态向量加权距离</div></div>
+              <div class="summary-card"><div class="summary-label">平均相似度</div><div class="summary-value {'green' if avg_similarity >= 80 else 'yellow' if avg_similarity >= 70 else 'red'}">{avg_similarity:.1f}</div><div class="module-desc">用于扩展经验置信度校准</div></div>
               <div class="summary-card"><div class="summary-label">经验置信度等级</div><div class="summary-value {participation_color}">{escape(sample_level)}</div><div class="module-desc">层级：{escape("、".join(str(x) for x in list(match.get("matched_layers") or [])) or "无")}</div></div>
               <div class="summary-card"><div class="summary-label">经验委员参与状态</div><div class="summary-value {participation_color}">{escape(participation_status)}</div><div class="module-desc">{escape(abstain_reason or "按历史经验置信度参与。")}</div></div>
               <div class="summary-card"><div class="summary-label">ExperienceConfidence</div><div class="summary-value blue">{_plain(match.get("confidence"))} / 100</div><div class="module-desc">历史经验置信度，受样本数与单币种命中影响</div></div>
@@ -3347,6 +3362,16 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               同类匹配使用分组：{escape(used_group)}｜
               全市场匹配：{escape(str(global_level.get("match_type") or "NONE"))}<br>
               state_vector：{escape(state_summary)}
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>匹配扩展说明</b><br>
+              精确状态样本：{exact_samples}｜
+              相似状态样本：{similar_samples}｜
+              向量近邻样本：{vector_samples}｜
+              总参考样本：{total_samples}｜
+              平均相似度：{avg_similarity:.1f}<br>
+              使用层级：{escape(used_match_layers_text)}<br>
+              {escape(expansion_note or "当前按经验库匹配策略生成历史参考。")}
             </div>
             <div class="committee-grid" style="margin-top:8px;">
               <div class="summary-card"><div class="summary-label">30分钟历史概率</div><div class="summary-value blue">涨{_pct(match.get("historical_30m_up_probability"))}</div><div class="module-desc">震荡{_pct(match.get("historical_30m_sideways_probability"))}｜跌{_pct(match.get("historical_30m_down_probability"))}</div></div>

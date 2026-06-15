@@ -221,7 +221,12 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
             reason=reason,
             evidence={
                 "matched_layers": match.get("matched_layers", []),
+                "used_match_layers": match.get("used_match_layers", []),
                 "matched_sample_count": match.get("matched_sample_count", 0),
+                "exact_sample_count": match.get("exact_sample_count", 0),
+                "similar_state_sample_count": match.get("similar_state_sample_count", 0),
+                "vector_nearest_sample_count": match.get("vector_nearest_sample_count", 0),
+                "avg_similarity": match.get("avg_similarity"),
                 "layer_weights": match.get("layer_weights", {}),
                 "historical_30m_up_probability": match.get("historical_30m_up_probability"),
                 "historical_30m_down_probability": match.get("historical_30m_down_probability"),
@@ -245,6 +250,11 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
         "symbol_group_candidates": query.get("symbol_group_candidates", []),
         "experience_query": query,
         "similar_sample_count": match.get("matched_sample_count", 0),
+        "exact_sample_count": match.get("exact_sample_count", 0),
+        "similar_state_sample_count": match.get("similar_state_sample_count", 0),
+        "vector_nearest_sample_count": match.get("vector_nearest_sample_count", 0),
+        "avg_similarity": match.get("avg_similarity"),
+        "used_match_layers": match.get("used_match_layers", []),
         "matched_sample_count": match.get("matched_sample_count", 0),
         "win_rate_30m": match.get("historical_30m_up_probability"),
         "win_rate_60m": match.get("historical_60m_up_probability"),
@@ -469,7 +479,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.6 经验匹配一致性与单币种fallback校准版",
+        "version": "AI模型 9.2.7 经验库相似状态扩展匹配版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,

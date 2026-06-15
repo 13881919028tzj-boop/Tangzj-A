@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
-import re
 from typing import Any
 
+from services.experience_similarity import (
+    state_code_distance,
+    state_code_similarity,
+    state_vector_similarity,
+)
 from services.experience_library_loader import (
     check_experience_library_available,
     get_default_experience_library_path,
@@ -35,15 +38,29 @@ STATE_VECTOR_KEYS = (
     "confidence",
     "data_integrity_score",
 )
-SIMILARITY_WEIGHTS = {
-    "demand_score": 0.20,
-    "trend_quality_score": 0.15,
-    "capital_score": 0.15,
-    "behavior_score": 0.15,
-    "structure_score": 0.10,
-    "risk_score": 0.15,
-    "trap_risk_score": 0.10,
+MATCH_TYPE_WEIGHTS = {
+    "exact_state_code": 1.00,
+    "similar_state_code": 0.70,
+    "vector_nearest": 0.60,
+    "group_exact": 0.75,
+    "group_similar": 0.55,
+    "global_exact": 0.45,
+    "global_similar": 0.35,
 }
+SIMILARITY_MINIMUM = 70.0
+SIMILARITY_PRIORITY = 80.0
+VECTOR_LOW_SAMPLE_MINIMUM = 60.0
+LAYER_ORDER = [
+    "SYMBOL_EXACT",
+    "SYMBOL_SIMILAR",
+    "SYMBOL_VECTOR_NEAREST",
+    "GROUP_EXACT",
+    "GROUP_SIMILAR",
+    "GROUP_VECTOR_NEAREST",
+    "GLOBAL_EXACT",
+    "GLOBAL_SIMILAR",
+    "GLOBAL_VECTOR_NEAREST",
+]
 METRIC_FIELDS = (
     "historical_30m_up_probability",
     "historical_30m_down_probability",
@@ -200,6 +217,13 @@ def _empty_level(scope_type: str, reason: str = "未命中该层经验。") -> d
         "matched_state_code": "",
         "matched_sample_count": 0,
         "sample_count": 0,
+        "exact_sample_count": 0,
+        "similar_state_sample_count": 0,
+        "vector_nearest_sample_count": 0,
+        "total_matched_sample_count": 0,
+        "avg_similarity": 0,
+        "used_match_layers": [],
+        "match_expansion_note": "",
         "confidence": 0,
         "data_quality": 0,
         "similarity": 0,
@@ -210,50 +234,15 @@ def _empty_level(scope_type: str, reason: str = "未命中该层经验。") -> d
     }
 
 
-def _parse_center(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            raw = json.loads(value)
-            return raw if isinstance(raw, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
 def _vector_similarity(query_vector: dict[str, Any], center_value: Any, fallback: Any) -> tuple[float, str]:
-    center = _parse_center(center_value)
-    if not center:
+    result = state_vector_similarity(query_vector, center_value)
+    if result.get("similarity_confidence", 0) <= 0:
         return _clamp(_probability_percent(fallback) if _to_float(fallback, 0) <= 1 else fallback, 60), "state_vector_center 缺失，使用 avg_similarity 或默认相似度。"
-    total_weight = 0.0
-    weighted_distance = 0.0
-    for key, weight in SIMILARITY_WEIGHTS.items():
-        if key not in query_vector or key not in center:
-            continue
-        weighted_distance += abs(_to_float(query_vector.get(key), 0) - _to_float(center.get(key), 0)) * weight
-        total_weight += weight
-    if total_weight <= 0:
-        return _clamp(_probability_percent(fallback) if _to_float(fallback, 0) <= 1 else fallback, 60), "状态向量可比字段不足，使用 avg_similarity 或默认相似度。"
-    return round(max(0.0, 100.0 - weighted_distance / total_weight), 2), ""
+    return _clamp(result.get("similarity"), 0), str(result.get("warning") or "")
 
 
 def _state_code_distance(current: Any, candidate: Any) -> float:
-    weights = {"T": 1.5, "C": 1.0, "S": 1.0, "B": 1.0, "R": 2.0, "D": 2.0}
-    current_parts = {key: int(value) for key, value in re.findall(r"([TCSBRD])\s*(\d+)", str(current or "").upper())}
-    candidate_parts = {key: int(value) for key, value in re.findall(r"([TCSBRD])\s*(\d+)", str(candidate or "").upper())}
-    if current_parts and candidate_parts:
-        return float(sum(abs(current_parts.get(key, 0) - candidate_parts.get(key, 0)) * weight for key, weight in weights.items()))
-    current_numbers = [int(x) for x in re.findall(r"\d+", str(current or ""))]
-    candidate_numbers = [int(x) for x in re.findall(r"\d+", str(candidate or ""))]
-    if not current_numbers or not candidate_numbers:
-        return 999.0
-    size = max(len(current_numbers), len(candidate_numbers))
-    current_numbers.extend([0] * (size - len(current_numbers)))
-    candidate_numbers.extend([0] * (size - len(candidate_numbers)))
-    positional_weights = [1.5, 1.0, 1.0, 1.0, 2.0, 2.0]
-    positional_weights.extend([1.0] * max(0, size - len(positional_weights)))
-    return float(sum(abs(a - b) * positional_weights[index] for index, (a, b) in enumerate(zip(current_numbers, candidate_numbers))))
+    return state_code_distance(current, candidate)
 
 
 def _best_state_code_distance(rows: list[dict[str, Any]], state_code: Any) -> float:
@@ -261,23 +250,95 @@ def _best_state_code_distance(rows: list[dict[str, Any]], state_code: Any) -> fl
     return min(distances) if distances else 999.0
 
 
+def _row_identity(row: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (row.get("symbol"), row.get("symbol_group"), row.get("state_code"))
+
+
+def _scope_match_key(scope_type: str, match_type: str) -> str:
+    scope = str(scope_type or "").upper()
+    match = str(match_type or "").lower()
+    if scope == "SYMBOL":
+        return match
+    if scope == "GROUP":
+        return "group_exact" if match == "exact_state_code" else "group_similar"
+    return "global_exact" if match == "exact_state_code" else "global_similar"
+
+
+def _layer_name(scope_type: str, match_type: str) -> str:
+    scope = str(scope_type or "").upper()
+    match = str(match_type or "").lower()
+    if scope == "SYMBOL" and match == "exact_state_code":
+        return "SYMBOL_EXACT"
+    if scope == "SYMBOL" and match == "similar_state_code":
+        return "SYMBOL_SIMILAR"
+    if scope == "SYMBOL" and match == "vector_nearest":
+        return "SYMBOL_VECTOR_NEAREST"
+    if scope == "GROUP" and match == "exact_state_code":
+        return "GROUP_EXACT"
+    if scope == "GROUP" and match == "similar_state_code":
+        return "GROUP_SIMILAR"
+    if scope == "GROUP" and match == "vector_nearest":
+        return "GROUP_VECTOR_NEAREST"
+    if scope == "GLOBAL" and match == "exact_state_code":
+        return "GLOBAL_EXACT"
+    if scope == "GLOBAL" and match == "similar_state_code":
+        return "GLOBAL_SIMILAR"
+    if scope == "GLOBAL" and match == "vector_nearest":
+        return "GLOBAL_VECTOR_NEAREST"
+    return f"{scope}_{match.upper()}"
+
+
+def _sample_count(rows: list[dict[str, Any]]) -> int:
+    return int(sum(max(0.0, _to_float(row.get("sample_count"), 0)) for row in rows))
+
+
+def _similarity_from_row(row: dict[str, Any], query_vector: dict[str, Any], state_code: Any) -> tuple[float, float, str]:
+    match_type = str(row.get("_match_type") or "").lower()
+    if match_type == "exact_state_code":
+        return 100.0, 100.0, ""
+    if match_type == "similar_state_code":
+        return state_code_similarity(state_code, row.get("state_code")), 100.0, ""
+    vector_result = state_vector_similarity(query_vector, row.get("state_vector_center"))
+    similarity = _clamp(vector_result.get("similarity"), 0)
+    confidence = _clamp(vector_result.get("similarity_confidence"), 0)
+    warning = str(vector_result.get("warning") or "")
+    if confidence <= 0:
+        fallback = row.get("avg_similarity", 60)
+        similarity = _clamp(_probability_percent(fallback) if _to_float(fallback, 0) <= 1 else fallback, 60)
+        warning = "state_vector_center 缺失，向量近邻使用 avg_similarity fallback。"
+    return similarity, max(25.0, confidence), warning
+
+
 def _select_similar_state_rows(rows: list[dict[str, Any]], state_code: Any, top_k: int) -> list[dict[str, Any]]:
-    best_distance = _best_state_code_distance(rows, state_code)
-    if best_distance >= 999.0:
-        return []
-    window = max(best_distance, 0.0) + 0.0001
-    candidates = [row for row in rows if _state_code_distance(state_code, row.get("state_code")) <= window]
-    return sorted(candidates, key=lambda row: (_state_code_distance(state_code, row.get("state_code")), -_to_float(row.get("sample_count"), 0)))[: max(top_k * 3, 10)]
+    candidates = []
+    for row in rows:
+        similarity = state_code_similarity(state_code, row.get("state_code"))
+        if similarity >= SIMILARITY_MINIMUM and str(row.get("state_code")) != str(state_code):
+            candidates.append({**row, "_state_code_similarity": similarity})
+    candidates.sort(key=lambda row: (_to_float(row.get("_state_code_similarity"), 0) >= SIMILARITY_PRIORITY, _to_float(row.get("_state_code_similarity"), 0), _to_float(row.get("sample_count"), 0)), reverse=True)
+    return candidates[: max(top_k * 3, 30)]
 
 
 def _select_vector_nearest_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], top_k: int) -> tuple[list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     enriched: list[dict[str, Any]] = []
     for row in rows:
-        similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
+        result = state_vector_similarity(query_vector, row.get("state_vector_center"))
+        similarity = _clamp(result.get("similarity"), 0)
+        warning = str(result.get("warning") or "")
+        if _clamp(result.get("similarity_confidence"), 0) <= 0:
+            similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
         if warning and warning not in warnings:
             warnings.append(warning)
-        enriched.append({**row, "_pre_similarity": similarity})
+        if similarity >= SIMILARITY_MINIMUM:
+            enriched.append({**row, "_pre_similarity": similarity})
+    if not enriched:
+        for row in rows:
+            similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
+            if warning and warning not in warnings:
+                warnings.append(warning)
+            if similarity >= VECTOR_LOW_SAMPLE_MINIMUM:
+                enriched.append({**row, "_pre_similarity": similarity})
     enriched.sort(key=lambda row: (_to_float(row.get("_pre_similarity"), 0), _to_float(row.get("sample_count"), 0)), reverse=True)
     return enriched[: max(top_k * 3, 10)], warnings
 
@@ -298,36 +359,67 @@ def _aggregate_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], st
     warnings: list[str] = []
     enriched: list[dict[str, Any]] = []
     for row in rows:
-        similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
+        similarity, similarity_confidence, warning = _similarity_from_row(row, query_vector, state_code)
         if warning and warning not in warnings:
             warnings.append(warning)
         sample_count = max(0.0, _to_float(row.get("sample_count"), 0))
         confidence = _clamp(row.get("confidence"), 0)
         data_quality = _clamp(row.get("data_quality"), 50)
-        state_distance = 0.0 if str(row.get("state_code")) == str(state_code) else _state_code_distance(state_code, row.get("state_code"))
-        rank_score = similarity * 2 + min(sample_count, 1000) / 20 + confidence - state_distance * 15
-        enriched.append({**row, "_similarity": similarity, "_state_distance": state_distance, "_rank_score": rank_score})
+        state_distance = 0.0 if str(row.get("state_code")) == str(state_code) else state_code_distance(state_code, row.get("state_code"))
+        match_weight = MATCH_TYPE_WEIGHTS.get(_scope_match_key(str(row.get("_scope_type") or ""), str(row.get("_match_type") or "")), 0.35)
+        quality_factor = max(0.05, confidence / 100 * data_quality / 100 * similarity_confidence / 100)
+        basis = max(1.0, math.sqrt(max(sample_count, 1.0))) * match_weight * max(0.05, similarity / 100) * quality_factor
+        rank_score = similarity * 2 + min(sample_count, 1000) / 35 + confidence * 0.5 + data_quality * 0.25 + match_weight * 30 - state_distance * 20
+        enriched.append({
+            **row,
+            "_similarity": similarity,
+            "_similarity_confidence": similarity_confidence,
+            "_state_distance": state_distance,
+            "_match_weight": match_weight,
+            "_effective_basis": basis,
+            "_rank_score": rank_score,
+        })
     enriched.sort(key=lambda item: (_to_float(item.get("_rank_score"), 0), _to_float(item.get("sample_count"), 0)), reverse=True)
-    selected = enriched[: max(1, top_k)]
-    total_basis = sum(max(1.0, _to_float(row.get("sample_count"), 0)) * max(1.0, _to_float(row.get("_similarity"), 0)) for row in selected)
+    selected = enriched[: max(1, top_k * 3)]
+    total_basis = sum(max(0.0001, _to_float(row.get("_effective_basis"), 0)) for row in selected)
     def weighted(field: str) -> float:
         if total_basis <= 0:
             return 0.0
-        return sum(_row_metric(row, field) * max(1.0, _to_float(row.get("sample_count"), 0)) * max(1.0, _to_float(row.get("_similarity"), 0)) for row in selected) / total_basis
+        return sum(_row_metric(row, field) * max(0.0001, _to_float(row.get("_effective_basis"), 0)) for row in selected) / total_basis
 
     sample_count = int(sum(max(0.0, _to_float(row.get("sample_count"), 0)) for row in selected))
     metrics = {field: round(weighted(field), 6) for field in METRIC_FIELDS}
-    confidence = weighted("confidence") if "confidence" in METRIC_FIELDS else 0
-    confidence = sum(_clamp(row.get("confidence"), 0) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
-    data_quality = sum(_clamp(row.get("data_quality"), 50) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
-    similarity = sum(_to_float(row.get("_similarity"), 0) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
+    confidence = sum(_clamp(row.get("confidence"), 0) * max(0.0001, _to_float(row.get("_effective_basis"), 0)) for row in selected) / max(total_basis, 0.0001)
+    data_quality = sum(_clamp(row.get("data_quality"), 50) * max(0.0001, _to_float(row.get("_effective_basis"), 0)) for row in selected) / max(total_basis, 0.0001)
+    similarity = sum(_to_float(row.get("_similarity"), 0) * max(0.0001, _to_float(row.get("_effective_basis"), 0)) for row in selected) / max(total_basis, 0.0001)
+    exact_sample_count = _sample_count([row for row in selected if str(row.get("_match_type") or "").lower() == "exact_state_code"])
+    similar_sample_count = _sample_count([row for row in selected if str(row.get("_match_type") or "").lower() == "similar_state_code"])
+    vector_sample_count = _sample_count([row for row in selected if str(row.get("_match_type") or "").lower() == "vector_nearest"])
+    used_layers = []
+    for row in selected:
+        layer = _layer_name(str(row.get("_scope_type") or ""), str(row.get("_match_type") or ""))
+        if layer not in used_layers:
+            used_layers.append(layer)
+    used_layers.sort(key=lambda item: LAYER_ORDER.index(item) if item in LAYER_ORDER else len(LAYER_ORDER))
+    expansion_note = "精确状态样本充足，主要使用精确经验。"
+    if exact_sample_count < 300 and (similar_sample_count or vector_sample_count):
+        expansion_note = "精确状态样本较少，系统已扩展到相似状态与向量近邻，经验结果为扩展参考。"
+    elif not exact_sample_count and sample_count:
+        expansion_note = "未命中精确状态，系统使用相似状态或状态向量近邻作为扩展参考。"
     aggregate = {
         **metrics,
         "matched_sample_count": sample_count,
         "sample_count": sample_count,
+        "exact_sample_count": exact_sample_count,
+        "similar_state_sample_count": similar_sample_count,
+        "vector_nearest_sample_count": vector_sample_count,
+        "total_matched_sample_count": sample_count,
         "confidence": round(confidence, 2),
         "data_quality": round(data_quality, 2),
         "similarity": round(similarity, 2),
+        "avg_similarity": round(similarity, 2),
+        "used_match_layers": used_layers,
+        "match_expansion_note": expansion_note,
         "exact_state_code": any(str(row.get("state_code")) == str(state_code) for row in selected),
         "matched_state_code": str(selected[0].get("state_code") or "") if selected else "",
         "top_matches": [
@@ -337,6 +429,8 @@ def _aggregate_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], st
                 "state_code": row.get("state_code"),
                 "sample_count": int(_to_float(row.get("sample_count"), 0)),
                 "similarity": row.get("_similarity"),
+                "match_type": row.get("_match_type"),
+                "match_weight": row.get("_match_weight"),
                 "confidence": row.get("confidence"),
                 "data_quality": row.get("data_quality"),
             }
@@ -351,17 +445,64 @@ def _read_candidate_rows(
     experience_library_path: str | None,
     exact_filters: list[tuple[str, str, Any]],
     broad_filters: list[tuple[str, str, Any]],
-) -> tuple[list[dict[str, Any]], list[str], list[str], bool]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[str]]:
     exact = load_experience_level_records(level, experience_library_path, filters=exact_filters)
     warnings = list(exact.get("warnings") or [])
     errors = list(exact.get("errors") or [])
-    rows = list(exact.get("records") or [])
-    if rows:
-        return rows, warnings, errors, True
+    exact_rows = list(exact.get("records") or [])
     broad = load_experience_level_records(level, experience_library_path, filters=broad_filters)
     warnings.extend(str(item) for item in list(broad.get("warnings") or []) if item not in warnings)
     errors.extend(str(item) for item in list(broad.get("errors") or []) if item not in errors)
-    return list(broad.get("records") or []), warnings, errors, False
+    return exact_rows, list(broad.get("records") or []), warnings, errors
+
+
+def _build_expanded_rows(
+    rows: list[dict[str, Any]],
+    exact_rows: list[dict[str, Any]],
+    query_vector: dict[str, Any],
+    state_code: Any,
+    scope_type: str,
+    top_k: int,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+    warnings: list[str] = []
+    expanded: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+
+    for row in exact_rows:
+        key = _row_identity(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append({**row, "_match_type": "exact_state_code", "_scope_type": scope_type})
+
+    exact_sample_count = _sample_count(expanded)
+    include_similar = exact_sample_count < 300
+    include_vector = exact_sample_count < 100
+
+    if include_similar:
+        for row in _select_similar_state_rows(rows, state_code, top_k):
+            key = _row_identity(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append({**row, "_match_type": "similar_state_code", "_scope_type": scope_type})
+
+    if include_vector:
+        vector_rows, vector_warnings = _select_vector_nearest_rows(rows, query_vector, top_k)
+        warnings.extend(item for item in vector_warnings if item not in warnings)
+        for row in vector_rows:
+            key = _row_identity(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append({**row, "_match_type": "vector_nearest", "_scope_type": scope_type})
+
+    counts = {
+        "exact_sample_count": _sample_count([row for row in expanded if row.get("_match_type") == "exact_state_code"]),
+        "similar_state_sample_count": _sample_count([row for row in expanded if row.get("_match_type") == "similar_state_code"]),
+        "vector_nearest_sample_count": _sample_count([row for row in expanded if row.get("_match_type") == "vector_nearest"]),
+    }
+    return expanded, warnings, counts
 
 
 def _match_level(level: str, query: dict[str, Any], experience_library_path: str | None, top_k: int) -> dict[str, Any]:
@@ -371,23 +512,24 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
     query_vector = query.get("state_vector") if isinstance(query.get("state_vector"), dict) else {}
     if level == "symbol_level":
         scope_type = "SYMBOL"
-        rows, warnings, errors, exact = _read_candidate_rows(
+        exact_rows, rows, warnings, errors = _read_candidate_rows(
             level,
             experience_library_path,
             [("symbol", "==", symbol), ("state_code", "==", state_code)],
             [("symbol", "==", symbol)],
         )
         rows = [row for row in rows if _scope_matches(row, {"symbol"}) and str(row.get("symbol") or "").upper() == symbol]
+        exact_rows = [row for row in exact_rows if _scope_matches(row, {"symbol"}) and str(row.get("symbol") or "").upper() == symbol]
         used_group = ""
     elif level == "group_level":
         scope_type = "GROUP"
         rows = []
+        exact_rows = []
         used_group = ""
         warnings = []
         errors = []
-        exact = False
         for group in groups:
-            found, level_warnings, level_errors, level_exact = _read_candidate_rows(
+            found_exact, found, level_warnings, level_errors = _read_candidate_rows(
                 level,
                 experience_library_path,
                 [("symbol_group", "==", group), ("state_code", "==", state_code)],
@@ -396,41 +538,46 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
             warnings.extend(item for item in level_warnings if item not in warnings)
             errors.extend(item for item in level_errors if item not in errors)
             rows = [row for row in found if _scope_matches(row, {"group", "symbol_group"}) and str(row.get("symbol_group") or "") == group]
-            exact = level_exact
+            exact_rows = [row for row in found_exact if _scope_matches(row, {"group", "symbol_group"}) and str(row.get("symbol_group") or "") == group]
             if rows:
                 used_group = group
                 break
     else:
         scope_type = "GLOBAL"
         used_group = ""
-        rows, warnings, errors, exact = _read_candidate_rows(
+        exact_rows, rows, warnings, errors = _read_candidate_rows(
             level,
             experience_library_path,
             [("state_code", "==", state_code)],
             [],
         )
         rows = [row for row in rows if _scope_matches(row, {"global"})]
+        exact_rows = [row for row in exact_rows if _scope_matches(row, {"global"})]
 
     if errors and not rows:
         return {**_empty_level(scope_type, "该层经验读取失败。"), "available": False, "warnings": warnings, "errors": errors}
     if not rows:
         return {**_empty_level(scope_type), "available": not errors, "warnings": warnings, "errors": errors}
-    match_type = "EXACT_STATE_CODE"
-    reason = "命中 exact state_code。"
-    if not exact:
-        similar_rows = _select_similar_state_rows(rows, state_code, top_k)
-        if similar_rows:
-            rows = similar_rows
-            match_type = "SIMILAR_STATE_CODE"
-            reason = "未命中 exact state_code，使用相似 state_code fallback。"
-            warnings.append("exact state_code 未命中，已按相似 state_code fallback。")
-        else:
-            rows, vector_warnings = _select_vector_nearest_rows(rows, query_vector, top_k)
-            warnings.extend(item for item in vector_warnings if item not in warnings)
-            match_type = "VECTOR_NEAREST"
-            reason = "未命中 exact 与相似 state_code，使用 state_vector 最近邻 fallback。"
-            warnings.append("exact state_code 未命中，已按 state_vector 最近邻 fallback。")
-    aggregate, sim_warnings = _aggregate_rows(rows, query_vector, state_code, top_k)
+    expanded_rows, expansion_warnings, _pre_counts = _build_expanded_rows(rows, exact_rows, query_vector, state_code, scope_type, top_k)
+    warnings.extend(item for item in expansion_warnings if item not in warnings)
+    if not expanded_rows:
+        return {**_empty_level(scope_type, "未找到相似状态或向量近邻经验。"), "available": True, "warnings": warnings, "errors": errors}
+    aggregate, sim_warnings = _aggregate_rows(expanded_rows, query_vector, state_code, top_k)
+    match_types = {str(row.get("_match_type") or "") for row in expanded_rows}
+    if "exact_state_code" in match_types and len(match_types) == 1:
+        match_type = "EXACT_STATE_CODE"
+        reason = "命中 exact state_code，精确状态样本充足。"
+    elif "exact_state_code" in match_types:
+        match_type = "EXPANDED_SIMILAR"
+        reason = "命中 exact state_code，且因样本不足扩展到相似状态或向量近邻。"
+    elif "similar_state_code" in match_types:
+        match_type = "SIMILAR_STATE_CODE"
+        reason = "未命中 exact state_code，使用相似 state_code 与必要的向量近邻扩展。"
+        warnings.append("exact state_code 未命中，已按相似 state_code 扩展。")
+    else:
+        match_type = "VECTOR_NEAREST"
+        reason = "未命中 exact 与相似 state_code，使用 state_vector 最近邻扩展。"
+        warnings.append("exact state_code 未命中，已按 state_vector 最近邻扩展。")
     return {
         **_empty_level(scope_type),
         **aggregate,
@@ -475,11 +622,39 @@ def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict
     for field in METRIC_FIELDS:
         result[field] = round(sum(_to_float(levels[key].get(field), 0) * weights.get(key, 0) for key in levels), 6)
     matched_layers = [levels[key].get("scope_type") for key in levels if levels[key].get("matched")]
+    used_match_layers = []
+    for level in levels.values():
+        for item in list(level.get("used_match_layers") or []):
+            if item not in used_match_layers:
+                used_match_layers.append(item)
+    used_match_layers.sort(key=lambda item: LAYER_ORDER.index(item) if item in LAYER_ORDER else len(LAYER_ORDER))
+    total_samples = int(sum(_to_float(level.get("matched_sample_count"), 0) for level in levels.values() if level.get("matched")))
+    exact_samples = int(sum(_to_float(level.get("exact_sample_count"), 0) for level in levels.values() if level.get("matched")))
+    similar_samples = int(sum(_to_float(level.get("similar_state_sample_count"), 0) for level in levels.values() if level.get("matched")))
+    vector_samples = int(sum(_to_float(level.get("vector_nearest_sample_count"), 0) for level in levels.values() if level.get("matched")))
+    global_samples = int(_to_float(levels.get("global_level", {}).get("matched_sample_count"), 0))
+    avg_similarity = 0.0
+    if total_samples > 0:
+        avg_similarity = sum(_to_float(level.get("avg_similarity") or level.get("similarity"), 0) * _to_float(level.get("matched_sample_count"), 0) for level in levels.values() if level.get("matched")) / total_samples
+    expansion_notes = []
+    for level in levels.values():
+        note = str(level.get("match_expansion_note") or "")
+        if note and note not in expansion_notes:
+            expansion_notes.append(note)
+    expansion_note = "；".join(expansion_notes[:3])
     result.update(
         {
             "matched": bool(matched_layers),
             "matched_layers": matched_layers,
-            "matched_sample_count": int(sum(_to_float(level.get("matched_sample_count"), 0) for level in levels.values() if level.get("matched"))),
+            "matched_sample_count": total_samples,
+            "total_matched_sample_count": total_samples,
+            "exact_sample_count": exact_samples,
+            "similar_state_sample_count": similar_samples,
+            "vector_nearest_sample_count": vector_samples,
+            "global_sample_count": global_samples,
+            "avg_similarity": round(avg_similarity, 2),
+            "used_match_layers": used_match_layers,
+            "match_expansion_note": expansion_note,
             "experience_confidence": round(sum(_clamp(levels[key].get("confidence"), 0) * weights.get(key, 0) for key in levels), 2),
             "experience_data_quality": round(sum(_clamp(levels[key].get("data_quality"), 0) * weights.get(key, 0) for key in levels), 2),
             "layer_weights": weights,
@@ -488,7 +663,7 @@ def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict
     return result
 
 
-def _sample_confidence_policy(sample_count: int, matched_layers: list[Any]) -> dict[str, Any]:
+def _sample_confidence_policy(sample_count: int, matched_layers: list[Any], avg_similarity: float = 0.0) -> dict[str, Any]:
     has_symbol = "SYMBOL" in {str(layer) for layer in matched_layers}
     if sample_count < 30:
         level = "样本严重不足"
@@ -507,9 +682,17 @@ def _sample_confidence_policy(sample_count: int, matched_layers: list[Any]) -> d
         note = "匹配样本达到中等规模，经验委员可谨慎参与投票。"
     else:
         level = "样本充足"
-        cap = 100.0
-        participation = "参与投票"
+        cap = 85.0 if avg_similarity < 80 else 100.0
+        participation = "谨慎参与" if avg_similarity < 80 else "参与投票"
         note = "匹配样本较充足，经验委员根据历史概率、MFE/MAE 和回撤分布参与投票。"
+    if sample_count >= 1000 and avg_similarity >= 75:
+        level = "扩展样本充足"
+        cap = max(cap, 80.0)
+        participation = "参与投票"
+        note = "扩展匹配样本充足且平均相似度达标，经验委员可正常参与，但结果属于扩展相似经验。"
+    elif sample_count >= 300 and avg_similarity >= 80:
+        participation = "谨慎参与" if not has_symbol else participation
+        note = "匹配样本和平均相似度达标，经验委员可谨慎参与投票。"
     if matched_layers and not has_symbol:
         cap = min(cap, 65.0)
         if participation == "参与投票":
@@ -548,10 +731,24 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     trap_risk = _to_float(blended.get("trap_risk_avg"), _to_float((query.get("state_vector") or {}).get("trap_risk_score"), 0))
     matched_layers = list(blended.get("matched_layers") or [])
     sample_count = int(_to_float(blended.get("matched_sample_count"), 0))
-    sample_policy = _sample_confidence_policy(sample_count, matched_layers)
+    avg_similarity = _to_float(blended.get("avg_similarity"), 0)
+    exact_sample_count = int(_to_float(blended.get("exact_sample_count"), 0))
+    similar_sample_count = int(_to_float(blended.get("similar_state_sample_count"), 0))
+    vector_sample_count = int(_to_float(blended.get("vector_nearest_sample_count"), 0))
+    sample_policy = _sample_confidence_policy(sample_count, matched_layers, avg_similarity)
     raw_experience_confidence = _clamp(blended.get("experience_confidence"), 0)
+    exact_ratio = exact_sample_count / max(sample_count, 1)
+    global_ratio = _to_float(blended.get("global_sample_count"), 0) / max(sample_count, 1)
     if sample_policy.get("single_symbol_experience_missing"):
         raw_experience_confidence *= 0.85
+    if exact_ratio < 0.20 and (similar_sample_count or vector_sample_count):
+        raw_experience_confidence *= 0.82
+    if vector_sample_count > exact_sample_count + similar_sample_count:
+        raw_experience_confidence *= 0.90
+    if "GLOBAL" in {str(layer) for layer in matched_layers} and "SYMBOL" not in {str(layer) for layer in matched_layers}:
+        raw_experience_confidence *= 0.80
+    elif global_ratio > 0.50:
+        raw_experience_confidence *= 0.90
     confidence = min(raw_experience_confidence, _to_float(sample_policy.get("experience_confidence_cap"), 100))
     data_quality = _clamp(blended.get("experience_data_quality"), 0)
     current_integrity = _clamp((query.get("state_vector") or {}).get("data_integrity_score"), data_quality)
@@ -589,11 +786,20 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     if sample_count < 100 and vote == "SUPPORT":
         vote = "CAUTIOUS_SUPPORT"
         sample_policy["experience_participation_status"] = "仅参考"
+    if exact_ratio < 0.20 and (similar_sample_count or vector_sample_count) and vote == "SUPPORT":
+        vote = "CAUTIOUS_SUPPORT"
+        sample_policy["experience_participation_status"] = "谨慎参与"
+    if avg_similarity < 75 and vote == "SUPPORT":
+        vote = "CAUTIOUS_SUPPORT"
     layers = "、".join(str(item) for item in blended.get("matched_layers") or []) or "无"
+    used_layers = "、".join(str(item) for item in blended.get("used_match_layers") or []) or "无"
     sample_note = str(sample_policy.get("sample_confidence_note") or "")
     abstain_text = f"{abstain_reason}" if abstain_reason else ""
+    experience_kind = "精确经验" if exact_sample_count >= max(similar_sample_count + vector_sample_count, 1) else "扩展相似经验"
     reason = (
-        f"匹配层级：{layers}，总样本{int(_to_float(blended.get('matched_sample_count'), 0))}。"
+        f"匹配层级：{layers}，使用层级：{used_layers}，经验类型：{experience_kind}。"
+        f"精确样本{exact_sample_count}，相似状态扩展样本{similar_sample_count}，向量近邻样本{vector_sample_count}，"
+        f"总参考样本{int(_to_float(blended.get('matched_sample_count'), 0))}，平均相似度{avg_similarity:.1f}。"
         f"{sample_note}"
         f"30m上涨/震荡/下跌概率为{up30:.1f}%/{_to_float(blended.get('historical_30m_sideways_probability'), 0):.1f}%/{down30:.1f}%，"
         f"60m上涨/震荡/下跌概率为{_to_float(blended.get('historical_60m_up_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_sideways_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_down_probability'), 0):.1f}%。"
@@ -610,6 +816,11 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
         "data_integrity_score": round(current_integrity, 2),
         "current_data_integrity_score": round(current_integrity, 2),
         "experience_data_quality": round(data_quality, 2),
+        "avg_similarity": round(avg_similarity, 2),
+        "exact_sample_count": exact_sample_count,
+        "similar_state_sample_count": similar_sample_count,
+        "vector_nearest_sample_count": vector_sample_count,
+        "total_matched_sample_count": sample_count,
         "abstain_reason": abstain_reason,
         "reason": reason,
         **sample_policy,
