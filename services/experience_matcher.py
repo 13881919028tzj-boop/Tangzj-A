@@ -131,10 +131,13 @@ def summarize_state_vector(state_vector: dict[str, Any]) -> str:
 def _factory_group_candidates(symbol: str, profile: dict[str, Any]) -> list[str]:
     profile_candidates = list(profile.get("experience_symbol_group_candidates") or [])
     if profile_candidates:
-        return [str(item) for index, item in enumerate(profile_candidates) if item and item not in profile_candidates[:index]]
+        unique = [str(item) for index, item in enumerate(profile_candidates) if item and item not in profile_candidates[:index]]
+        non_unknown = [item for item in unique if item.upper() != "UNKNOWN"]
+        unknown = [item for item in unique if item.upper() == "UNKNOWN"]
+        return non_unknown + unknown
     symbol = str(symbol or "").upper()
     primary = str(profile.get("symbol_group") or "").strip()
-    candidates = [primary]
+    candidates: list[str] = []
     if symbol in {"BTCUSDT", "ETHUSDT"}:
         candidates.append("majors")
     elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
@@ -143,7 +146,11 @@ def _factory_group_candidates(symbol: str, profile: dict[str, Any]) -> list[str]
         candidates.extend(["majors", "large_alt"])
     elif primary in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
         candidates.append("large_alt")
-    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+    candidates.append(primary)
+    unique = [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+    non_unknown = [item for item in unique if str(item).upper() != "UNKNOWN"]
+    unknown = [item for item in unique if str(item).upper() == "UNKNOWN"]
+    return non_unknown + unknown
 
 
 def build_experience_query_from_cognition(
@@ -156,12 +163,17 @@ def build_experience_query_from_cognition(
     state_vector = _safe_vector(cognition)
     clean_symbol = str(symbol or cognition.get("symbol") or "").upper()
     group_candidates = _factory_group_candidates(clean_symbol, profile)
+    primary_group = next((item for item in group_candidates if str(item).upper() != "UNKNOWN"), group_candidates[0] if group_candidates else profile.get("symbol_group", "UNKNOWN"))
+    cognition_state_code = cognition.get("state_code")
     return {
         "symbol": clean_symbol,
-        "symbol_group": group_candidates[0] if group_candidates else profile.get("symbol_group", "UNKNOWN"),
+        "symbol_group": primary_group,
+        "primary_group": primary_group,
         "symbol_group_candidates": group_candidates,
         "symbol_profile": profile,
-        "state_code": cognition.get("state_code"),
+        "market_cognition_state_code": cognition_state_code,
+        "experience_query_state_code": cognition_state_code,
+        "state_code": cognition_state_code,
         "state_vector": state_vector,
         "state_vector_summary": summarize_state_vector(state_vector),
         "versions": {
@@ -176,10 +188,14 @@ def build_experience_query_from_cognition(
 
 def _empty_level(scope_type: str, reason: str = "未命中该层经验。") -> dict[str, Any]:
     return {
+        "layer": scope_type,
         "scope_type": scope_type,
         "available": False,
         "matched": False,
+        "match_type": "NONE",
+        "matched_state_code": "",
         "matched_sample_count": 0,
+        "sample_count": 0,
         "confidence": 0,
         "data_quality": 0,
         "similarity": 0,
@@ -219,14 +235,47 @@ def _vector_similarity(query_vector: dict[str, Any], center_value: Any, fallback
 
 
 def _state_code_distance(current: Any, candidate: Any) -> float:
-    current_parts = [int(x) for x in re.findall(r"\d+", str(current or ""))]
-    candidate_parts = [int(x) for x in re.findall(r"\d+", str(candidate or ""))]
-    if not current_parts or not candidate_parts:
+    weights = {"T": 1.5, "C": 1.0, "S": 1.0, "B": 1.0, "R": 2.0, "D": 2.0}
+    current_parts = {key: int(value) for key, value in re.findall(r"([TCSBRD])\s*(\d+)", str(current or "").upper())}
+    candidate_parts = {key: int(value) for key, value in re.findall(r"([TCSBRD])\s*(\d+)", str(candidate or "").upper())}
+    if current_parts and candidate_parts:
+        return float(sum(abs(current_parts.get(key, 0) - candidate_parts.get(key, 0)) * weight for key, weight in weights.items()))
+    current_numbers = [int(x) for x in re.findall(r"\d+", str(current or ""))]
+    candidate_numbers = [int(x) for x in re.findall(r"\d+", str(candidate or ""))]
+    if not current_numbers or not candidate_numbers:
         return 999.0
-    size = max(len(current_parts), len(candidate_parts))
-    current_parts.extend([0] * (size - len(current_parts)))
-    candidate_parts.extend([0] * (size - len(candidate_parts)))
-    return float(sum(abs(a - b) for a, b in zip(current_parts, candidate_parts)))
+    size = max(len(current_numbers), len(candidate_numbers))
+    current_numbers.extend([0] * (size - len(current_numbers)))
+    candidate_numbers.extend([0] * (size - len(candidate_numbers)))
+    positional_weights = [1.5, 1.0, 1.0, 1.0, 2.0, 2.0]
+    positional_weights.extend([1.0] * max(0, size - len(positional_weights)))
+    return float(sum(abs(a - b) * positional_weights[index] for index, (a, b) in enumerate(zip(current_numbers, candidate_numbers))))
+
+
+def _best_state_code_distance(rows: list[dict[str, Any]], state_code: Any) -> float:
+    distances = [_state_code_distance(state_code, row.get("state_code")) for row in rows if row.get("state_code") is not None]
+    return min(distances) if distances else 999.0
+
+
+def _select_similar_state_rows(rows: list[dict[str, Any]], state_code: Any, top_k: int) -> list[dict[str, Any]]:
+    best_distance = _best_state_code_distance(rows, state_code)
+    if best_distance >= 999.0:
+        return []
+    window = max(best_distance, 0.0) + 0.0001
+    candidates = [row for row in rows if _state_code_distance(state_code, row.get("state_code")) <= window]
+    return sorted(candidates, key=lambda row: (_state_code_distance(state_code, row.get("state_code")), -_to_float(row.get("sample_count"), 0)))[: max(top_k * 3, 10)]
+
+
+def _select_vector_nearest_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], top_k: int) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
+        if warning and warning not in warnings:
+            warnings.append(warning)
+        enriched.append({**row, "_pre_similarity": similarity})
+    enriched.sort(key=lambda row: (_to_float(row.get("_pre_similarity"), 0), _to_float(row.get("sample_count"), 0)), reverse=True)
+    return enriched[: max(top_k * 3, 10)], warnings
 
 
 def _scope_matches(row: dict[str, Any], expected: set[str]) -> bool:
@@ -271,10 +320,12 @@ def _aggregate_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], st
     aggregate = {
         **metrics,
         "matched_sample_count": sample_count,
+        "sample_count": sample_count,
         "confidence": round(confidence, 2),
         "data_quality": round(data_quality, 2),
         "similarity": round(similarity, 2),
         "exact_state_code": any(str(row.get("state_code")) == str(state_code) for row in selected),
+        "matched_state_code": str(selected[0].get("state_code") or "") if selected else "",
         "top_matches": [
             {
                 "symbol": row.get("symbol"),
@@ -323,9 +374,11 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
             [("symbol", "==", symbol)],
         )
         rows = [row for row in rows if _scope_matches(row, {"symbol"}) and str(row.get("symbol") or "").upper() == symbol]
+        used_group = ""
     elif level == "group_level":
         scope_type = "GROUP"
         rows = []
+        used_group = ""
         warnings = []
         errors = []
         exact = False
@@ -341,9 +394,11 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
             rows = [row for row in found if _scope_matches(row, {"group", "symbol_group"}) and str(row.get("symbol_group") or "") == group]
             exact = level_exact
             if rows:
+                used_group = group
                 break
     else:
         scope_type = "GLOBAL"
+        used_group = ""
         rows, warnings, errors, exact = _read_candidate_rows(
             level,
             experience_library_path,
@@ -356,17 +411,32 @@ def _match_level(level: str, query: dict[str, Any], experience_library_path: str
         return {**_empty_level(scope_type, "该层经验读取失败。"), "available": False, "warnings": warnings, "errors": errors}
     if not rows:
         return {**_empty_level(scope_type), "available": not errors, "warnings": warnings, "errors": errors}
+    match_type = "EXACT_STATE_CODE"
+    reason = "命中 exact state_code。"
     if not exact:
-        rows = sorted(rows, key=lambda row: _state_code_distance(state_code, row.get("state_code")))[: max(top_k * 3, 10)]
-        warnings.append("exact state_code 未命中，已按相近 state_code fallback。")
+        similar_rows = _select_similar_state_rows(rows, state_code, top_k)
+        if similar_rows:
+            rows = similar_rows
+            match_type = "SIMILAR_STATE_CODE"
+            reason = "未命中 exact state_code，使用相似 state_code fallback。"
+            warnings.append("exact state_code 未命中，已按相似 state_code fallback。")
+        else:
+            rows, vector_warnings = _select_vector_nearest_rows(rows, query_vector, top_k)
+            warnings.extend(item for item in vector_warnings if item not in warnings)
+            match_type = "VECTOR_NEAREST"
+            reason = "未命中 exact 与相似 state_code，使用 state_vector 最近邻 fallback。"
+            warnings.append("exact state_code 未命中，已按 state_vector 最近邻 fallback。")
     aggregate, sim_warnings = _aggregate_rows(rows, query_vector, state_code, top_k)
     return {
         **_empty_level(scope_type),
         **aggregate,
         "available": True,
         "matched": True,
-        "match_type": "exact_state_code" if exact else "similar_state_code",
-        "reason": "命中 exact state_code。" if exact else "未命中 exact state_code，使用相近状态 fallback。",
+        "layer": scope_type,
+        "match_type": match_type,
+        "used_symbol_group": used_group,
+        "candidate_groups": groups,
+        "reason": reason,
         "warnings": warnings + [item for item in sim_warnings if item not in warnings],
         "errors": errors,
     }

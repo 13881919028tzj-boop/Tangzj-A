@@ -270,15 +270,16 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.5"
+APP_TITLE = "AI模型 9.2.6"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.5 经验库显示优化与样本置信度校准版"
+VERSION = "AI模型 9.2.6 经验匹配一致性与单币种fallback校准版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
 SIGNAL_CHAIN_LOG = LOG_DIR / "signal_chain_debug.log"
+EXPERIENCE_MATCH_LOG = LOG_DIR / "experience_match_debug.log"
 
 
 def append_debug_log(path: Path, message: str) -> None:
@@ -3233,17 +3234,37 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     query = build_experience_query_from_cognition(symbol, cognition)
     summary = load_experience_library_summary()
     match = match_experience(query)
+    market_cognition_state_code = str(cognition.get("state_code") or "")
+    experience_query_state_code = str(query.get("experience_query_state_code") or query.get("state_code") or "")
+    state_code_consistent = market_cognition_state_code == experience_query_state_code
+    if not state_code_consistent:
+        append_debug_log(
+            EXPERIENCE_MATCH_LOG,
+            f"state_code_mismatch symbol={symbol} cognition={market_cognition_state_code or '-'} query={experience_query_state_code or '-'}",
+        )
+        st.warning(f"经验查询 state_code 与市场认知不一致：市场认知 {market_cognition_state_code or '-'}，经验查询 {experience_query_state_code or '-'}")
     status = "可用" if summary.get("available") else "未接入" if not summary.get("manifest_found") else "格式不完整"
     status_class = "green" if summary.get("available") else "yellow" if summary.get("manifest_found") else "red"
     state_summary = str(query.get("state_vector_summary") or "状态向量缺失")
     if len(state_summary) > 180:
         state_summary = state_summary[:180].rstrip() + "..."
+    def _match_label(level: dict[str, Any], symbol_scope: bool = False) -> str:
+        match_type = str(level.get("match_type") or "NONE").upper()
+        if match_type == "EXACT_STATE_CODE":
+            return "exact命中"
+        if match_type == "SIMILAR_STATE_CODE":
+            return "相似状态命中"
+        if match_type == "VECTOR_NEAREST":
+            return "向量近邻命中"
+        if symbol_scope:
+            return "单币种无相似经验，使用同类币种与全市场经验"
+        return "未命中"
     def _level_card(label: str, level: dict[str, Any]) -> str:
         hit = bool(level.get("matched"))
         sample = int(float(level.get("matched_sample_count") or 0))
-        text = "命中" if hit else "未命中"
+        text = _match_label(level, label == "单币种匹配")
         color = "green" if hit else "yellow" if level.get("available") else "red"
-        return f"""<div class="summary-card"><div class="summary-label">{escape(label)}</div><div class="summary-value {color}">{text}</div><div class="module-desc">样本 {sample}｜权重 {float(level.get("weight", 0) or 0) * 100:.1f}%｜相似度 {float(level.get("similarity", 0) or 0):.1f}</div></div>"""
+        return f"""<div class="summary-card"><div class="summary-label">{escape(label)}</div><div class="summary-value {color}">{escape(text)}</div><div class="module-desc">样本 {sample}｜权重 {float(level.get("weight", 0) or 0) * 100:.1f}%｜相似度 {float(level.get("similarity", 0) or 0):.1f}</div></div>"""
     def _pct(value: Any) -> str:
         return format_pct_value(value, already_percent=True, digits=1)
     def _ret_pct(value: Any) -> str:
@@ -3263,9 +3284,11 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     detail_rows = "".join(
         f"""<div class="status-card" style="margin-top:8px;">
           <b>{escape(label)}</b><br>
-          状态：{escape("命中" if level.get("matched") else "未命中")}｜
+          状态：{escape(_match_label(level, label == "单币种经验"))}｜
           样本：{int(float(level.get("matched_sample_count") or 0))}｜
           匹配：{escape(str(level.get("match_type") or "-"))}｜
+          命中状态码：{escape(str(level.get("matched_state_code") or "-"))}｜
+          Layer：{escape(str(level.get("layer") or level.get("scope_type") or "-"))}｜
           Confidence：{float(level.get("confidence", 0) or 0):.1f}｜
           DataQuality：{float(level.get("data_quality", 0) or 0):.1f}<br>
           30m 上涨/震荡/下跌：{_pct(level.get("historical_30m_up_probability"))}/{_pct(level.get("historical_30m_sideways_probability"))}/{_pct(level.get("historical_30m_down_probability"))}｜
@@ -3274,6 +3297,11 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         </div>"""
         for label, level in (("单币种经验", symbol_level), ("同类币种经验", group_level), ("全市场经验", global_level))
     )
+    primary_group = str(query.get("primary_group") or query.get("symbol_group") or "UNKNOWN")
+    candidate_groups_text = "、".join(str(x) for x in list(query.get("symbol_group_candidates") or [])) or "-"
+    used_group = str(group_level.get("used_symbol_group") or "-")
+    consistency_text = "一致" if state_code_consistent else "不一致"
+    consistency_color = "green" if state_code_consistent else "red"
     render_html(
         f"""
         <div class="app-shell">
@@ -3295,6 +3323,7 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">经验委员参与状态</div><div class="summary-value {participation_color}">{escape(participation_status)}</div><div class="module-desc">{escape(abstain_reason or "按历史经验置信度参与。")}</div></div>
               <div class="summary-card"><div class="summary-label">ExperienceConfidence</div><div class="summary-value blue">{_plain(match.get("confidence"))} / 100</div><div class="module-desc">历史经验置信度，受样本数与单币种命中影响</div></div>
               <div class="summary-card"><div class="summary-label">DataIntegrity</div><div class="summary-value yellow">{_plain(match.get("data_integrity_score"))} / 100</div><div class="module-desc">当前实时数据完整度，和历史置信度分开计算</div></div>
+              <div class="summary-card"><div class="summary-label">state_code一致性</div><div class="summary-value {consistency_color}">{escape(consistency_text)}</div><div class="module-desc">市场认知 {escape(market_cognition_state_code or '-')}｜经验查询 {escape(experience_query_state_code or '-')}</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>经验库路径</b><br>{escape(str(summary.get("path", "/data/ai-training-data/experience_library/current/")))}
@@ -3302,9 +3331,15 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
             <div class="status-card" style="margin-top:8px;">
               <b>当前查询输入</b><br>
               symbol：{escape(str(query.get("symbol") or "-"))}｜
-              symbol_group：{escape(str(query.get("symbol_group") or "UNKNOWN"))}｜
-              候选分组：{escape("、".join(str(x) for x in list(query.get("symbol_group_candidates") or [])) or "-")}｜
-              state_code：{escape(str(query.get("state_code") or "-"))}<br>
+              symbol_group：{escape(primary_group)}｜
+              primary_group：{escape(primary_group)}｜
+              fallback_groups：{escape(candidate_groups_text)}｜
+              candidate_groups：{escape(candidate_groups_text)}<br>
+              market_cognition_state_code：{escape(market_cognition_state_code or "-")}｜
+              experience_query_state_code：{escape(experience_query_state_code or "-")}｜
+              state_code一致性：{escape(consistency_text)}<br>
+              同类匹配使用分组：{escape(used_group)}｜
+              全市场匹配：{escape(str(global_level.get("match_type") or "NONE"))}<br>
               state_vector：{escape(state_summary)}
             </div>
             <div class="committee-grid" style="margin-top:8px;">

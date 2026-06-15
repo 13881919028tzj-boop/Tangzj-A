@@ -44,7 +44,7 @@ def _tier(value: float, high: float, mid: float) -> str:
 
 def _experience_group_candidates(symbol: str, symbol_group: str) -> list[str]:
     """Map local symbol profiles to the first factory experience taxonomy."""
-    candidates = [symbol_group]
+    candidates: list[str] = []
     if symbol in {"BTCUSDT", "ETHUSDT"}:
         candidates.append("majors")
     elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
@@ -53,7 +53,11 @@ def _experience_group_candidates(symbol: str, symbol_group: str) -> list[str]:
         candidates.extend(["majors", "large_alt"])
     elif symbol_group in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
         candidates.append("large_alt")
-    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+    candidates.append(symbol_group)
+    unique = [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+    non_unknown = [item for item in unique if str(item).upper() != "UNKNOWN"]
+    unknown = [item for item in unique if str(item).upper() == "UNKNOWN"]
+    return non_unknown + unknown
 
 
 def build_symbol_profile(symbol: str, ticker: dict[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -109,10 +113,12 @@ def build_symbol_profile(symbol: str, ticker: dict[str, Any] | None = None, rows
         symbol_group = "UNKNOWN" if quote_volume <= 0 else "MID_VOLUME_ALT"
 
     experience_candidates = _experience_group_candidates(clean_symbol, symbol_group)
+    primary_experience_group = next((item for item in experience_candidates if str(item).upper() != "UNKNOWN"), symbol_group)
     return {
         "symbol": clean_symbol,
-        "symbol_group": symbol_group,
-        "experience_symbol_group": experience_candidates[1] if len(experience_candidates) > 1 else symbol_group,
+        "symbol_group": primary_experience_group if str(primary_experience_group).upper() != "UNKNOWN" else symbol_group,
+        "fallback_symbol_group": symbol_group,
+        "experience_symbol_group": primary_experience_group,
         "experience_symbol_group_candidates": experience_candidates,
         "liquidity_tier": liquidity_tier,
         "volatility_tier": volatility_tier,
