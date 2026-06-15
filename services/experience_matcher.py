@@ -131,13 +131,10 @@ def summarize_state_vector(state_vector: dict[str, Any]) -> str:
 def _factory_group_candidates(symbol: str, profile: dict[str, Any]) -> list[str]:
     profile_candidates = list(profile.get("experience_symbol_group_candidates") or [])
     if profile_candidates:
-        unique = [str(item) for index, item in enumerate(profile_candidates) if item and item not in profile_candidates[:index]]
-        non_unknown = [item for item in unique if item.upper() != "UNKNOWN"]
-        unknown = [item for item in unique if item.upper() == "UNKNOWN"]
-        return non_unknown + unknown
+        return [str(item) for index, item in enumerate(profile_candidates) if item and item not in profile_candidates[:index]]
     symbol = str(symbol or "").upper()
     primary = str(profile.get("symbol_group") or "").strip()
-    candidates: list[str] = []
+    candidates: list[str] = [primary]
     if symbol in {"BTCUSDT", "ETHUSDT"}:
         candidates.append("majors")
     elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
@@ -146,11 +143,18 @@ def _factory_group_candidates(symbol: str, profile: dict[str, Any]) -> list[str]
         candidates.extend(["majors", "large_alt"])
     elif primary in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
         candidates.append("large_alt")
-    candidates.append(primary)
-    unique = [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
-    non_unknown = [item for item in unique if str(item).upper() != "UNKNOWN"]
-    unknown = [item for item in unique if str(item).upper() == "UNKNOWN"]
-    return non_unknown + unknown
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+
+
+def _primary_group_from_candidates(candidates: list[str], fallback: Any = "UNKNOWN") -> str:
+    return str(next((item for item in candidates if str(item).upper() != "UNKNOWN"), candidates[0] if candidates else fallback))
+
+
+def _group_query_order(query: dict[str, Any]) -> list[str]:
+    candidates = [str(x) for x in list(query.get("symbol_group_candidates") or [query.get("symbol_group")]) if x]
+    primary = str(query.get("primary_group") or query.get("symbol_group") or "").strip()
+    ordered = [primary] + candidates if primary else candidates
+    return [item for index, item in enumerate(ordered) if item and item not in ordered[:index]]
 
 
 def build_experience_query_from_cognition(
@@ -163,7 +167,7 @@ def build_experience_query_from_cognition(
     state_vector = _safe_vector(cognition)
     clean_symbol = str(symbol or cognition.get("symbol") or "").upper()
     group_candidates = _factory_group_candidates(clean_symbol, profile)
-    primary_group = next((item for item in group_candidates if str(item).upper() != "UNKNOWN"), group_candidates[0] if group_candidates else profile.get("symbol_group", "UNKNOWN"))
+    primary_group = _primary_group_from_candidates(group_candidates, profile.get("symbol_group", "UNKNOWN"))
     cognition_state_code = cognition.get("state_code")
     return {
         "symbol": clean_symbol,
@@ -363,7 +367,7 @@ def _read_candidate_rows(
 def _match_level(level: str, query: dict[str, Any], experience_library_path: str | None, top_k: int) -> dict[str, Any]:
     symbol = str(query.get("symbol") or "").upper()
     state_code = query.get("state_code")
-    groups = [str(x) for x in list(query.get("symbol_group_candidates") or [query.get("symbol_group")]) if x]
+    groups = _group_query_order(query)
     query_vector = query.get("state_vector") if isinstance(query.get("state_vector"), dict) else {}
     if level == "symbol_level":
         scope_type = "SYMBOL"

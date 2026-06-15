@@ -3297,9 +3297,15 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         </div>"""
         for label, level in (("单币种经验", symbol_level), ("同类币种经验", group_level), ("全市场经验", global_level))
     )
-    primary_group = str(query.get("primary_group") or query.get("symbol_group") or "UNKNOWN")
-    candidate_groups_text = "、".join(str(x) for x in list(query.get("symbol_group_candidates") or [])) or "-"
-    used_group = str(group_level.get("used_symbol_group") or "-")
+    candidate_groups = [str(x) for x in list(query.get("symbol_group_candidates") or []) if x]
+    primary_group = str(
+        next(
+            (item for item in [query.get("primary_group"), query.get("symbol_group"), *candidate_groups] if item and str(item).upper() != "UNKNOWN"),
+            query.get("primary_group") or query.get("symbol_group") or "UNKNOWN",
+        )
+    )
+    candidate_groups_text = ", ".join(candidate_groups) or "-"
+    used_group = str(group_level.get("used_symbol_group") or primary_group or "-")
     consistency_text = "一致" if state_code_consistent else "不一致"
     consistency_color = "green" if state_code_consistent else "red"
     render_html(

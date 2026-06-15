@@ -44,7 +44,7 @@ def _tier(value: float, high: float, mid: float) -> str:
 
 def _experience_group_candidates(symbol: str, symbol_group: str) -> list[str]:
     """Map local symbol profiles to the first factory experience taxonomy."""
-    candidates: list[str] = []
+    candidates: list[str] = [symbol_group]
     if symbol in {"BTCUSDT", "ETHUSDT"}:
         candidates.append("majors")
     elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
@@ -53,11 +53,7 @@ def _experience_group_candidates(symbol: str, symbol_group: str) -> list[str]:
         candidates.extend(["majors", "large_alt"])
     elif symbol_group in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
         candidates.append("large_alt")
-    candidates.append(symbol_group)
-    unique = [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
-    non_unknown = [item for item in unique if str(item).upper() != "UNKNOWN"]
-    unknown = [item for item in unique if str(item).upper() == "UNKNOWN"]
-    return non_unknown + unknown
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
 
 
 def build_symbol_profile(symbol: str, ticker: dict[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
