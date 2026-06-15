@@ -9,7 +9,7 @@ from services.demand_engine import analyze_demand, clamp
 from services.market_state_engine import build_market_state
 
 
-APP_VERSION = "AI模型 9.2.4 经验库匹配与经验委员实测接入版"
+APP_VERSION = "AI模型 9.2.5 经验库显示优化与样本置信度校准版"
 DATA_VERSION = "market_cognition_v1"
 SCHEMA_VERSION = "experience_sample_schema_v1"
 STATE_LANGUAGE_VERSION = "market_state_language_v1"

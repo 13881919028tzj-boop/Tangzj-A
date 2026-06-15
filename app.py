@@ -270,9 +270,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.4"
+APP_TITLE = "AI模型 9.2.5"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.4 经验库匹配与经验委员实测接入版"
+VERSION = "AI模型 9.2.5 经验库显示优化与样本置信度校准版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -808,6 +808,15 @@ def format_percent(value: Any) -> str:
         return "正在获取"
     sign = "+" if number > 0 else ""
     return f"{sign}{number:.2f}%"
+
+
+def format_pct_value(value: Any, already_percent: bool = False, digits: int = 2, signed: bool = False) -> str:
+    number = safe_number(value)
+    if number is None:
+        return "–"
+    display = number if already_percent or abs(number) > 1 else number * 100
+    sign = "+" if signed and display > 0 else ""
+    return f"{sign}{display:.{digits}f}%"
 
 
 def format_compact(value: Any) -> str:
@@ -3236,12 +3245,20 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         color = "green" if hit else "yellow" if level.get("available") else "red"
         return f"""<div class="summary-card"><div class="summary-label">{escape(label)}</div><div class="summary-value {color}">{text}</div><div class="module-desc">样本 {sample}｜权重 {float(level.get("weight", 0) or 0) * 100:.1f}%｜相似度 {float(level.get("similarity", 0) or 0):.1f}</div></div>"""
     def _pct(value: Any) -> str:
-        return f"{float(value or 0):.1f}%"
-    def _num(value: Any) -> str:
-        return f"{float(value or 0):.5f}"
+        return format_pct_value(value, already_percent=True, digits=1)
+    def _ret_pct(value: Any) -> str:
+        return format_pct_value(value, digits=2, signed=True)
+    def _plain(value: Any, digits: int = 1) -> str:
+        number = safe_number(value)
+        return "–" if number is None else f"{number:.{digits}f}"
     symbol_level = match.get("symbol_level") or {}
     group_level = match.get("group_level") or {}
     global_level = match.get("global_level") or {}
+    total_samples = int(float(match.get("matched_sample_count") or 0))
+    sample_level = str(match.get("sample_confidence_level") or "等待样本")
+    participation_status = str(match.get("experience_participation_status") or ("弃权" if match.get("vote") == "ABSTAIN" else "谨慎参与"))
+    abstain_reason = str(match.get("abstain_reason") or match.get("sample_confidence_note") or "")
+    participation_color = "green" if participation_status == "参与投票" else "yellow" if participation_status in {"谨慎参与", "仅参考"} else "red"
     warnings_text = "；".join(str(item) for item in list(match.get("warnings") or [])[:4])
     detail_rows = "".join(
         f"""<div class="status-card" style="margin-top:8px;">
@@ -3252,7 +3269,7 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
           Confidence：{float(level.get("confidence", 0) or 0):.1f}｜
           DataQuality：{float(level.get("data_quality", 0) or 0):.1f}<br>
           30m 上涨/震荡/下跌：{_pct(level.get("historical_30m_up_probability"))}/{_pct(level.get("historical_30m_sideways_probability"))}/{_pct(level.get("historical_30m_down_probability"))}｜
-          MFE90/MAE90：{_num(level.get("mfe_p90"))}/{_num(level.get("mae_p90"))}<br>
+          MFE90/MAE90：{_ret_pct(level.get("mfe_p90"))}/{_ret_pct(level.get("mae_p90"))}<br>
           {escape(str(level.get("reason") or ""))}
         </div>"""
         for label, level in (("单币种经验", symbol_level), ("同类币种经验", group_level), ("全市场经验", global_level))
@@ -3273,7 +3290,11 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               {_level_card("单币种匹配", symbol_level)}
               {_level_card("同类币种匹配", group_level)}
               {_level_card("全市场匹配", global_level)}
-              <div class="summary-card"><div class="summary-label">总样本</div><div class="summary-value blue">{int(float(match.get("matched_sample_count") or 0))}</div><div class="module-desc">层级：{escape("、".join(str(x) for x in list(match.get("matched_layers") or [])) or "无")}</div></div>
+              <div class="summary-card"><div class="summary-label">总样本</div><div class="summary-value blue">{total_samples}</div><div class="module-desc">单币种 {int(float(symbol_level.get("matched_sample_count") or 0))}｜同类 {int(float(group_level.get("matched_sample_count") or 0))}｜全市场 {int(float(global_level.get("matched_sample_count") or 0))}</div></div>
+              <div class="summary-card"><div class="summary-label">经验置信度等级</div><div class="summary-value {participation_color}">{escape(sample_level)}</div><div class="module-desc">层级：{escape("、".join(str(x) for x in list(match.get("matched_layers") or [])) or "无")}</div></div>
+              <div class="summary-card"><div class="summary-label">经验委员参与状态</div><div class="summary-value {participation_color}">{escape(participation_status)}</div><div class="module-desc">{escape(abstain_reason or "按历史经验置信度参与。")}</div></div>
+              <div class="summary-card"><div class="summary-label">ExperienceConfidence</div><div class="summary-value blue">{_plain(match.get("confidence"))} / 100</div><div class="module-desc">历史经验置信度，受样本数与单币种命中影响</div></div>
+              <div class="summary-card"><div class="summary-label">DataIntegrity</div><div class="summary-value yellow">{_plain(match.get("data_integrity_score"))} / 100</div><div class="module-desc">当前实时数据完整度，和历史置信度分开计算</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>经验库路径</b><br>{escape(str(summary.get("path", "/data/ai-training-data/experience_library/current/")))}
@@ -3289,12 +3310,12 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
             <div class="committee-grid" style="margin-top:8px;">
               <div class="summary-card"><div class="summary-label">30分钟历史概率</div><div class="summary-value blue">涨{_pct(match.get("historical_30m_up_probability"))}</div><div class="module-desc">震荡{_pct(match.get("historical_30m_sideways_probability"))}｜跌{_pct(match.get("historical_30m_down_probability"))}</div></div>
               <div class="summary-card"><div class="summary-label">60分钟历史概率</div><div class="summary-value blue">涨{_pct(match.get("historical_60m_up_probability"))}</div><div class="module-desc">震荡{_pct(match.get("historical_60m_sideways_probability"))}｜跌{_pct(match.get("historical_60m_down_probability"))}</div></div>
-              <div class="summary-card"><div class="summary-label">历史收益</div><div class="summary-value yellow">30m {_num(match.get("avg_return_30m"))}</div><div class="module-desc">60m {_num(match.get("avg_return_60m"))}</div></div>
-              <div class="summary-card"><div class="summary-label">MFE / MAE</div><div class="summary-value yellow">MFE90 {_num(match.get("mfe_p90"))}</div><div class="module-desc">MFE50/75 {_num(match.get("mfe_p50"))}/{_num(match.get("mfe_p75"))}｜MAE50/75/90 {_num(match.get("mae_p50"))}/{_num(match.get("mae_p75"))}/{_num(match.get("mae_p90"))}</div></div>
-              <div class="summary-card"><div class="summary-label">建议止损</div><div class="summary-value {_signal_color(str(match.get("suggested_stop_loss", 0)))}">{_num(match.get("suggested_stop_loss"))}</div></div>
-              <div class="summary-card"><div class="summary-label">建议止盈1</div><div class="summary-value green">{_num(match.get("suggested_take_profit_1"))}</div></div>
-              <div class="summary-card"><div class="summary-label">建议止盈2</div><div class="summary-value green">{_num(match.get("suggested_take_profit_2"))}</div></div>
-              <div class="summary-card"><div class="summary-label">经验委员投票</div><div class="summary-value {_signal_color(str(match.get("vote", "ABSTAIN")))}">{escape(str(match.get("vote", "ABSTAIN")))} / {escape(str(match.get("direction", "WAIT")))}</div><div class="module-desc">Score {float(match.get("score", 0) or 0):.1f}｜Confidence {float(match.get("confidence", 0) or 0):.1f}｜DataIntegrity {float(match.get("data_integrity_score", 0) or 0):.1f}</div></div>
+              <div class="summary-card"><div class="summary-label">历史收益</div><div class="summary-value yellow">30m {_ret_pct(match.get("avg_return_30m"))}</div><div class="module-desc">60m {_ret_pct(match.get("avg_return_60m"))}｜中位30m {_ret_pct(match.get("median_return_30m"))}｜中位60m {_ret_pct(match.get("median_return_60m"))}</div></div>
+              <div class="summary-card"><div class="summary-label">MFE / MAE</div><div class="summary-value yellow">MFE90 {_ret_pct(match.get("mfe_p90"))}</div><div class="module-desc">MFE50/75 {_ret_pct(match.get("mfe_p50"))}/{_ret_pct(match.get("mfe_p75"))}｜MAE50/75/90 {_ret_pct(match.get("mae_p50"))}/{_ret_pct(match.get("mae_p75"))}/{_ret_pct(match.get("mae_p90"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止损</div><div class="summary-value {_signal_color(str(match.get("suggested_stop_loss", 0)))}">{_ret_pct(match.get("suggested_stop_loss"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止盈1</div><div class="summary-value green">{_ret_pct(match.get("suggested_take_profit_1"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止盈2</div><div class="summary-value green">{_ret_pct(match.get("suggested_take_profit_2"))}</div><div class="module-desc">移动止损 {_ret_pct(match.get("suggested_trailing_stop"))}</div></div>
+              <div class="summary-card"><div class="summary-label">经验委员投票</div><div class="summary-value {_signal_color(str(match.get("vote", "ABSTAIN")))}">{escape(str(match.get("vote", "ABSTAIN")))} / {escape(str(match.get("direction", "WAIT")))}</div><div class="module-desc">Score {_plain(match.get("score"))}｜ExperienceConfidence {_plain(match.get("confidence"))}｜DataIntegrity {_plain(match.get("data_integrity_score"))}</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>经验委员理由</b><br>

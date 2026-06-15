@@ -53,6 +53,8 @@ METRIC_FIELDS = (
     "historical_60m_sideways_probability",
     "avg_return_30m",
     "avg_return_60m",
+    "median_return_30m",
+    "median_return_60m",
     "mfe_p50",
     "mfe_p75",
     "mfe_p90",
@@ -62,6 +64,7 @@ METRIC_FIELDS = (
     "suggested_stop_loss",
     "suggested_take_profit_1",
     "suggested_take_profit_2",
+    "suggested_trailing_stop",
     "historical_loss_probability",
     "trap_risk_avg",
 )
@@ -411,9 +414,57 @@ def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict
     return result
 
 
+def _sample_confidence_policy(sample_count: int, matched_layers: list[Any]) -> dict[str, Any]:
+    has_symbol = "SYMBOL" in {str(layer) for layer in matched_layers}
+    if sample_count < 30:
+        level = "样本严重不足"
+        cap = 20.0
+        participation = "弃权"
+        note = "匹配样本不足 30 条，不足以形成稳定历史经验，经验委员弃权，仅展示历史参考。"
+    elif sample_count < 100:
+        level = "样本偏少"
+        cap = 40.0
+        participation = "仅参考"
+        note = "匹配样本少于 100 条，历史结果只能作为弱参考，不允许强 SUPPORT。"
+    elif sample_count < 300:
+        level = "样本中等"
+        cap = 65.0
+        participation = "谨慎参与"
+        note = "匹配样本达到中等规模，经验委员可谨慎参与投票。"
+    else:
+        level = "样本充足"
+        cap = 100.0
+        participation = "参与投票"
+        note = "匹配样本较充足，经验委员根据历史概率、MFE/MAE 和回撤分布参与投票。"
+    if matched_layers and not has_symbol:
+        cap = min(cap, 65.0)
+        if participation == "参与投票":
+            participation = "谨慎参与"
+        note = f"当前币种暂无单币种历史经验，系统使用同类币种与全市场经验作为参考。{note}"
+    return {
+        "sample_confidence_level": level,
+        "experience_confidence_cap": cap,
+        "experience_participation_status": participation,
+        "sample_confidence_note": note,
+        "single_symbol_experience_missing": bool(matched_layers and not has_symbol),
+    }
+
+
 def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[str, Any]:
     if not blended.get("matched"):
-        return {"vote": "ABSTAIN", "direction": "WAIT", "score": 0, "confidence": 0, "data_integrity_score": 0, "reason": "三层经验均未命中，经验委员弃权。"}
+        current_integrity = _clamp((query.get("state_vector") or {}).get("data_integrity_score"), 0)
+        return {
+            "vote": "ABSTAIN",
+            "direction": "WAIT",
+            "score": 0,
+            "confidence": 0,
+            "data_integrity_score": current_integrity,
+            "current_data_integrity_score": current_integrity,
+            "sample_confidence_level": "无匹配样本",
+            "experience_participation_status": "弃权",
+            "abstain_reason": "三层经验均未命中。",
+            "reason": "三层经验均未命中，经验委员弃权。",
+        }
     up30 = _to_float(blended.get("historical_30m_up_probability"), 0)
     down30 = _to_float(blended.get("historical_30m_down_probability"), 0)
     avg30 = _to_float(blended.get("avg_return_30m"), 0)
@@ -421,16 +472,29 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     mae90 = abs(_to_float(blended.get("mae_p90"), 0))
     loss_probability = _to_float(blended.get("historical_loss_probability"), 0)
     trap_risk = _to_float(blended.get("trap_risk_avg"), _to_float((query.get("state_vector") or {}).get("trap_risk_score"), 0))
-    confidence = _clamp(blended.get("experience_confidence"), 0)
+    matched_layers = list(blended.get("matched_layers") or [])
+    sample_count = int(_to_float(blended.get("matched_sample_count"), 0))
+    sample_policy = _sample_confidence_policy(sample_count, matched_layers)
+    raw_experience_confidence = _clamp(blended.get("experience_confidence"), 0)
+    if sample_policy.get("single_symbol_experience_missing"):
+        raw_experience_confidence *= 0.85
+    confidence = min(raw_experience_confidence, _to_float(sample_policy.get("experience_confidence_cap"), 100))
     data_quality = _clamp(blended.get("experience_data_quality"), 0)
-    sample_score = min(20.0, math.log10(max(_to_float(blended.get("matched_sample_count"), 0), 1)) * 8)
+    current_integrity = _clamp((query.get("state_vector") or {}).get("data_integrity_score"), data_quality)
+    sample_score = min(20.0, math.log10(max(sample_count, 1)) * 8)
     prob_edge = up30 - down30
     return_score = max(-15.0, min(15.0, avg30 * 5000))
     rr_score = max(0.0, min(20.0, (mfe90 / max(mae90, 0.0001)) * 8))
     score = _clamp(50 + prob_edge * 0.45 + return_score + rr_score + sample_score * 0.5 + data_quality * 0.10 - trap_risk * 0.18 - loss_probability * 0.22)
-    if confidence < 30 or _to_float(blended.get("matched_sample_count"), 0) < 20:
+    abstain_reason = ""
+    if sample_count < 30:
         vote = "ABSTAIN"
         direction = "WAIT"
+        abstain_reason = "样本数不足 30，经验委员弃权，仅展示历史参考。"
+    elif confidence < 30:
+        vote = "ABSTAIN"
+        direction = "WAIT"
+        abstain_reason = "历史经验置信度低于 30，经验委员弃权，仅展示历史参考。"
     elif data_quality < 35 or mae90 >= 0.08 or loss_probability >= 70:
         vote = "VETO" if mae90 >= 0.12 or data_quality < 20 else "OPPOSE"
         direction = "WAIT"
@@ -446,15 +510,36 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     else:
         vote = "ABSTAIN" if score < 45 else "CAUTIOUS_SUPPORT"
         direction = "WAIT" if vote == "ABSTAIN" else ("LONG" if up30 >= down30 else "SHORT")
+        if vote == "ABSTAIN":
+            abstain_reason = "历史概率优势和收益质量不足，经验委员弃权。"
+    if sample_count < 100 and vote == "SUPPORT":
+        vote = "CAUTIOUS_SUPPORT"
+        sample_policy["experience_participation_status"] = "仅参考"
     layers = "、".join(str(item) for item in blended.get("matched_layers") or []) or "无"
+    sample_note = str(sample_policy.get("sample_confidence_note") or "")
+    abstain_text = f"{abstain_reason}" if abstain_reason else ""
     reason = (
         f"匹配层级：{layers}，总样本{int(_to_float(blended.get('matched_sample_count'), 0))}。"
+        f"{sample_note}"
         f"30m上涨/震荡/下跌概率为{up30:.1f}%/{_to_float(blended.get('historical_30m_sideways_probability'), 0):.1f}%/{down30:.1f}%，"
         f"60m上涨/震荡/下跌概率为{_to_float(blended.get('historical_60m_up_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_sideways_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_down_probability'), 0):.1f}%。"
-        f"MFE90约{mfe90:.4f}，MAE90约{mae90:.4f}，平均30m收益{avg30:.5f}。"
-        f"经验评分{score:.1f}，置信度{confidence:.1f}，数据质量{data_quality:.1f}，因此给出{vote}/{direction}。"
+        f"MFE90约{mfe90 * 100:.2f}%，MAE90约{-mae90 * 100:.2f}%，平均30m收益{avg30 * 100:.2f}%。"
+        f"经验评分{score:.1f}，ExperienceConfidence {confidence:.1f}，DataIntegrity {current_integrity:.1f}，经验数据质量{data_quality:.1f}，因此给出{vote}/{direction}。"
+        f"{abstain_text}"
     )
-    return {"vote": vote, "direction": direction, "score": round(score, 2), "confidence": round(confidence, 2), "data_integrity_score": round(data_quality, 2), "reason": reason}
+    return {
+        "vote": vote,
+        "direction": direction,
+        "score": round(score, 2),
+        "confidence": round(confidence, 2),
+        "raw_experience_confidence": round(raw_experience_confidence, 2),
+        "data_integrity_score": round(current_integrity, 2),
+        "current_data_integrity_score": round(current_integrity, 2),
+        "experience_data_quality": round(data_quality, 2),
+        "abstain_reason": abstain_reason,
+        "reason": reason,
+        **sample_policy,
+    }
 
 
 def match_experience(query: dict[str, Any], experience_library_path: str | None = None, top_k: int = 50) -> dict[str, Any]:
