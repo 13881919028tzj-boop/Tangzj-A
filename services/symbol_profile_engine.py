@@ -42,6 +42,20 @@ def _tier(value: float, high: float, mid: float) -> str:
     return "LOW"
 
 
+def _experience_group_candidates(symbol: str, symbol_group: str) -> list[str]:
+    """Map local symbol profiles to the first factory experience taxonomy."""
+    candidates = [symbol_group]
+    if symbol in {"BTCUSDT", "ETHUSDT"}:
+        candidates.append("majors")
+    elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
+        candidates.append("large_alt")
+    elif symbol_group == "MAJOR_HIGH_LIQUIDITY":
+        candidates.extend(["majors", "large_alt"])
+    elif symbol_group in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
+        candidates.append("large_alt")
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+
+
 def build_symbol_profile(symbol: str, ticker: dict[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Build a conservative symbol group without external market-cap data."""
     clean_symbol = str(symbol or "").upper().strip()
@@ -94,9 +108,12 @@ def build_symbol_profile(symbol: str, ticker: dict[str, Any] | None = None, rows
     else:
         symbol_group = "UNKNOWN" if quote_volume <= 0 else "MID_VOLUME_ALT"
 
+    experience_candidates = _experience_group_candidates(clean_symbol, symbol_group)
     return {
         "symbol": clean_symbol,
         "symbol_group": symbol_group,
+        "experience_symbol_group": experience_candidates[1] if len(experience_candidates) > 1 else symbol_group,
+        "experience_symbol_group_candidates": experience_candidates,
         "liquidity_tier": liquidity_tier,
         "volatility_tier": volatility_tier,
         "volume_tier": volume_tier,

@@ -1,0 +1,7 @@
+{
+  "auto_daily_backup": false,
+  "auto_weekly_backup": false,
+  "include_logs": true,
+  "include_config": true,
+  "include_data": true
+}

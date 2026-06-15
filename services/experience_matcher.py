@@ -1,10 +1,17 @@
-"""Reserved matching interface for future experience-library lookups."""
+"""Experience-library matching and voting for the experience committee."""
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from typing import Any
 
-from services.experience_library_loader import check_experience_library_available, get_default_experience_library_path
+from services.experience_library_loader import (
+    check_experience_library_available,
+    get_default_experience_library_path,
+    load_experience_level_records,
+)
 from services.symbol_profile_engine import build_symbol_profile
 
 
@@ -28,6 +35,67 @@ STATE_VECTOR_KEYS = (
     "confidence",
     "data_integrity_score",
 )
+SIMILARITY_WEIGHTS = {
+    "demand_score": 0.20,
+    "trend_quality_score": 0.15,
+    "capital_score": 0.15,
+    "behavior_score": 0.15,
+    "structure_score": 0.10,
+    "risk_score": 0.15,
+    "trap_risk_score": 0.10,
+}
+METRIC_FIELDS = (
+    "historical_30m_up_probability",
+    "historical_30m_down_probability",
+    "historical_30m_sideways_probability",
+    "historical_60m_up_probability",
+    "historical_60m_down_probability",
+    "historical_60m_sideways_probability",
+    "avg_return_30m",
+    "avg_return_60m",
+    "mfe_p50",
+    "mfe_p75",
+    "mfe_p90",
+    "mae_p50",
+    "mae_p75",
+    "mae_p90",
+    "suggested_stop_loss",
+    "suggested_take_profit_1",
+    "suggested_take_profit_2",
+    "historical_loss_probability",
+    "trap_risk_avg",
+)
+PROBABILITY_MAP = {
+    "historical_30m_up_probability": "future_30m_up_probability",
+    "historical_30m_down_probability": "future_30m_down_probability",
+    "historical_30m_sideways_probability": "future_30m_sideways_probability",
+    "historical_60m_up_probability": "future_60m_up_probability",
+    "historical_60m_down_probability": "future_60m_down_probability",
+    "historical_60m_sideways_probability": "future_60m_sideways_probability",
+}
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return default
+        return number
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(value: Any, default: float = 0.0) -> float:
+    return max(0.0, min(100.0, _to_float(value, default)))
+
+
+def _probability_percent(value: Any) -> float:
+    number = _to_float(value, 0.0)
+    if abs(number) <= 1.0:
+        number *= 100.0
+    return round(max(0.0, min(100.0, number)), 2)
 
 
 def _safe_vector(market_cognition: dict[str, Any]) -> dict[str, Any]:
@@ -57,18 +125,38 @@ def summarize_state_vector(state_vector: dict[str, Any]) -> str:
     return "，".join(parts)
 
 
+def _factory_group_candidates(symbol: str, profile: dict[str, Any]) -> list[str]:
+    profile_candidates = list(profile.get("experience_symbol_group_candidates") or [])
+    if profile_candidates:
+        return [str(item) for index, item in enumerate(profile_candidates) if item and item not in profile_candidates[:index]]
+    symbol = str(symbol or "").upper()
+    primary = str(profile.get("symbol_group") or "").strip()
+    candidates = [primary]
+    if symbol in {"BTCUSDT", "ETHUSDT"}:
+        candidates.append("majors")
+    elif symbol in {"BNBUSDT", "SOLUSDT", "XRPUSDT"}:
+        candidates.append("large_alt")
+    elif primary in {"MAJOR_HIGH_LIQUIDITY"}:
+        candidates.extend(["majors", "large_alt"])
+    elif primary in {"HIGH_VOLUME_ALT", "MID_VOLUME_ALT", "MEME_OR_HYPE", "LOW_LIQUIDITY_HIGH_VOL", "UNKNOWN"}:
+        candidates.append("large_alt")
+    return [item for index, item in enumerate(candidates) if item and item not in candidates[:index]]
+
+
 def build_experience_query_from_cognition(
     symbol: str,
     market_cognition: dict[str, Any],
     ticker: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the query payload future experience matching will consume."""
     cognition = market_cognition or {}
     profile = build_symbol_profile(symbol, ticker=ticker)
     state_vector = _safe_vector(cognition)
+    clean_symbol = str(symbol or cognition.get("symbol") or "").upper()
+    group_candidates = _factory_group_candidates(clean_symbol, profile)
     return {
-        "symbol": str(symbol or cognition.get("symbol") or "").upper(),
-        "symbol_group": profile.get("symbol_group", "UNKNOWN"),
+        "symbol": clean_symbol,
+        "symbol_group": group_candidates[0] if group_candidates else profile.get("symbol_group", "UNKNOWN"),
+        "symbol_group_candidates": group_candidates,
         "symbol_profile": profile,
         "state_code": cognition.get("state_code"),
         "state_vector": state_vector,
@@ -83,58 +171,339 @@ def build_experience_query_from_cognition(
     }
 
 
-def _empty_level(scope_type: str) -> dict[str, Any]:
+def _empty_level(scope_type: str, reason: str = "未命中该层经验。") -> dict[str, Any]:
     return {
         "scope_type": scope_type,
         "available": False,
         "matched": False,
         "matched_sample_count": 0,
         "confidence": 0,
+        "data_quality": 0,
+        "similarity": 0,
         "weight": 0,
-        "reason": "当前阶段只预留接口，尚未执行大规模经验匹配。",
+        "reason": reason,
+        "warnings": [],
+        "top_matches": [],
     }
 
 
-def match_experience(query: dict[str, Any], experience_library_path: str | None = None, top_k: int = 50) -> dict[str, Any]:
-    """Reserved interface for three-level experience matching.
+def _parse_center(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            raw = json.loads(value)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
-    Future implementation:
-    1. Query symbol_level_experience by symbol + state_code + state_vector similarity.
-    2. If symbol samples are insufficient, query group_level_experience by symbol_group.
-    3. Query global_level_experience as market-wide fallback.
-    4. Blend levels by sample_count and confidence using the 9.2.3 contract rules.
-    """
+
+def _vector_similarity(query_vector: dict[str, Any], center_value: Any, fallback: Any) -> tuple[float, str]:
+    center = _parse_center(center_value)
+    if not center:
+        return _clamp(_probability_percent(fallback) if _to_float(fallback, 0) <= 1 else fallback, 60), "state_vector_center 缺失，使用 avg_similarity 或默认相似度。"
+    total_weight = 0.0
+    weighted_distance = 0.0
+    for key, weight in SIMILARITY_WEIGHTS.items():
+        if key not in query_vector or key not in center:
+            continue
+        weighted_distance += abs(_to_float(query_vector.get(key), 0) - _to_float(center.get(key), 0)) * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return _clamp(_probability_percent(fallback) if _to_float(fallback, 0) <= 1 else fallback, 60), "状态向量可比字段不足，使用 avg_similarity 或默认相似度。"
+    return round(max(0.0, 100.0 - weighted_distance / total_weight), 2), ""
+
+
+def _state_code_distance(current: Any, candidate: Any) -> float:
+    current_parts = [int(x) for x in re.findall(r"\d+", str(current or ""))]
+    candidate_parts = [int(x) for x in re.findall(r"\d+", str(candidate or ""))]
+    if not current_parts or not candidate_parts:
+        return 999.0
+    size = max(len(current_parts), len(candidate_parts))
+    current_parts.extend([0] * (size - len(current_parts)))
+    candidate_parts.extend([0] * (size - len(candidate_parts)))
+    return float(sum(abs(a - b) for a, b in zip(current_parts, candidate_parts)))
+
+
+def _scope_matches(row: dict[str, Any], expected: set[str]) -> bool:
+    return str(row.get("scope_type") or "").strip().lower() in expected
+
+
+def _row_metric(row: dict[str, Any], field: str) -> float:
+    source = PROBABILITY_MAP.get(field, field)
+    value = row.get(source)
+    if field.endswith("_probability"):
+        return _probability_percent(value)
+    return _to_float(value, 0.0)
+
+
+def _aggregate_rows(rows: list[dict[str, Any]], query_vector: dict[str, Any], state_code: Any, top_k: int) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        similarity, warning = _vector_similarity(query_vector, row.get("state_vector_center"), row.get("avg_similarity", 60))
+        if warning and warning not in warnings:
+            warnings.append(warning)
+        sample_count = max(0.0, _to_float(row.get("sample_count"), 0))
+        confidence = _clamp(row.get("confidence"), 0)
+        data_quality = _clamp(row.get("data_quality"), 50)
+        state_distance = 0.0 if str(row.get("state_code")) == str(state_code) else _state_code_distance(state_code, row.get("state_code"))
+        rank_score = similarity * 2 + min(sample_count, 1000) / 20 + confidence - state_distance * 15
+        enriched.append({**row, "_similarity": similarity, "_state_distance": state_distance, "_rank_score": rank_score})
+    enriched.sort(key=lambda item: (_to_float(item.get("_rank_score"), 0), _to_float(item.get("sample_count"), 0)), reverse=True)
+    selected = enriched[: max(1, top_k)]
+    total_basis = sum(max(1.0, _to_float(row.get("sample_count"), 0)) * max(1.0, _to_float(row.get("_similarity"), 0)) for row in selected)
+    def weighted(field: str) -> float:
+        if total_basis <= 0:
+            return 0.0
+        return sum(_row_metric(row, field) * max(1.0, _to_float(row.get("sample_count"), 0)) * max(1.0, _to_float(row.get("_similarity"), 0)) for row in selected) / total_basis
+
+    sample_count = int(sum(max(0.0, _to_float(row.get("sample_count"), 0)) for row in selected))
+    metrics = {field: round(weighted(field), 6) for field in METRIC_FIELDS}
+    confidence = weighted("confidence") if "confidence" in METRIC_FIELDS else 0
+    confidence = sum(_clamp(row.get("confidence"), 0) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
+    data_quality = sum(_clamp(row.get("data_quality"), 50) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
+    similarity = sum(_to_float(row.get("_similarity"), 0) * max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected) / max(sum(max(1.0, _to_float(row.get("sample_count"), 0)) for row in selected), 1)
+    aggregate = {
+        **metrics,
+        "matched_sample_count": sample_count,
+        "confidence": round(confidence, 2),
+        "data_quality": round(data_quality, 2),
+        "similarity": round(similarity, 2),
+        "exact_state_code": any(str(row.get("state_code")) == str(state_code) for row in selected),
+        "top_matches": [
+            {
+                "symbol": row.get("symbol"),
+                "symbol_group": row.get("symbol_group"),
+                "state_code": row.get("state_code"),
+                "sample_count": int(_to_float(row.get("sample_count"), 0)),
+                "similarity": row.get("_similarity"),
+                "confidence": row.get("confidence"),
+                "data_quality": row.get("data_quality"),
+            }
+            for row in selected[:5]
+        ],
+    }
+    return aggregate, warnings
+
+
+def _read_candidate_rows(
+    level: str,
+    experience_library_path: str | None,
+    exact_filters: list[tuple[str, str, Any]],
+    broad_filters: list[tuple[str, str, Any]],
+) -> tuple[list[dict[str, Any]], list[str], list[str], bool]:
+    exact = load_experience_level_records(level, experience_library_path, filters=exact_filters)
+    warnings = list(exact.get("warnings") or [])
+    errors = list(exact.get("errors") or [])
+    rows = list(exact.get("records") or [])
+    if rows:
+        return rows, warnings, errors, True
+    broad = load_experience_level_records(level, experience_library_path, filters=broad_filters)
+    warnings.extend(str(item) for item in list(broad.get("warnings") or []) if item not in warnings)
+    errors.extend(str(item) for item in list(broad.get("errors") or []) if item not in errors)
+    return list(broad.get("records") or []), warnings, errors, False
+
+
+def _match_level(level: str, query: dict[str, Any], experience_library_path: str | None, top_k: int) -> dict[str, Any]:
+    symbol = str(query.get("symbol") or "").upper()
+    state_code = query.get("state_code")
+    groups = [str(x) for x in list(query.get("symbol_group_candidates") or [query.get("symbol_group")]) if x]
+    query_vector = query.get("state_vector") if isinstance(query.get("state_vector"), dict) else {}
+    if level == "symbol_level":
+        scope_type = "SYMBOL"
+        rows, warnings, errors, exact = _read_candidate_rows(
+            level,
+            experience_library_path,
+            [("symbol", "==", symbol), ("state_code", "==", state_code)],
+            [("symbol", "==", symbol)],
+        )
+        rows = [row for row in rows if _scope_matches(row, {"symbol"}) and str(row.get("symbol") or "").upper() == symbol]
+    elif level == "group_level":
+        scope_type = "GROUP"
+        rows = []
+        warnings = []
+        errors = []
+        exact = False
+        for group in groups:
+            found, level_warnings, level_errors, level_exact = _read_candidate_rows(
+                level,
+                experience_library_path,
+                [("symbol_group", "==", group), ("state_code", "==", state_code)],
+                [("symbol_group", "==", group)],
+            )
+            warnings.extend(item for item in level_warnings if item not in warnings)
+            errors.extend(item for item in level_errors if item not in errors)
+            rows = [row for row in found if _scope_matches(row, {"group", "symbol_group"}) and str(row.get("symbol_group") or "") == group]
+            exact = level_exact
+            if rows:
+                break
+    else:
+        scope_type = "GLOBAL"
+        rows, warnings, errors, exact = _read_candidate_rows(
+            level,
+            experience_library_path,
+            [("state_code", "==", state_code)],
+            [],
+        )
+        rows = [row for row in rows if _scope_matches(row, {"global"})]
+
+    if errors and not rows:
+        return {**_empty_level(scope_type, "该层经验读取失败。"), "available": False, "warnings": warnings, "errors": errors}
+    if not rows:
+        return {**_empty_level(scope_type), "available": not errors, "warnings": warnings, "errors": errors}
+    if not exact:
+        rows = sorted(rows, key=lambda row: _state_code_distance(state_code, row.get("state_code")))[: max(top_k * 3, 10)]
+        warnings.append("exact state_code 未命中，已按相近 state_code fallback。")
+    aggregate, sim_warnings = _aggregate_rows(rows, query_vector, state_code, top_k)
+    return {
+        **_empty_level(scope_type),
+        **aggregate,
+        "available": True,
+        "matched": True,
+        "match_type": "exact_state_code" if exact else "similar_state_code",
+        "reason": "命中 exact state_code。" if exact else "未命中 exact state_code，使用相近状态 fallback。",
+        "warnings": warnings + [item for item in sim_warnings if item not in warnings],
+        "errors": errors,
+    }
+
+
+def _base_layer_weights(symbol_sample_count: int) -> dict[str, float]:
+    if symbol_sample_count >= 300:
+        return {"symbol_level": 0.60, "group_level": 0.25, "global_level": 0.15}
+    if symbol_sample_count >= 100:
+        return {"symbol_level": 0.35, "group_level": 0.45, "global_level": 0.20}
+    return {"symbol_level": 0.10, "group_level": 0.60, "global_level": 0.30}
+
+
+def _effective_weights(levels: dict[str, dict[str, Any]]) -> dict[str, float]:
+    base = _base_layer_weights(int(_to_float(levels["symbol_level"].get("matched_sample_count"), 0)))
+    adjusted: dict[str, float] = {}
+    for key, level in levels.items():
+        if not level.get("matched"):
+            adjusted[key] = 0.0
+            continue
+        quality_factor = max(0.05, _clamp(level.get("confidence"), 0) / 100 * _clamp(level.get("data_quality"), 50) / 100 * _clamp(level.get("similarity"), 60) / 100)
+        adjusted[key] = base.get(key, 0.0) * quality_factor
+    total = sum(adjusted.values())
+    if total <= 0:
+        matched = [key for key, level in levels.items() if level.get("matched")]
+        return {key: (1 / len(matched) if key in matched and matched else 0.0) for key in levels}
+    return {key: round(value / total, 6) for key, value in adjusted.items()}
+
+
+def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict[str, Any]:
+    result = {field: 0.0 for field in METRIC_FIELDS}
+    for field in METRIC_FIELDS:
+        result[field] = round(sum(_to_float(levels[key].get(field), 0) * weights.get(key, 0) for key in levels), 6)
+    matched_layers = [levels[key].get("scope_type") for key in levels if levels[key].get("matched")]
+    result.update(
+        {
+            "matched": bool(matched_layers),
+            "matched_layers": matched_layers,
+            "matched_sample_count": int(sum(_to_float(level.get("matched_sample_count"), 0) for level in levels.values() if level.get("matched"))),
+            "experience_confidence": round(sum(_clamp(levels[key].get("confidence"), 0) * weights.get(key, 0) for key in levels), 2),
+            "experience_data_quality": round(sum(_clamp(levels[key].get("data_quality"), 0) * weights.get(key, 0) for key in levels), 2),
+            "layer_weights": weights,
+        }
+    )
+    return result
+
+
+def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[str, Any]:
+    if not blended.get("matched"):
+        return {"vote": "ABSTAIN", "direction": "WAIT", "score": 0, "confidence": 0, "data_integrity_score": 0, "reason": "三层经验均未命中，经验委员弃权。"}
+    up30 = _to_float(blended.get("historical_30m_up_probability"), 0)
+    down30 = _to_float(blended.get("historical_30m_down_probability"), 0)
+    avg30 = _to_float(blended.get("avg_return_30m"), 0)
+    mfe90 = abs(_to_float(blended.get("mfe_p90"), 0))
+    mae90 = abs(_to_float(blended.get("mae_p90"), 0))
+    loss_probability = _to_float(blended.get("historical_loss_probability"), 0)
+    trap_risk = _to_float(blended.get("trap_risk_avg"), _to_float((query.get("state_vector") or {}).get("trap_risk_score"), 0))
+    confidence = _clamp(blended.get("experience_confidence"), 0)
+    data_quality = _clamp(blended.get("experience_data_quality"), 0)
+    sample_score = min(20.0, math.log10(max(_to_float(blended.get("matched_sample_count"), 0), 1)) * 8)
+    prob_edge = up30 - down30
+    return_score = max(-15.0, min(15.0, avg30 * 5000))
+    rr_score = max(0.0, min(20.0, (mfe90 / max(mae90, 0.0001)) * 8))
+    score = _clamp(50 + prob_edge * 0.45 + return_score + rr_score + sample_score * 0.5 + data_quality * 0.10 - trap_risk * 0.18 - loss_probability * 0.22)
+    if confidence < 30 or _to_float(blended.get("matched_sample_count"), 0) < 20:
+        vote = "ABSTAIN"
+        direction = "WAIT"
+    elif data_quality < 35 or mae90 >= 0.08 or loss_probability >= 70:
+        vote = "VETO" if mae90 >= 0.12 or data_quality < 20 else "OPPOSE"
+        direction = "WAIT"
+    elif down30 >= 60:
+        vote = "OPPOSE"
+        direction = "SHORT"
+    elif up30 >= 60 and avg30 > 0 and mae90 <= max(0.06, mfe90 * 2.2):
+        vote = "SUPPORT" if score >= 70 and confidence >= 50 else "CAUTIOUS_SUPPORT"
+        direction = "LONG"
+    elif up30 >= 55:
+        vote = "CAUTIOUS_SUPPORT"
+        direction = "LONG"
+    else:
+        vote = "ABSTAIN" if score < 45 else "CAUTIOUS_SUPPORT"
+        direction = "WAIT" if vote == "ABSTAIN" else ("LONG" if up30 >= down30 else "SHORT")
+    layers = "、".join(str(item) for item in blended.get("matched_layers") or []) or "无"
+    reason = (
+        f"匹配层级：{layers}，总样本{int(_to_float(blended.get('matched_sample_count'), 0))}。"
+        f"30m上涨/震荡/下跌概率为{up30:.1f}%/{_to_float(blended.get('historical_30m_sideways_probability'), 0):.1f}%/{down30:.1f}%，"
+        f"60m上涨/震荡/下跌概率为{_to_float(blended.get('historical_60m_up_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_sideways_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_down_probability'), 0):.1f}%。"
+        f"MFE90约{mfe90:.4f}，MAE90约{mae90:.4f}，平均30m收益{avg30:.5f}。"
+        f"经验评分{score:.1f}，置信度{confidence:.1f}，数据质量{data_quality:.1f}，因此给出{vote}/{direction}。"
+    )
+    return {"vote": vote, "direction": direction, "score": round(score, 2), "confidence": round(confidence, 2), "data_integrity_score": round(data_quality, 2), "reason": reason}
+
+
+def match_experience(query: dict[str, Any], experience_library_path: str | None = None, top_k: int = 50) -> dict[str, Any]:
     status = check_experience_library_available(experience_library_path)
     if not status.get("available"):
+        reason = "经验库未接入或不可读，当前经验委员弃权。"
+        if status.get("warnings"):
+            reason = f"{reason}；{'; '.join(str(item) for item in list(status.get('warnings') or [])[:3])}"
         return {
             "available": False,
             "matched": False,
             "vote": "ABSTAIN",
+            "direction": "WAIT",
             "score": 0,
             "confidence": 0,
             "data_integrity_score": 0,
-            "reason": "经验库未接入，当前经验委员弃权。",
+            "reason": reason,
             "experience_library_path": status.get("path") or get_default_experience_library_path(),
             "experience_library_status": status,
             "query": query,
-            "symbol_level": _empty_level("SYMBOL"),
-            "group_level": _empty_level("GROUP"),
-            "global_level": _empty_level("GLOBAL"),
+            "symbol_level": _empty_level("SYMBOL", reason),
+            "group_level": _empty_level("GROUP", reason),
+            "global_level": _empty_level("GLOBAL", reason),
             "top_k": top_k,
         }
+
+    levels = {
+        "symbol_level": _match_level("symbol_level", query, experience_library_path, top_k),
+        "group_level": _match_level("group_level", query, experience_library_path, top_k),
+        "global_level": _match_level("global_level", query, experience_library_path, top_k),
+    }
+    weights = _effective_weights(levels)
+    for key, weight in weights.items():
+        levels[key]["weight"] = weight
+    blended = _blend(levels, weights)
+    vote = _vote_from_blended(blended, query)
+    all_warnings = []
+    for level in levels.values():
+        all_warnings.extend(str(item) for item in list(level.get("warnings") or []) if item not in all_warnings)
     return {
         "available": True,
-        "matched": False,
-        "vote": "ABSTAIN",
-        "score": 0,
-        "confidence": 0,
-        "data_integrity_score": 0,
-        "reason": "经验库文件已发现，但9.2.3仅预留读取接口，正式匹配将在9.4/9.5启用。",
+        **blended,
+        **vote,
         "experience_library_path": status.get("path") or get_default_experience_library_path(),
         "experience_library_status": status,
         "query": query,
-        "symbol_level": {**_empty_level("SYMBOL"), "available": bool(status.get("symbol_level_found"))},
-        "group_level": {**_empty_level("GROUP"), "available": bool(status.get("group_level_found"))},
-        "global_level": {**_empty_level("GLOBAL"), "available": bool(status.get("global_level_found"))},
+        "symbol_level": levels["symbol_level"],
+        "group_level": levels["group_level"],
+        "global_level": levels["global_level"],
+        "warnings": all_warnings,
         "top_k": top_k,
     }

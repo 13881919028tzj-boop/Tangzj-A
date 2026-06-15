@@ -1,4 +1,4 @@
-"""Safe status reader for future AI-Training-Factory experience libraries."""
+"""Safe status and data reader for AI-Training-Factory experience libraries."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ LEVEL_FILES = {
     "symbol_level": "symbol_level_experience",
     "group_level": "group_level_experience",
     "global_level": "global_level_experience",
+}
+LEVEL_REQUIRED_COLUMNS = {
+    "symbol_level": {"scope_type", "symbol", "state_code", "sample_count"},
+    "group_level": {"scope_type", "symbol_group", "state_code", "sample_count"},
+    "global_level": {"scope_type", "state_code", "sample_count"},
 }
 SUPPORTED_EXTENSIONS = (".parquet", ".jsonl", ".json", ".csv")
 
@@ -66,6 +71,87 @@ def _parquet_dependency_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _read_parquet_records(path: Path, filters: list[tuple[str, str, Any]] | None = None, columns: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    warnings: list[str] = []
+    errors: list[str] = []
+    try:
+        import pandas as pd
+        import pyarrow  # noqa: F401
+    except Exception as exc:
+        return [], ["缺少 pandas/pyarrow，无法读取 parquet 经验库。"], [repr(exc)]
+    try:
+        df = pd.read_parquet(path, filters=filters or None, columns=columns or None)
+    except Exception as exc:
+        return [], [f"经验库文件读取失败：{path.name}"], [repr(exc)]
+    return df.to_dict("records"), warnings, errors
+
+
+def load_experience_level_records(
+    level: str,
+    path: str | None = None,
+    *,
+    filters: list[tuple[str, str, Any]] | None = None,
+    columns: list[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Load one experience level with optional parquet filters.
+
+    The current factory output is small enough for direct reads.  Keeping the
+    filter/column boundary here lets the matcher move to partitioned or chunked
+    reads without changing its public contract.
+    """
+    base = _base_path(path)
+    stem = LEVEL_FILES.get(level)
+    if not stem:
+        return {"available": False, "records": [], "warnings": [], "errors": [f"未知经验层级：{level}"], "missing_columns": []}
+    level_path = _find_level_file(base, stem)
+    if not level_path:
+        return {"available": False, "records": [], "warnings": [f"{stem} 文件缺失，已跳过该层。"], "errors": [], "missing_columns": []}
+
+    warnings: list[str] = []
+    errors: list[str] = []
+    records: list[dict[str, Any]] = []
+    if level_path.suffix == ".parquet":
+        records, read_warnings, read_errors = _read_parquet_records(level_path, filters=filters, columns=columns)
+        warnings.extend(read_warnings)
+        errors.extend(read_errors)
+    elif level_path.suffix == ".json":
+        raw = _read_json(level_path)
+        items = raw.get("records") if isinstance(raw, dict) else []
+        records = items if isinstance(items, list) else []
+    elif level_path.suffix == ".jsonl":
+        try:
+            records = [json.loads(line) for line in level_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except Exception as exc:
+            errors.append(repr(exc))
+            warnings.append(f"经验库文件读取失败：{level_path.name}")
+    elif level_path.suffix == ".csv":
+        try:
+            import pandas as pd
+            df = pd.read_csv(level_path, usecols=columns or None)
+            records = df.to_dict("records")
+        except Exception as exc:
+            errors.append(repr(exc))
+            warnings.append(f"经验库文件读取失败：{level_path.name}")
+
+    if limit is not None and limit > 0:
+        records = records[:limit]
+    present = set(records[0].keys()) if records else set()
+    required = LEVEL_REQUIRED_COLUMNS.get(level, set())
+    missing_columns = sorted(required - present) if records else []
+    if missing_columns:
+        warnings.append(f"{stem} 字段缺失：{', '.join(missing_columns)}")
+    return {
+        "available": bool(level_path and not errors),
+        "file": str(level_path),
+        "records": records,
+        "row_count": len(records),
+        "warnings": warnings,
+        "errors": errors,
+        "missing_columns": missing_columns,
+    }
 
 
 def check_experience_library_available(path: str | None = None) -> dict[str, Any]:

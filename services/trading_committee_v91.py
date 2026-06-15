@@ -209,30 +209,54 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
         reason = f"当前状态码 {state_code} 已生成；{reason}"
     if library_summary.get("warnings"):
         reason = f"{reason}；{'; '.join(str(item) for item in library_summary.get('warnings', [])[:2])}"
-    return {
-        **abstain_member("经验委员", "experience", reason),
-        "enabled": False,
+    if match.get("vote") and match.get("vote") != VOTE_ABSTAIN:
+        result = member_result(
+            name="经验委员",
+            role="experience",
+            vote=str(match.get("vote")),
+            direction=str(match.get("direction") or DIRECTION_WAIT),
+            score=match.get("score", 0),
+            confidence=match.get("confidence", 0),
+            data_integrity_score=match.get("data_integrity_score", 0),
+            reason=reason,
+            evidence={
+                "matched_layers": match.get("matched_layers", []),
+                "matched_sample_count": match.get("matched_sample_count", 0),
+                "layer_weights": match.get("layer_weights", {}),
+                "historical_30m_up_probability": match.get("historical_30m_up_probability"),
+                "historical_30m_down_probability": match.get("historical_30m_down_probability"),
+                "mfe_p90": match.get("mfe_p90"),
+                "mae_p90": match.get("mae_p90"),
+            },
+            raw={},
+        )
+    else:
+        result = abstain_member("经验委员", "experience", reason, {"match_result": {"matched": match.get("matched"), "warnings": match.get("warnings", [])}})
+    result.update({
+        "enabled": bool(match.get("matched") and match.get("vote") != VOTE_ABSTAIN),
         "experience_library_available": bool(library_summary.get("available")),
         "experience_library_path": library_path,
         "experience_library_status": library_summary,
         "experience_library_version": library_summary.get("experience_version") or "none",
-        "sample_count": 0,
+        "sample_count": match.get("matched_sample_count", 0),
         "state_code": state_code,
         "state_vector_summary": query.get("state_vector_summary"),
         "symbol_group": query.get("symbol_group"),
+        "symbol_group_candidates": query.get("symbol_group_candidates", []),
         "experience_query": query,
-        "similar_sample_count": 0,
-        "matched_sample_count": 0,
-        "win_rate_30m": None,
-        "win_rate_60m": None,
-        "avg_return_30m": None,
-        "avg_return_60m": None,
-        "max_drawdown": None,
-        "max_profit": None,
-        "experience_score": None,
-        "experience_confidence": 0,
+        "similar_sample_count": match.get("matched_sample_count", 0),
+        "matched_sample_count": match.get("matched_sample_count", 0),
+        "win_rate_30m": match.get("historical_30m_up_probability"),
+        "win_rate_60m": match.get("historical_60m_up_probability"),
+        "avg_return_30m": match.get("avg_return_30m"),
+        "avg_return_60m": match.get("avg_return_60m"),
+        "max_drawdown": match.get("mae_p90"),
+        "max_profit": match.get("mfe_p90"),
+        "experience_score": match.get("score"),
+        "experience_confidence": match.get("confidence", 0),
         "match_result": match,
-    }
+    })
+    return result
 
 
 def build_market_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
@@ -445,7 +469,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.3",
+        "version": "AI模型 9.2.4 经验库匹配与经验委员实测接入版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,
