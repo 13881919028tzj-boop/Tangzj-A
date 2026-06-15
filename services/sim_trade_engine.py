@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from services.ai_committee_engine import get_committee_approved_signals
+from services.sim_trade_review_engine import (
+    record_close_result,
+    record_open_snapshot,
+    record_partial_close,
+    record_position_progress,
+)
 from services.trading_database import record_sim_close, record_sim_open
 
 
@@ -576,8 +582,11 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "entry_price": price,
         "current_price": price,
         "quantity": quantity,
+        "original_quantity": quantity,
         "margin_usdt": margin,
+        "original_margin_usdt": margin,
         "notional_usdt": _to_float(order.get("notional_usdt"), 0),
+        "original_notional_usdt": _to_float(order.get("notional_usdt"), 0),
         "leverage": int(order.get("leverage", 1)),
         "market_type": order.get("market_type", "futures"),
         "contract_type": order.get("contract_type", "USDT_PERPETUAL"),
@@ -591,6 +600,19 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "take_profit_2": _to_float(order.get("take_profit_2"), 0),
         "tp1_hit": False,
         "tp2_hit": False,
+        "partial_close_count": 0,
+        "highest_price_after_entry": price,
+        "lowest_price_after_entry": price,
+        "max_favorable_excursion": 0.0,
+        "max_adverse_excursion": 0.0,
+        "max_pnl_pct": 0.0,
+        "min_pnl_pct": 0.0,
+        "take_profit_1_hit": False,
+        "take_profit_2_hit": False,
+        "stop_loss_hit": False,
+        "trailing_stop_active": False,
+        "risk_state_changed": False,
+        "committee_signal_changed": False,
         "moved_stop_to_breakeven": False,
         "unrealized_pnl": 0.0,
         "unrealized_pnl_pct": 0.0,
@@ -605,6 +627,7 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "close_reason": "",
         "committee_snapshot": order.get("committee_snapshot"),
         "local_strategy_snapshot": order.get("local_strategy_snapshot"),
+        "position_pct": order.get("position_pct"),
     }
     positions = load_positions()
     positions.insert(0, position)
@@ -616,6 +639,10 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         record_sim_open(position)
     except Exception as exc:
         log_sim_event("模拟交易数据库写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"开仓记录未写入SQLite：{exc!r}")
+    try:
+        record_open_snapshot(position, account)
+    except Exception as exc:
+        log_sim_event("模拟交易复盘写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"开仓快照未写入：{exc!r}")
     return position
 
 
@@ -722,6 +749,14 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
         close_notional = _to_float(position.get("notional_usdt"), 0) * ratio
         pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), price, close_qty, str(position.get("direction")))
         released_margin = _to_float(position.get("margin_usdt"), 0) * ratio
+        if "止盈1" in reason:
+            position["tp1_hit"] = True
+            position["take_profit_1_hit"] = True
+        if "止盈2" in reason:
+            position["tp2_hit"] = True
+            position["take_profit_2_hit"] = True
+        if "止损" in reason:
+            position["stop_loss_hit"] = True
         position["realized_pnl"] = _to_float(position.get("realized_pnl"), 0) + pnl
         position["quantity"] = qty - close_qty
         position["margin_usdt"] = _to_float(position.get("margin_usdt"), 0) - released_margin
@@ -745,8 +780,16 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
                 account["consecutive_losses"] = int(account.get("consecutive_losses", 0)) + 1
             else:
                 account["consecutive_losses"] = 0
+            try:
+                record_close_result(position, trade, price, reason, pnl)
+            except Exception as exc:
+                log_sim_event("模拟交易复盘写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"平仓复盘未写入：{exc!r}")
         else:
             position["status"] = "partially_closed"
+            try:
+                record_partial_close(position, reason, price, pnl, ratio)
+            except Exception as exc:
+                log_sim_event("模拟交易复盘写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"部分平仓复盘未写入：{exc!r}")
         account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + _to_float(account.get("unrealized_pnl"), 0)
         account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + _to_float(account.get("unrealized_pnl"), 0)
         save_positions(positions)
@@ -866,27 +909,51 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
         position["r_multiple"] = pnl_info.get("r_multiple")
         position["holding_seconds"] = calculate_position_holding_time(position)["seconds"]
         position["update_time"] = _now()
-        unrealized_total += pnl
         direction = str(position.get("direction"))
+        entry = _to_float(position.get("entry_price"), 0)
+        previous_high = _to_float(position.get("highest_price_after_entry"), entry or price)
+        previous_low = _to_float(position.get("lowest_price_after_entry"), entry or price)
+        position["highest_price_after_entry"] = max(previous_high, price)
+        position["lowest_price_after_entry"] = min(previous_low, price)
+        if entry > 0:
+            if direction == "short":
+                mfe = entry / max(position["lowest_price_after_entry"], 0.00000001) - 1
+                mae = entry / max(position["highest_price_after_entry"], 0.00000001) - 1
+            else:
+                mfe = position["highest_price_after_entry"] / entry - 1
+                mae = position["lowest_price_after_entry"] / entry - 1
+            position["max_favorable_excursion"] = round(mfe * 100, 6)
+            position["max_adverse_excursion"] = round(mae * 100, 6)
+        position["max_pnl_pct"] = max(_to_float(position.get("max_pnl_pct"), _to_float(position.get("unrealized_pnl_pct"), 0)), _to_float(position.get("unrealized_pnl_pct"), 0))
+        position["min_pnl_pct"] = min(_to_float(position.get("min_pnl_pct"), _to_float(position.get("unrealized_pnl_pct"), 0)), _to_float(position.get("unrealized_pnl_pct"), 0))
+        try:
+            record_position_progress(position, price)
+        except Exception as exc:
+            log_sim_event("模拟交易复盘写入失败", symbol, direction, price, reason=f"持仓过程未写入：{exc!r}")
+        unrealized_total += pnl
         can_auto_exit = status in {"live", "ranking", "stale"}
         if can_auto_exit and check_stop_loss(position, price):
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=stop_loss price={price} status={status}")
+            position["stop_loss_hit"] = True
             close_sim_position(position["position_id"], "触发止损", price)
             external_position_change = True
             continue
         take_profit_hit = check_take_profit(position, price)
         if can_auto_exit and take_profit_hit == "tp1":
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_1 price={price} status={status}")
-            partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
             position["tp1_hit"] = True
+            position["take_profit_1_hit"] = True
+            partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
             if load_settings().get("move_sl_to_breakeven", True):
                 position["stop_loss"] = _to_float(position.get("entry_price"), position.get("stop_loss"))
                 position["moved_stop_to_breakeven"] = True
+                position["trailing_stop_active"] = True
                 log_sim_event("移动止损到保本", symbol, direction, price, reason="止盈1已触发。")
             external_position_change = True
         if can_auto_exit and take_profit_hit == "tp2":
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_2 price={price} status={status}")
             position["tp2_hit"] = True
+            position["take_profit_2_hit"] = True
             close_sim_position(position["position_id"], "触发止盈2", price)
             external_position_change = True
     if external_position_change:

@@ -235,6 +235,11 @@ from services.sim_trade_engine import (
     update_simulation,
     validate_signal_for_simulation,
 )
+from services.sim_trade_review_engine import (
+    build_feedback_summary,
+    load_feedback_summary,
+    load_sim_trade_reviews,
+)
 from services.system_operations import (
     get_system_operations_status,
     load_recent_log_lines,
@@ -277,9 +282,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.8"
+APP_TITLE = "AI模型 9.2.9"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.8 经验库版本选择与Funding_v1读取测试版"
+VERSION = "AI模型 9.2.9 模拟交易复盘与经验反馈记录版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -1637,6 +1642,24 @@ def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]
     """把当前委员会决议转换为模拟交易信号。"""
     if not decision:
         return {}
+    market_cognition = decision.get("market_cognition") if isinstance(decision.get("market_cognition"), dict) else {}
+    experience_library = decision.get("experience_library") if isinstance(decision.get("experience_library"), dict) else {}
+    experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
+    experience_match: dict[str, Any] = {}
+    if market_cognition:
+        try:
+            query = build_experience_query_from_cognition(str(decision.get("symbol") or ""), market_cognition)
+            experience_match = match_experience(query, experience_version=experience_version, top_k=50)
+        except Exception as exc:
+            experience_match = {
+                "available": False,
+                "matched": False,
+                "vote": "ABSTAIN",
+                "direction": "WAIT",
+                "confidence": 0,
+                "reason": f"模拟信号生成时经验匹配失败：{exc!r}",
+                "experience_library_version": experience_version,
+            }
     return {
         "symbol": decision.get("symbol"),
         "direction": decision.get("final_direction"),
@@ -1666,6 +1689,12 @@ def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]
         "system_position_suggestion": decision.get("system_position_suggestion"),
         "risk_max_position": decision.get("risk_max_position"),
         "manual_override_allowed": decision.get("manual_override_allowed"),
+        "market_cognition": market_cognition,
+        "experience_library": experience_library,
+        "experience_library_version": experience_version,
+        "experience_match": experience_match,
+        "trading_committee_v91": decision.get("trading_committee_v91"),
+        "vote_detail": decision.get("vote_detail"),
     }
 
 
@@ -5048,6 +5077,74 @@ def render_trading() -> None:
         target = low if price_value < low else high
         return f"{abs(price_value - target) / price_value * 100:.2f}%"
 
+    def render_sim_trade_review_panel() -> None:
+        reviews = load_sim_trade_reviews(100)
+        review_summary = load_feedback_summary() or build_feedback_summary(reviews)
+        version_stats = review_summary.get("by_experience_library_version") or {}
+        render_metric_grid(
+            [
+                ("总交易数", str(review_summary.get("total_trades", 0)), "blue"),
+                ("盈利交易数", str(review_summary.get("winning_trades", 0)), "green"),
+                ("亏损交易数", str(review_summary.get("losing_trades", 0)), "red"),
+                ("胜率", f"{float(review_summary.get('win_rate', 0) or 0):.2f}%", "green" if float(review_summary.get("win_rate", 0) or 0) >= 50 else "yellow"),
+                ("平均收益", pct(review_summary.get("avg_return_pct")), "green" if float(review_summary.get("avg_return_pct", 0) or 0) >= 0 else "red"),
+                ("平均最大浮盈", f"{float(review_summary.get('avg_max_favorable_excursion', 0) or 0):+.2f}%", "green"),
+                ("平均最大浮亏", f"{float(review_summary.get('avg_max_adverse_excursion', 0) or 0):+.2f}%", "red"),
+                ("止盈次数", str(review_summary.get("take_profit_count", 0)), "green"),
+                ("止损次数", str(review_summary.get("stop_loss_count", 0)), "red"),
+                ("验证经验库", str(review_summary.get("experience_validated_count", 0)), "green"),
+                ("推翻经验库", str(review_summary.get("experience_invalidated_count", 0)), "red"),
+                ("样本不足但盈利", str(review_summary.get("unknown_but_profit_count", 0)), "yellow"),
+                ("止损过紧", str(review_summary.get("tight_stop_loss_count", 0)), "red"),
+                ("止盈保守", str(review_summary.get("conservative_take_profit_count", 0)), "yellow"),
+            ]
+        )
+        version_cards = "".join(
+            f"""<div class="summary-card">
+              <div class="summary-label">{escape(version)} 经验库表现</div>
+              <div class="summary-value {'green' if float(item.get('total_pnl_usdt', 0) or 0) >= 0 else 'red'}">{float(item.get('total_pnl_usdt', 0) or 0):+.2f} USDT</div>
+              <div class="module-desc">交易 {int(item.get('trades', 0) or 0)}｜胜率 {float(item.get('win_rate', 0) or 0):.2f}%｜平均收益 {float(item.get('avg_pnl_pct', 0) or 0):+.2f}%</div>
+            </div>"""
+            for version, item in version_stats.items()
+        )
+        st.markdown(
+            f"""
+            <div class="app-shell"><div class="module-card">
+              <div class="module-title">经验库版本交易表现</div>
+              <div class="committee-grid">{version_cards or '<div class="status-card">暂无按经验库版本统计的平仓记录。</div>'}</div>
+            </div></div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if not reviews:
+            st.info("暂无模拟交易复盘记录。新开仓会记录开仓快照，最终平仓后会写入完整复盘。")
+            return
+        st.markdown('<div class="app-shell"><div class="module-card"><div class="module-title">最近模拟交易复盘</div>', unsafe_allow_html=True)
+        for review in reviews[:50]:
+            open_snapshot = review.get("open_snapshot") or {}
+            progress = review.get("position_progress") or {}
+            close_result = review.get("close_result") or {}
+            feedback = review.get("experience_feedback") or {}
+            pnl_pct = float(close_result.get("final_pnl_pct", 0) or 0)
+            pnl_usdt = float(close_result.get("final_pnl_usdt", 0) or 0)
+            state_code = str(open_snapshot.get("state_code") or "-")
+            feedback_label = str(feedback.get("experience_feedback_label") or "持仓中")
+            color = "green" if pnl_usdt > 0 else "red" if pnl_usdt < 0 else "yellow"
+            st.markdown(
+                f"""
+                <div class="status-card">
+                  <b>{kline_symbol_link(open_snapshot.get("symbol"), str(open_snapshot.get("symbol") or "-"))}</b>｜{direction_text(open_snapshot.get("side"))}｜{escape(str(close_result.get("close_reason") or review.get("status", "open")))}｜
+                  <span class="{color}">{pnl_usdt:+.2f} USDT / {pnl_pct:+.2f}%</span><br>
+                  入场：{format_waiting_price(open_snapshot.get("entry_price"))}　出场：{format_waiting_price(close_result.get("close_price"))}　持仓：{float(close_result.get("holding_minutes", progress.get("holding_minutes", 0)) or 0):.1f}分钟<br>
+                  最大浮盈：{float(progress.get("max_favorable_excursion", 0) or 0):+.2f}%　最大浮亏：{float(progress.get("max_adverse_excursion", 0) or 0):+.2f}%　部分止盈：{int(progress.get("partial_close_count", 0) or 0)}次<br>
+                  经验库：{escape(str(open_snapshot.get("experience_library_version") or "-"))}　state_code：{escape(state_code)}　经验委员：{escape(str(open_snapshot.get("experience_vote") or "-"))} / Confidence {float(open_snapshot.get("experience_confidence", 0) or 0):.1f}<br>
+                  经验反馈：<span class="{_signal_color(feedback_label)}">{escape(feedback_label)}</span>｜{escape(str(feedback.get("feedback_reason") or "持仓中，等待最终平仓后判断。"))}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div></div>", unsafe_allow_html=True)
+
     st.markdown(
         '<div class="app-shell"><div class="module-card warning-box"><b>模拟交易安全提示</b><br>当前为模拟交易，不会使用真实资金，不会执行真实订单。所有订单、持仓和盈亏均为本地模拟数据。</div></div>',
         unsafe_allow_html=True,
@@ -5087,7 +5184,7 @@ def render_trading() -> None:
         ]
     )
 
-    tabs = st.tabs(["账户总览", "当前持仓", "待触发订单", "交易历史", "统计分析", "参数设置", "事件日志"])
+    tabs = st.tabs(["账户总览", "当前持仓", "待触发订单", "交易历史", "统计分析", "模拟复盘", "参数设置", "事件日志"])
 
     with tabs[0]:
         risk = summary.get("risk_summary") or {}
@@ -5301,6 +5398,9 @@ def render_trading() -> None:
             st.info("暂无模拟交易历史，统计数据将在交易完成后生成。")
 
     with tabs[5]:
+        render_sim_trade_review_panel()
+
+    with tabs[6]:
         with st.form("sim_settings_form"):
             new_settings = dict(settings)
             new_settings["initial_balance"] = st.number_input("初始模拟资金 USDT", min_value=100.0, max_value=1000000.0, value=float(settings.get("initial_balance", 1000)), step=100.0)
@@ -5330,7 +5430,7 @@ def render_trading() -> None:
                 st.success("模拟交易参数已保存。")
                 st.rerun()
 
-    with tabs[6]:
+    with tabs[7]:
         if not events:
             st.info("当前暂无模拟事件。")
         for event in events[:80]:
