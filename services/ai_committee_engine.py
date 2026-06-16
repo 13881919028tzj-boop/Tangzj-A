@@ -54,6 +54,14 @@ try:
 except Exception:  # pragma: no cover
     build_market_cognition = None
 
+try:
+    from services.experience_fusion_engine import build_fused_experience_result
+    from services.experience_matcher import build_experience_query_from_cognition, match_experience
+except Exception:  # pragma: no cover
+    build_fused_experience_result = None
+    build_experience_query_from_cognition = None
+    match_experience = None
+
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 COMMITTEE_LOG_PATH = DATA_DIR / "committee_decision_log.json"
@@ -65,6 +73,7 @@ COMMITTEE_WEIGHTS = {
     "盘口委员": 6,
     "清算委员": 7,
     "大单 / 庄家委员": 8,
+    "经验委员": 8,
     "风险委员": 14,
     "实盘安全委员": 10,
     "DeepSeek委员": 10,
@@ -368,6 +377,9 @@ def collect_committee_inputs(symbol: str, **kwargs: Any) -> dict[str, Any]:
         "radar": kwargs.get("radar") or {},
         "local_strategy": kwargs.get("local_strategy") or {},
         "market_cognition": kwargs.get("market_cognition") or {},
+        "experience_mode": kwargs.get("experience_mode") or "single",
+        "fused_experience_result": kwargs.get("fused_experience_result") or {},
+        "experience_match_result": kwargs.get("experience_match_result") or {},
         "experience_library_version": kwargs.get("experience_library_version") or "current",
         "experience_library_path": kwargs.get("experience_library_path") or "",
         "experience_library_data_sources": kwargs.get("experience_library_data_sources") or "",
@@ -711,6 +723,94 @@ def run_strategy_validation_member(data: dict[str, Any]) -> dict[str, Any]:
     member["strategy_grade"] = grade
     member["simulation_status"] = simulation_status
     member["shadow"] = True
+    return member
+
+
+def _experience_vote_to_member_vote(vote: Any, direction: Any) -> tuple[str, str, bool, bool]:
+    vote_text = str(vote or "").strip().upper()
+    direction_text = str(direction or "").strip().upper()
+    normalized_direction = "long" if direction_text == "LONG" else "short" if direction_text == "SHORT" else "neutral"
+    if vote_text == "SUPPORT":
+        return "支持做多" if normalized_direction == "long" else "支持做空" if normalized_direction == "short" else "支持交易", normalized_direction, True, False
+    if vote_text == "CAUTIOUS_SUPPORT":
+        return "弱支持", normalized_direction, normalized_direction in {"long", "short"}, False
+    if vote_text == "OPPOSE":
+        return "反对交易", normalized_direction, False, False
+    if vote_text == "VETO":
+        return "反对交易", "neutral", False, False
+    return "建议观望", "neutral", False, False
+
+
+def run_experience_member(data: dict[str, Any]) -> dict[str, Any]:
+    mode = str(data.get("experience_mode") or "single")
+    cognition = data.get("market_cognition") or {}
+    symbol = str(data.get("symbol") or "BTCUSDT")
+    experience_result: dict[str, Any] = {}
+    if mode == "fused":
+        experience_result = data.get("fused_experience_result") or {}
+        if not experience_result and build_fused_experience_result and build_experience_query_from_cognition and cognition:
+            try:
+                query = build_experience_query_from_cognition(symbol, cognition)
+                experience_result = build_fused_experience_result(query, top_k=50)
+                data["fused_experience_result"] = experience_result
+            except Exception as exc:
+                experience_result = {"available": False, "fused_vote": "ABSTAIN", "fused_direction": "WAIT", "fused_confidence": 0, "reason": f"融合经验匹配失败：{exc!r}"}
+        vote_key = experience_result.get("fused_vote") or "ABSTAIN"
+        direction_key = experience_result.get("fused_direction") or "WAIT"
+        confidence = _to_int(experience_result.get("fused_confidence"), 0)
+        score = _to_int(experience_result.get("fused_score"), 0)
+        sample_count = _to_int(experience_result.get("matched_sample_count"), 0)
+        reason = str(experience_result.get("reason") or "融合经验暂无可用结论。")
+        risks = []
+        if not experience_result.get("available"):
+            risks.append("融合经验库不可用或未命中，经验委员弃权。")
+        if vote_key in {"OPPOSE", "VETO", "ABSTAIN"}:
+            risks.append(reason)
+        vote, direction, support, veto = _experience_vote_to_member_vote(vote_key, direction_key)
+        member = _member(
+            "经验委员",
+            direction,
+            confidence,
+            max(35, 100 - min(score, 85)),
+            vote,
+            support_trade=support,
+            veto=False,
+            reasons=[reason] if support else [f"融合经验投票：{vote_key}/{direction_key}，置信度 {confidence}/100，样本 {sample_count}。"],
+            risks=risks or ["历史经验只作为概率参考，仍需风险委员复核。"],
+            summary=f"经验库模式：融合模式，使用 fused_experience_result 参与委员会。",
+        )
+        member["experience_mode"] = "fused"
+        member["fused_experience_result"] = experience_result
+        return member
+
+    experience_result = data.get("experience_match_result") or {}
+    if not experience_result and match_experience and build_experience_query_from_cognition and cognition:
+        try:
+            query = build_experience_query_from_cognition(symbol, cognition)
+            experience_result = match_experience(query, experience_version=str(data.get("experience_library_version") or "current"), top_k=50)
+            data["experience_match_result"] = experience_result
+        except Exception as exc:
+            experience_result = {"available": False, "vote": "ABSTAIN", "direction": "WAIT", "confidence": 0, "reason": f"单库经验匹配失败：{exc!r}"}
+    vote_key = experience_result.get("vote") or "ABSTAIN"
+    direction_key = experience_result.get("direction") or "WAIT"
+    confidence = _to_int(experience_result.get("confidence"), 0)
+    sample_count = _to_int(experience_result.get("matched_sample_count"), 0)
+    reason = str(experience_result.get("reason") or "单库经验暂无可用结论。")
+    vote, direction, support, veto = _experience_vote_to_member_vote(vote_key, direction_key)
+    member = _member(
+        "经验委员",
+        direction,
+        confidence,
+        max(35, 100 - _to_int(experience_result.get("score"), 0)),
+        vote,
+        support_trade=support,
+        veto=False,
+        reasons=[reason] if support else [f"单库经验投票：{vote_key}/{direction_key}，置信度 {confidence}/100，样本 {sample_count}。"],
+        risks=[] if support else [reason],
+        summary=f"经验库模式：单库模式，当前版本 {data.get('experience_library_version') or 'current'}。",
+    )
+    member["experience_mode"] = "single"
+    member["experience_match_result"] = experience_result
     return member
 
 
@@ -1091,10 +1191,13 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
         "vote_detail": vote_result,
         "committee_weights": COMMITTEE_WEIGHTS,
         "experience_library": {
+            "mode": data.get("experience_mode") or "single",
             "version": data.get("experience_library_version") or "current",
             "path": data.get("experience_library_path") or "",
             "data_sources": data.get("experience_library_data_sources") or "",
-            "participates_in_trade_vote": False,
+            "participates_in_trade_vote": True,
+            "fused_experience_result": data.get("fused_experience_result") or {},
+            "experience_match_result": data.get("experience_match_result") or {},
         },
         "majority_rule": {
             "enabled": True,
@@ -1173,6 +1276,7 @@ def run_committee_meeting(symbol: str, **kwargs: Any) -> dict[str, Any]:
         run_whale_member,
         run_watchlist_member,
         run_strategy_validation_member,
+        run_experience_member,
         run_risk_member,
         run_live_safety_member,
     ]

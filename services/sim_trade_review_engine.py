@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_VERSION = "AI模型 9.2.10 多经验库版本选择与对比版"
+APP_VERSION = "AI模型 9.2.11 多经验库融合决策版"
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 REVIEW_DIR = DATA_DIR / "sim_trade_reviews"
 REVIEWS_JSONL_PATH = REVIEW_DIR / "sim_trade_reviews.jsonl"

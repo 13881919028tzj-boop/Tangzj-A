@@ -33,6 +33,7 @@ from services.experience_library_loader import (
     normalize_experience_library_version,
 )
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
+from services.experience_fusion_engine import build_fused_experience_result
 
 
 BASE_WEIGHTS = {
@@ -205,9 +206,59 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
     symbol = str(decision.get("symbol") or data.get("symbol") or cognition.get("symbol") or "").upper()
     ticker = data.get("ticker") or {}
     state_code = str(cognition.get("state_code") or "")
+    experience_mode = str(data.get("experience_mode") or "single")
     selected_version = normalize_experience_library_version(data.get("experience_library_version"))
     selected_path = str(data.get("experience_library_path") or get_experience_library_path(selected_version))
     query = build_experience_query_from_cognition(symbol, cognition, ticker=ticker)
+    if experience_mode == "fused":
+        fused = data.get("fused_experience_result") or build_fused_experience_result(query)
+        data["fused_experience_result"] = fused
+        reason = fused.get("reason") or "融合经验库未形成可用结论，当前经验委员弃权。"
+        if state_code:
+            reason = f"当前状态码 {state_code} 已生成；{reason}"
+        if fused.get("fused_vote") and fused.get("fused_vote") != VOTE_ABSTAIN:
+            result = member_result(
+                name="经验委员",
+                role="experience",
+                vote=str(fused.get("fused_vote")),
+                direction=str(fused.get("fused_direction") or DIRECTION_WAIT),
+                score=fused.get("fused_score", 0),
+                confidence=fused.get("fused_confidence", 0),
+                data_integrity_score=fused.get("fused_data_integrity_score", 0),
+                reason=reason,
+                evidence={
+                    "mode": "FUSED",
+                    "used_libraries": fused.get("used_libraries", []),
+                    "library_weights": fused.get("library_weights", {}),
+                    "matched_sample_count": fused.get("matched_sample_count", 0),
+                    "avg_similarity": fused.get("avg_similarity"),
+                    "historical_30m_up_probability": fused.get("historical_30m_up_probability"),
+                    "historical_30m_down_probability": fused.get("historical_30m_down_probability"),
+                    "historical_60m_up_probability": fused.get("historical_60m_up_probability"),
+                    "historical_60m_down_probability": fused.get("historical_60m_down_probability"),
+                },
+                raw={"fused_experience_result": fused},
+            )
+        else:
+            result = abstain_member("经验委员", "experience", reason, {"fused_experience_result": fused})
+        result.update({
+            "enabled": bool(fused.get("available") and fused.get("fused_vote") != VOTE_ABSTAIN),
+            "experience_mode": "fused",
+            "experience_library_available": bool(fused.get("available")),
+            "experience_library_path": "current + funding_v1 + oi_longshort_recent30_v1",
+            "experience_library_status": {"mode": "FUSED", "used_libraries": fused.get("used_libraries", [])},
+            "experience_library_version": "FUSED",
+            "experience_library_data_sources": "current + funding_v1 + oi_longshort_recent30_v1",
+            "sample_count": fused.get("matched_sample_count", 0),
+            "state_code": state_code,
+            "state_vector_summary": query.get("state_vector_summary"),
+            "symbol_group": query.get("symbol_group"),
+            "symbol_group_candidates": query.get("symbol_group_candidates", []),
+            "experience_query": query,
+            "similar_sample_count": fused.get("matched_sample_count", 0),
+        })
+        return result
+
     library_summary = load_experience_library_summary(selected_path, version=selected_version)
     match = match_experience(query, experience_library_path=selected_path, experience_version=selected_version)
     library_path = library_summary.get("path") or get_default_experience_library_path()
@@ -487,7 +538,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.10 多经验库版本选择与对比版",
+        "version": "AI模型 9.2.11 多经验库融合决策版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,

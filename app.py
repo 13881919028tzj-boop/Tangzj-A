@@ -126,6 +126,7 @@ from services.experience_library_loader import (
     get_experience_library_versions_status,
     load_experience_library_summary,
 )
+from services.experience_fusion_engine import build_fused_experience_result
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
 from services.market_risk_radar import analyze_market_risk_radar
 from services.market_scanner import scan_market_opportunities
@@ -282,9 +283,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.10"
+APP_TITLE = "AI模型 9.2.11"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.10 多经验库版本选择与对比版"
+VERSION = "AI模型 9.2.11 多经验库融合决策版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -297,6 +298,31 @@ EXPERIENCE_MATCH_LOG = LOG_DIR / "experience_match_debug.log"
 def get_selected_experience_library_version() -> str:
     selected = str(st.session_state.get("experience_library_version") or DEFAULT_EXPERIENCE_LIBRARY_VERSION)
     return selected if selected in EXPERIENCE_LIBRARY_VERSIONS else DEFAULT_EXPERIENCE_LIBRARY_VERSION
+
+
+def get_selected_experience_mode() -> str:
+    selected = str(st.session_state.get("experience_mode") or "single")
+    return "fused" if selected == "fused" else "single"
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def get_cached_experience_library_versions_status() -> dict[str, dict[str, Any]]:
+    return get_experience_library_versions_status()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_cached_experience_library_summary(version: str) -> dict[str, Any]:
+    return load_experience_library_summary(version=version)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def match_cached_experience(query: dict[str, Any], version: str, top_k: int = 50) -> dict[str, Any]:
+    return match_experience(query, experience_version=version, top_k=top_k)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def build_cached_fused_experience_result(query: dict[str, Any], top_k: int = 50) -> dict[str, Any]:
+    return build_fused_experience_result(query, top_k=top_k)
 
 
 def append_debug_log(path: Path, message: str) -> None:
@@ -357,6 +383,8 @@ def initialize_session_state() -> None:
         "committee_active_symbol": "BTCUSDT",
         "committee_review_queue_symbol": "BTCUSDT",
         "committee_anchor_source": "默认交易对象",
+        "experience_mode": "single",
+        "experience_library_version": DEFAULT_EXPERIENCE_LIBRARY_VERSION,
         "selected_opportunity_symbol": "",
         "topbar_symbol": "BTCUSDT",
         "kline_symbol": "BTCUSDT",
@@ -1499,6 +1527,7 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
     """为总览页生成与信号页同源的委员会精简决议。"""
     live_symbol = str(symbol or st.session_state.get("current_symbol", "BTCUSDT")).upper().strip()
     experience_version = get_selected_experience_library_version()
+    experience_mode = get_selected_experience_mode()
     interval = market_cache.get_kline_interval()
     rows = market_cache.get_klines(live_symbol, interval)
     passed_symbol = str((ticker or {}).get("symbol") or "").upper().strip()
@@ -1551,9 +1580,14 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
         radar=radar,
         local_strategy=strategy,
         market_cognition=market_cognition,
+        experience_mode=experience_mode,
         experience_library_version=experience_version,
         experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
-        experience_library_data_sources=get_experience_library_data_sources(experience_version),
+        experience_library_data_sources=(
+            "current + funding_v1 + oi_longshort_recent30_v1"
+            if experience_mode == "fused"
+            else get_experience_library_data_sources(experience_version)
+        ),
     )
 
 
@@ -1573,6 +1607,7 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
     opposing = list(decision.get("opposing_members") or [])
     veto_members = list(decision.get("veto_members") or [])
     experience_library = decision.get("experience_library") or {}
+    committee_experience_mode = str(experience_library.get("mode") or get_selected_experience_mode())
     committee_experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
     committee_experience_sources = str(experience_library.get("data_sources") or get_experience_library_data_sources(committee_experience_version))
     committee_experience_path = str(experience_library.get("path") or EXPERIENCE_LIBRARY_VERSIONS.get(committee_experience_version, ""))
@@ -1622,7 +1657,7 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">风险裁判</div><div class="summary-value {_signal_color("禁止开仓" if v91_risk.get("blocked") else "支持交易")}">{escape(str(v91_risk.get("risk_verdict", "WAIT")))}</div></div>
               <div class="summary-card"><div class="summary-label">仓位委员会</div><div class="summary-value yellow">{float(v91_position.get("position_size_pct", 0) or 0):.2f}% / {int(v91_position.get("leverage", 1) or 1)}x</div></div>
               <div class="summary-card"><div class="summary-label">执行委员会</div><div class="summary-value {_signal_color("支持交易" if v91_execution.get("execution_allowed") else "反对交易")}">{escape(str(v91_execution.get("execution_type", "WAIT")))}</div></div>
-              <div class="summary-card"><div class="summary-label">经验库版本</div><div class="summary-value blue">{escape(committee_experience_version)}</div><div class="module-desc">{escape(committee_experience_sources)}｜不参与交易委员会正式投票</div></div>
+              <div class="summary-card"><div class="summary-label">经验库模式</div><div class="summary-value blue">{escape("融合模式" if committee_experience_mode == "fused" else "单库模式")}</div><div class="module-desc">{escape(committee_experience_version)}｜{escape(committee_experience_sources)}｜经验委员参与正式投票</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;"><b>经验库路径</b><br>{escape(committee_experience_path or "-")}</div>
             {_render_committee_summary_panel(decision)}
@@ -1644,9 +1679,14 @@ def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]
         return {}
     market_cognition = decision.get("market_cognition") if isinstance(decision.get("market_cognition"), dict) else {}
     experience_library = decision.get("experience_library") if isinstance(decision.get("experience_library"), dict) else {}
+    experience_mode = str(experience_library.get("mode") or get_selected_experience_mode())
     experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
     experience_match: dict[str, Any] = {}
-    if market_cognition:
+    if experience_mode == "fused" and isinstance(experience_library.get("fused_experience_result"), dict):
+        experience_match = experience_library.get("fused_experience_result") or {}
+    elif isinstance(experience_library.get("experience_match_result"), dict) and experience_library.get("experience_match_result"):
+        experience_match = experience_library.get("experience_match_result") or {}
+    elif market_cognition:
         try:
             query = build_experience_query_from_cognition(str(decision.get("symbol") or ""), market_cognition)
             experience_match = match_experience(query, experience_version=experience_version, top_k=50)
@@ -1691,6 +1731,7 @@ def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]
         "manual_override_allowed": decision.get("manual_override_allowed"),
         "market_cognition": market_cognition,
         "experience_library": experience_library,
+        "experience_mode": experience_mode,
         "experience_library_version": experience_version,
         "experience_match": experience_match,
         "trading_committee_v91": decision.get("trading_committee_v91"),
@@ -3282,11 +3323,21 @@ def render_cognition_snapshot_validation_panel() -> None:
 def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     """Render experience-library status and live matching result."""
     symbol = str(cognition.get("symbol") or st.session_state.get("current_symbol", "")).upper()
-    version_statuses = get_experience_library_versions_status()
+    version_statuses = get_cached_experience_library_versions_status()
     version_options = list(EXPERIENCE_LIBRARY_VERSIONS.keys())
     current_version = get_selected_experience_library_version()
     if st.session_state.get("experience_library_version") not in version_options:
         st.session_state["experience_library_version"] = DEFAULT_EXPERIENCE_LIBRARY_VERSION
+    if st.session_state.get("experience_mode") not in {"single", "fused"}:
+        st.session_state["experience_mode"] = "single"
+    selected_mode = st.radio(
+        "经验库模式",
+        ["single", "fused"],
+        index=1 if get_selected_experience_mode() == "fused" else 0,
+        format_func=lambda mode: "融合模式" if mode == "fused" else "单库模式",
+        horizontal=True,
+        key="experience_mode",
+    )
     selected_version = st.selectbox(
         "经验库版本选择",
         version_options,
@@ -3298,8 +3349,8 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         key="experience_library_version",
     )
     query = build_experience_query_from_cognition(symbol, cognition)
-    summary = load_experience_library_summary(version=selected_version)
-    match = match_experience(query, experience_version=selected_version)
+    summary = load_cached_experience_library_summary(selected_version)
+    match = match_cached_experience(query, selected_version)
     market_cognition_state_code = str(cognition.get("state_code") or "")
     experience_query_state_code = str(query.get("experience_query_state_code") or query.get("state_code") or "")
     state_code_consistent = market_cognition_state_code == experience_query_state_code
@@ -3353,9 +3404,10 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     group_level = match.get("group_level") or {}
     global_level = match.get("global_level") or {}
     comparison_matches = {
-        version: match_experience(query, experience_version=version)
+        version: match_cached_experience(query, version)
         for version in version_options
     }
+    fused_result = build_cached_fused_experience_result(query) if selected_mode == "fused" else {}
     total_samples = int(float(match.get("matched_sample_count") or 0))
     exact_samples = int(float(match.get("exact_sample_count") or 0))
     similar_samples = int(float(match.get("similar_state_sample_count") or 0))
@@ -3424,12 +3476,64 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
           <div class="module-desc">{escape(notice)}</div>
         </div>"""
     comparison_cards = "".join(_comparison_card(version, comparison_matches.get(version) or {}) for version in version_options)
+    def _fusion_library_card(version: str, item: dict[str, Any], weight: Any) -> str:
+        available = bool(item.get("available") and item.get("matched"))
+        notice = "最近30天 OI / 多空比修正库，不是长期历史库。" if version == "oi_longshort_recent30_v1" else ""
+        if not available:
+            return f"""<div class="summary-card">
+              <div class="summary-label">{escape(version)}</div>
+              <div class="summary-value red">未使用</div>
+              <div class="module-desc">权重：0.0%｜{escape(str(item.get("reason") or "不可用或未命中"))}</div>
+              <div class="module-desc">{escape(notice)}</div>
+            </div>"""
+        return f"""<div class="summary-card">
+          <div class="summary-label">{escape(version)}</div>
+          <div class="summary-value {_signal_color(str(item.get("vote", "ABSTAIN")))}">{escape(str(item.get("vote", "ABSTAIN")))} / {escape(str(item.get("direction", "WAIT")))}</div>
+          <div class="module-desc">权重：{_plain(weight)}%｜样本数：{int(float(item.get("matched_sample_count") or 0))}</div>
+          <div class="module-desc">30m上涨概率：{_pct(item.get("historical_30m_up_probability"))}｜60m上涨概率：{_pct(item.get("historical_60m_up_probability"))}</div>
+          <div class="module-desc">ExperienceConfidence：{_plain(item.get("confidence"))} / 100</div>
+          <div class="module-desc">{escape(notice)}</div>
+        </div>"""
+    fused_library_results = fused_result.get("library_results") if isinstance(fused_result.get("library_results"), dict) else {}
+    fused_weights = fused_result.get("library_weights") if isinstance(fused_result.get("library_weights"), dict) else {}
+    fused_library_cards = "".join(
+        _fusion_library_card(version, fused_library_results.get(version) or comparison_matches.get(version) or {}, fused_weights.get(version, 0))
+        for version in version_options
+    )
+    fused_panel = ""
+    if selected_mode == "fused":
+        fused_panel = f"""
+            <div class="status-card" style="margin-top:8px;">
+              <b>多经验库融合结果</b><br>
+              使用的经验库：{escape("、".join(str(x) for x in list(fused_result.get("used_libraries") or [])) or "无")}<br>
+              权重：{escape(", ".join(f"{k}={v:.1f}%" for k, v in (fused_weights or {}).items()) or "无可用权重")}<br>
+              明确提示：oi_longshort_recent30_v1 是最近30天修正库，不是长期历史库。
+            </div>
+            <div class="committee-grid" style="margin-top:8px;">
+              {fused_library_cards}
+            </div>
+            <div class="committee-grid" style="margin-top:8px;">
+              <div class="summary-card"><div class="summary-label">fused_vote</div><div class="summary-value {_signal_color(str(fused_result.get("fused_vote", "ABSTAIN")))}">{escape(str(fused_result.get("fused_vote", "ABSTAIN")))}</div><div class="module-desc">direction：{escape(str(fused_result.get("fused_direction", "WAIT")))}</div></div>
+              <div class="summary-card"><div class="summary-label">fused_score</div><div class="summary-value blue">{_plain(fused_result.get("fused_score"))}</div></div>
+              <div class="summary-card"><div class="summary-label">fused_confidence</div><div class="summary-value blue">{_plain(fused_result.get("fused_confidence"))} / 100</div></div>
+              <div class="summary-card"><div class="summary-label">30m融合概率</div><div class="summary-value blue">涨{_pct(fused_result.get("historical_30m_up_probability"))}</div><div class="module-desc">震荡{_pct(fused_result.get("historical_30m_sideways_probability"))}｜跌{_pct(fused_result.get("historical_30m_down_probability"))}</div></div>
+              <div class="summary-card"><div class="summary-label">60m融合概率</div><div class="summary-value blue">涨{_pct(fused_result.get("historical_60m_up_probability"))}</div><div class="module-desc">震荡{_pct(fused_result.get("historical_60m_sideways_probability"))}｜跌{_pct(fused_result.get("historical_60m_down_probability"))}</div></div>
+              <div class="summary-card"><div class="summary-label">融合样本</div><div class="summary-value yellow">{int(float(fused_result.get("matched_sample_count") or 0))}</div><div class="module-desc">平均相似度：{_plain(fused_result.get("avg_similarity"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止损</div><div class="summary-value {_signal_color(str(fused_result.get("suggested_stop_loss", 0)))}">{_ret_pct(fused_result.get("suggested_stop_loss"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止盈1</div><div class="summary-value green">{_ret_pct(fused_result.get("suggested_take_profit_1"))}</div></div>
+              <div class="summary-card"><div class="summary-label">建议止盈2</div><div class="summary-value green">{_ret_pct(fused_result.get("suggested_take_profit_2"))}</div></div>
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>融合 reason</b><br>
+              {escape(str(fused_result.get("reason") or "融合经验暂无结论。"))}
+            </div>
+        """
     render_html(
         f"""
         <div class="app-shell">
           <div class="module-card">
             <div class="module-title">经验匹配结果</div>
-            <div class="module-desc">经验委员按单币种、同类币种、全市场三层经验匹配当前市场认知，只输出建议和投票。当前使用：{escape(selected_version)}。</div>
+            <div class="module-desc">经验委员按单币种、同类币种、全市场三层经验匹配当前市场认知。当前模式：{escape("融合模式" if selected_mode == "fused" else "单库模式")}；单库选择：{escape(selected_version)}。</div>
             <div class="committee-grid">
               {version_rows}
             </div>
@@ -3495,11 +3599,12 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>三库对比</b><br>
-              三库对比只是参考展示；交易委员会实际投票只使用用户当前选择的经验库版本：{escape(selected_version)}。
+              {escape("融合模式下，交易委员会经验委员使用 fused_experience_result 参与正式投票。" if selected_mode == "fused" else f"单库模式下，交易委员会经验委员使用用户当前选择的经验库版本：{selected_version}。")}
             </div>
             <div class="committee-grid" style="margin-top:8px;">
               {comparison_cards}
             </div>
+            {fused_panel}
             <div class="status-card" style="margin-top:8px;">
               <b>经验委员理由</b><br>
               {escape(str(match.get("reason") or summary.get("message") or "经验库未接入，当前经验委员弃权。"))}
@@ -4805,6 +4910,7 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
     render_local_strategy_decision(strategy)
     render_market_cognition_panel(market_cognition)
     experience_version = get_selected_experience_library_version()
+    experience_mode = get_selected_experience_mode()
     committee_decision = run_committee_meeting(
         symbol,
         ticker=live_ticker,
@@ -4819,9 +4925,14 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         radar=radar,
         local_strategy=strategy,
         market_cognition=market_cognition,
+        experience_mode=experience_mode,
         experience_library_version=experience_version,
         experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
-        experience_library_data_sources=get_experience_library_data_sources(experience_version),
+        experience_library_data_sources=(
+            "current + funding_v1 + oi_longshort_recent30_v1"
+            if experience_mode == "fused"
+            else get_experience_library_data_sources(experience_version)
+        ),
     )
     market_cognition_with_committee = dict(market_cognition)
     market_cognition_with_committee["committee_final_action"] = committee_decision.get("final_action")
