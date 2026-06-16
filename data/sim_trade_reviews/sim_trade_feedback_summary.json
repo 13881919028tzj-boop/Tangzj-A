@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-06-16 02:03:01",
+  "total_trades": 2,
+  "winning_trades": 1,
+  "losing_trades": 1,
+  "win_rate": 50.0,
+  "avg_return_pct": 13878.368498,
+  "avg_max_favorable_excursion": 0.0,
+  "avg_max_adverse_excursion": -3.603512,
+  "take_profit_count": 0,
+  "stop_loss_count": 2,
+  "by_experience_library_version": {
+    "current": {
+      "trades": 2,
+      "wins": 1,
+      "losses": 1,
+      "total_pnl_usdt": -38.536285,
+      "avg_pnl_pct": 13878.368498,
+      "win_rate": 50.0
+    }
+  },
+  "experience_validated_count": 1,
+  "experience_invalidated_count": 1,
+  "unknown_but_profit_count": 0,
+  "tight_stop_loss_count": 0,
+  "conservative_take_profit_count": 0
+}

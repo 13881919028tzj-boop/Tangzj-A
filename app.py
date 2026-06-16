@@ -282,9 +282,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.9"
+APP_TITLE = "AI模型 9.2.10"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.9 模拟交易复盘与经验反馈记录版"
+VERSION = "AI模型 9.2.10 多经验库版本选择与对比版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -3352,6 +3352,10 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     symbol_level = match.get("symbol_level") or {}
     group_level = match.get("group_level") or {}
     global_level = match.get("global_level") or {}
+    comparison_matches = {
+        version: match_experience(query, experience_version=version)
+        for version in version_options
+    }
     total_samples = int(float(match.get("matched_sample_count") or 0))
     exact_samples = int(float(match.get("exact_sample_count") or 0))
     similar_samples = int(float(match.get("similar_state_sample_count") or 0))
@@ -3394,6 +3398,32 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     used_group = str(group_level.get("used_symbol_group") or primary_group or "-")
     consistency_text = "一致" if state_code_consistent else "不一致"
     consistency_color = "green" if state_code_consistent else "red"
+    def _comparison_card(version: str, item: dict[str, Any]) -> str:
+        item_status = item.get("experience_library_status") or version_statuses.get(version) or {}
+        available = bool(item.get("available") and item_status.get("available"))
+        notice = ""
+        if version == "oi_longshort_recent30_v1":
+            notice = "该经验库仅覆盖最近30天 OI / 多空比样本，不代表半年完整历史。"
+        if not available:
+            return f"""<div class="summary-card">
+              <div class="summary-label">{escape(version)}</div>
+              <div class="summary-value red">不可用</div>
+              <div class="module-desc">{escape(str(item_status.get("message") or item.get("reason") or "经验库不可用。"))}</div>
+              <div class="module-desc">{escape(str(item_status.get("path") or EXPERIENCE_LIBRARY_VERSIONS.get(version, "")))}</div>
+              <div class="module-desc">{escape(notice)}</div>
+            </div>"""
+        return f"""<div class="summary-card">
+          <div class="summary-label">{escape(version)}</div>
+          <div class="summary-value {_signal_color(str(item.get("vote", "ABSTAIN")))}">{escape(str(item.get("vote", "ABSTAIN")))} / {escape(str(item.get("direction", "WAIT")))}</div>
+          <div class="module-desc">30m上涨概率：{_pct(item.get("historical_30m_up_probability"))}</div>
+          <div class="module-desc">60m上涨概率：{_pct(item.get("historical_60m_up_probability"))}</div>
+          <div class="module-desc">建议止损：{_ret_pct(item.get("suggested_stop_loss"))}</div>
+          <div class="module-desc">建议止盈1：{_ret_pct(item.get("suggested_take_profit_1"))}</div>
+          <div class="module-desc">建议止盈2：{_ret_pct(item.get("suggested_take_profit_2"))}</div>
+          <div class="module-desc">ExperienceConfidence：{_plain(item.get("confidence"))} / 100</div>
+          <div class="module-desc">{escape(notice)}</div>
+        </div>"""
+    comparison_cards = "".join(_comparison_card(version, comparison_matches.get(version) or {}) for version in version_options)
     render_html(
         f"""
         <div class="app-shell">
@@ -3462,6 +3492,13 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">建议止盈1</div><div class="summary-value green">{_ret_pct(match.get("suggested_take_profit_1"))}</div></div>
               <div class="summary-card"><div class="summary-label">建议止盈2</div><div class="summary-value green">{_ret_pct(match.get("suggested_take_profit_2"))}</div><div class="module-desc">移动止损 {_ret_pct(match.get("suggested_trailing_stop"))}</div></div>
               <div class="summary-card"><div class="summary-label">经验委员投票</div><div class="summary-value {_signal_color(str(match.get("vote", "ABSTAIN")))}">{escape(str(match.get("vote", "ABSTAIN")))} / {escape(str(match.get("direction", "WAIT")))}</div><div class="module-desc">Score {_plain(match.get("score"))}｜ExperienceConfidence {_plain(match.get("confidence"))}｜DataIntegrity {_plain(match.get("data_integrity_score"))}</div></div>
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>三库对比</b><br>
+              三库对比只是参考展示；交易委员会实际投票只使用用户当前选择的经验库版本：{escape(selected_version)}。
+            </div>
+            <div class="committee-grid" style="margin-top:8px;">
+              {comparison_cards}
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>经验委员理由</b><br>

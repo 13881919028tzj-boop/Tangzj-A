@@ -11,14 +11,17 @@ DEFAULT_EXPERIENCE_LIBRARY_VERSION = "current"
 EXPERIENCE_LIBRARY_VERSIONS = {
     "current": "/data/ai-training-data/experience_library/current",
     "funding_v1": "/data/ai-training-data/experience_library/funding_v1",
+    "oi_longshort_recent30_v1": "/data/ai-training-data/experience_library/oi_longshort_recent30_v1",
 }
 EXPERIENCE_LIBRARY_LABELS = {
     "current": "K线版经验库",
     "funding_v1": "K线 + Funding 增强版经验库",
+    "oi_longshort_recent30_v1": "最近30天 OI / 多空比增强版经验库",
 }
 EXPERIENCE_LIBRARY_DATA_SOURCES = {
     "current": "klines_5m",
     "funding_v1": "klines_5m + funding_rate",
+    "oi_longshort_recent30_v1": "klines_5m + open_interest + long_short_ratio",
 }
 DEFAULT_EXPERIENCE_LIBRARY_PATH = EXPERIENCE_LIBRARY_VERSIONS[DEFAULT_EXPERIENCE_LIBRARY_VERSION]
 LEVEL_FILES = {

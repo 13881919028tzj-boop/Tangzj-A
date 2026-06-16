@@ -26,7 +26,12 @@ from services.committee_types import (
     member_result,
     normalize_direction,
 )
-from services.experience_library_loader import get_default_experience_library_path, load_experience_library_summary
+from services.experience_library_loader import (
+    get_default_experience_library_path,
+    get_experience_library_path,
+    load_experience_library_summary,
+    normalize_experience_library_version,
+)
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
 
 
@@ -200,9 +205,11 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
     symbol = str(decision.get("symbol") or data.get("symbol") or cognition.get("symbol") or "").upper()
     ticker = data.get("ticker") or {}
     state_code = str(cognition.get("state_code") or "")
+    selected_version = normalize_experience_library_version(data.get("experience_library_version"))
+    selected_path = str(data.get("experience_library_path") or get_experience_library_path(selected_version))
     query = build_experience_query_from_cognition(symbol, cognition, ticker=ticker)
-    library_summary = load_experience_library_summary()
-    match = match_experience(query)
+    library_summary = load_experience_library_summary(selected_path, version=selected_version)
+    match = match_experience(query, experience_library_path=selected_path, experience_version=selected_version)
     library_path = library_summary.get("path") or get_default_experience_library_path()
     reason = match.get("reason") or "经验库未接入，当前经验委员弃权。"
     if state_code:
@@ -242,7 +249,8 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
         "experience_library_available": bool(library_summary.get("available")),
         "experience_library_path": library_path,
         "experience_library_status": library_summary,
-        "experience_library_version": library_summary.get("experience_version") or "none",
+        "experience_library_version": selected_version,
+        "experience_library_data_sources": library_summary.get("data_sources") or data.get("experience_library_data_sources") or "",
         "sample_count": match.get("matched_sample_count", 0),
         "state_code": state_code,
         "state_vector_summary": query.get("state_vector_summary"),
@@ -479,7 +487,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.7 经验库相似状态扩展匹配版",
+        "version": "AI模型 9.2.10 多经验库版本选择与对比版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,
