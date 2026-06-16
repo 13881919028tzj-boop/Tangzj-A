@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_VERSION = "AI模型 9.2.11.1 融合经验库默认模式版"
+APP_VERSION = "AI模型 9.2.12 经验库去平均化与真实净收益模拟版"
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 REVIEW_DIR = DATA_DIR / "sim_trade_reviews"
 REVIEWS_JSONL_PATH = REVIEW_DIR / "sim_trade_reviews.jsonl"
@@ -150,6 +150,12 @@ def build_open_snapshot(position: dict[str, Any], account: dict[str, Any] | None
         "side": position.get("direction"),
         "entry_time": position.get("open_time"),
         "entry_price": position.get("entry_price"),
+        "theoretical_entry_price": position.get("theoretical_entry_price") or position.get("entry_price"),
+        "actual_entry_price": position.get("actual_entry_price") or position.get("entry_price"),
+        "entry_slippage_rate": position.get("entry_slippage_rate"),
+        "entry_slippage_cost": position.get("entry_slippage_cost"),
+        "open_fee_rate": position.get("open_fee_rate"),
+        "open_fee_usdt": position.get("open_fee_usdt"),
         "quantity": position.get("original_quantity") or position.get("quantity"),
         "margin": position.get("original_margin_usdt") or position.get("margin_usdt"),
         "leverage": position.get("leverage"),
@@ -175,6 +181,13 @@ def build_open_snapshot(position: dict[str, Any], account: dict[str, Any] | None
         "market_cognition_score": cognition.get("market_cognition_score") or cognition.get("confidence"),
         "experience_version_used": experience_version,
         "matched_sample_count": experience.get("matched_sample_count"),
+        "effective_sample_count": experience.get("effective_sample_count"),
+        "base_rate": experience.get("base_rate"),
+        "edge": experience.get("edge"),
+        "edge_direction": experience.get("edge_direction"),
+        "similarity_cutoff": experience.get("similarity_cutoff"),
+        "cost_adjusted_expectancy": experience.get("cost_adjusted_expectancy"),
+        "has_trade_edge": experience.get("has_trade_edge"),
         "exact_sample_count": experience.get("exact_sample_count"),
         "similar_state_sample_count": experience.get("similar_state_sample_count"),
         "vector_nearest_sample_count": experience.get("vector_nearest_sample_count"),
@@ -344,12 +357,28 @@ def build_close_result(position: dict[str, Any], trade: dict[str, Any], close_pr
     open_ts = int(_to_float(position.get("open_ts"), _ts()))
     final_pnl_pct = total_pnl / notional * 100 if notional else _to_float(trade.get("pnl_pct"), 0)
     exit_type = _exit_type(reason)
+    gross_pnl = _to_float(trade.get("gross_pnl_usdt"), _to_float(position.get("gross_pnl_usdt"), total_pnl))
+    net_pnl = _to_float(trade.get("net_pnl_usdt"), total_pnl)
     return {
         "close_time": trade.get("close_time") or _now(),
         "close_price": close_price,
+        "theoretical_exit_price": trade.get("theoretical_exit_price") or close_price,
+        "actual_exit_price": trade.get("actual_exit_price") or close_price,
+        "exit_slippage_rate": trade.get("exit_slippage_rate"),
+        "exit_slippage_cost": trade.get("exit_slippage_cost"),
+        "close_fee_rate": trade.get("close_fee_rate"),
+        "close_fee_usdt": trade.get("close_fee_usdt"),
         "close_reason": reason or "系统平仓",
         "final_pnl_pct": round(final_pnl_pct, 6),
         "final_pnl_usdt": round(total_pnl, 8),
+        "gross_pnl_pct": _to_float(trade.get("gross_pnl_pct"), 0),
+        "gross_pnl_usdt": round(gross_pnl, 8),
+        "total_fee_usdt": _to_float(trade.get("total_fee_usdt"), 0),
+        "total_slippage_cost_usdt": _to_float(trade.get("total_slippage_cost_usdt"), 0),
+        "net_pnl_pct": _to_float(trade.get("net_pnl_pct"), final_pnl_pct),
+        "net_pnl_usdt": round(net_pnl, 8),
+        "cost_after_still_profitable": bool(trade.get("cost_after_still_profitable") or (gross_pnl > 0 and net_pnl > 0)),
+        "cost_invalid_profit": bool(trade.get("cost_invalid_profit") or (gross_pnl > 0 and net_pnl <= 0)),
         "holding_minutes": round(max(0, _ts() - open_ts) / 60, 2),
         "exit_type": exit_type,
         "exit_trigger": exit_type,

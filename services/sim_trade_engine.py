@@ -22,6 +22,13 @@ from services.sim_trade_review_engine import (
     record_partial_close,
     record_position_progress,
 )
+from services.trading_cost_engine import (
+    apply_entry_slippage,
+    calculate_fee,
+    calculate_net_pnl,
+    estimate_slippage,
+    get_fee_rate,
+)
 from services.trading_database import record_sim_close, record_sim_open
 
 
@@ -43,8 +50,8 @@ DEFAULT_SETTINGS = {
     "initial_balance": 1000.0,
     "max_position_pct": 10.0,
     "max_risk_pct": 1.0,
-    "max_positions": 3,
-    "max_same_symbol_positions": 1,
+    "max_positions": 0,
+    "max_same_symbol_positions": 0,
     "allow_long": True,
     "allow_short": True,
     "leverage": 5,
@@ -476,14 +483,6 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("参数设置不允许模拟做多。")
     if direction == "short" and not settings.get("allow_short", True):
         reasons.append("参数设置不允许模拟做空。")
-    if len(positions) >= int(settings.get("max_positions", 3)):
-        reasons.append("当前持仓数量已达到上限。")
-    same_symbol = [p for p in positions if p.get("symbol") == symbol]
-    if len(same_symbol) >= int(settings.get("max_same_symbol_positions", 1)):
-        reasons.append(f"当前已持有 {symbol} 模拟仓位。")
-    same_order = [o for o in load_orders() if o.get("status") == "pending" and o.get("symbol") == symbol]
-    if same_order:
-        reasons.append(f"当前已有 {symbol} 待触发模拟订单。")
     ignore_loss_limits = bool(settings.get("continuous_run", True) or settings.get("ignore_loss_limits", True))
     if not ignore_loss_limits:
         if _to_float(account.get("daily_pnl"), 0) <= -_to_float(account.get("initial_balance"), 1000) * _to_float(settings.get("daily_loss_limit_pct"), 3) / 100:
@@ -553,8 +552,18 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
     mode = str(settings.get("entry_mode", "等待入场区"))
     if mode == "立即按当前价模拟开仓" or low <= current_price <= high:
         order["status"] = "filled"
-        open_sim_position(order, current_price)
-        log_sim_event("模拟开仓", symbol, direction, current_price, content=f"由委员会信号触发，仓位 {margin:.2f} USDT。")
+        opened = open_sim_position(order, current_price)
+        log_sim_event(
+            "模拟开仓",
+            symbol,
+            direction,
+            current_price,
+            content=(
+                f"由委员会信号触发，仓位 {margin:.2f} USDT。"
+                f"理论价 {current_price:.8f}，实际价 {_to_float((opened or {}).get('actual_entry_price'), current_price):.8f}，"
+                f"开仓手续费 {_to_float((opened or {}).get('open_fee_usdt'), 0):.4f} USDT。"
+            ),
+        )
     else:
         orders = load_orders()
         orders.insert(0, order)
@@ -573,20 +582,34 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
     if margin > _to_float(account.get("available_balance"), 0):
         log_sim_event("拒绝模拟开仓", order.get("symbol", ""), order.get("direction", ""), price, reason="可用余额不足。")
         return {}
-    quantity = _to_float(order.get("notional_usdt"), 0) / price if price > 0 else 0
+    symbol = str(order.get("symbol") or "")
+    direction = str(order.get("direction") or "long")
+    notional = _to_float(order.get("notional_usdt"), 0)
+    entry_slippage_rate = estimate_slippage(symbol, notional)
+    actual_entry_price = apply_entry_slippage(price, direction, entry_slippage_rate)
+    quantity = notional / actual_entry_price if actual_entry_price > 0 else 0
+    open_fee_rate = get_fee_rate()
+    open_fee_usdt = calculate_fee(notional, open_fee_rate)
+    entry_slippage_cost = abs(actual_entry_price - price) * quantity if price > 0 else 0.0
     position = {
         "position_id": f"sim_pos_{int(time.time() * 1000)}",
-        "symbol": order.get("symbol"),
-        "direction": order.get("direction"),
+        "symbol": symbol,
+        "direction": direction,
         "status": "open",
-        "entry_price": price,
+        "entry_price": actual_entry_price,
+        "theoretical_entry_price": price,
+        "actual_entry_price": actual_entry_price,
+        "entry_slippage_rate": entry_slippage_rate,
+        "entry_slippage_cost": round(entry_slippage_cost, 8),
+        "open_fee_rate": open_fee_rate,
+        "open_fee_usdt": open_fee_usdt,
         "current_price": price,
         "quantity": quantity,
         "original_quantity": quantity,
         "margin_usdt": margin,
         "original_margin_usdt": margin,
-        "notional_usdt": _to_float(order.get("notional_usdt"), 0),
-        "original_notional_usdt": _to_float(order.get("notional_usdt"), 0),
+        "notional_usdt": notional,
+        "original_notional_usdt": notional,
         "leverage": int(order.get("leverage", 1)),
         "market_type": order.get("market_type", "futures"),
         "contract_type": order.get("contract_type", "USDT_PERPETUAL"),
@@ -617,6 +640,10 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "unrealized_pnl": 0.0,
         "unrealized_pnl_pct": 0.0,
         "realized_pnl": 0.0,
+        "gross_pnl_usdt": 0.0,
+        "net_pnl_usdt": 0.0,
+        "total_fee_usdt": open_fee_usdt,
+        "total_slippage_cost_usdt": round(entry_slippage_cost, 8),
         "risk_reward_ratio": order.get("committee_snapshot", {}).get("risk_reward_ratio"),
         "committee_confidence": order.get("committee_snapshot", {}).get("committee_confidence"),
         "committee_risk_score": order.get("committee_snapshot", {}).get("risk_score"),
@@ -684,12 +711,29 @@ def calculate_position_holding_time(position: dict[str, Any]) -> dict[str, Any]:
 
 
 def calculate_position_pnl(position: dict[str, Any], current_price: float) -> dict[str, Any]:
-    pnl = calculate_unrealized_pnl(position, current_price)
+    entry = _to_float(position.get("theoretical_entry_price"), _to_float(position.get("entry_price"), 0))
+    actual_entry = _to_float(position.get("actual_entry_price"), _to_float(position.get("entry_price"), 0))
+    qty = _to_float(position.get("quantity"), 0)
+    net_info = calculate_net_pnl(
+        theoretical_entry_price=entry,
+        theoretical_exit_price=current_price,
+        actual_entry_price=actual_entry,
+        quantity=qty,
+        direction=str(position.get("direction")),
+        entry_slippage_rate=_to_float(position.get("entry_slippage_rate"), 0),
+        symbol=str(position.get("symbol") or ""),
+        notional_usdt=_to_float(position.get("notional_usdt"), 0),
+        margin_usdt=_to_float(position.get("margin_usdt"), 0),
+    )
+    pnl = _to_float(net_info.get("net_pnl_usdt"), 0)
     margin = _to_float(position.get("margin_usdt"), 0)
     notional = _to_float(position.get("notional_usdt"), 0)
     r_multiple = calculate_position_r_multiple(position, current_price)
     return {
         "unrealized_pnl": pnl,
+        "gross_unrealized_pnl": net_info.get("gross_pnl_usdt"),
+        "estimated_fee_usdt": net_info.get("total_fee_usdt"),
+        "estimated_slippage_cost_usdt": net_info.get("total_slippage_cost_usdt"),
         "unrealized_pnl_pct": pnl / margin * 100 if margin else 0,
         "unrealized_pnl_pct_notional": pnl / notional * 100 if notional else 0,
         "r_multiple": r_multiple,
@@ -747,7 +791,19 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
         qty = _to_float(position.get("quantity"), 0)
         close_qty = qty * ratio
         close_notional = _to_float(position.get("notional_usdt"), 0) * ratio
-        pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), price, close_qty, str(position.get("direction")))
+        net_info = calculate_net_pnl(
+            theoretical_entry_price=_to_float(position.get("theoretical_entry_price"), _to_float(position.get("entry_price"), 0)),
+            theoretical_exit_price=price,
+            actual_entry_price=_to_float(position.get("actual_entry_price"), _to_float(position.get("entry_price"), 0)),
+            quantity=close_qty,
+            direction=str(position.get("direction")),
+            entry_slippage_rate=_to_float(position.get("entry_slippage_rate"), 0),
+            symbol=str(position.get("symbol") or ""),
+            notional_usdt=close_notional,
+            margin_usdt=_to_float(position.get("margin_usdt"), 0) * ratio,
+        )
+        pnl = _to_float(net_info.get("net_pnl_usdt"), 0)
+        gross_pnl = _to_float(net_info.get("gross_pnl_usdt"), 0)
         released_margin = _to_float(position.get("margin_usdt"), 0) * ratio
         if "止盈1" in reason:
             position["tp1_hit"] = True
@@ -758,6 +814,16 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
         if "止损" in reason:
             position["stop_loss_hit"] = True
         position["realized_pnl"] = _to_float(position.get("realized_pnl"), 0) + pnl
+        position["gross_pnl_usdt"] = _to_float(position.get("gross_pnl_usdt"), 0) + gross_pnl
+        position["net_pnl_usdt"] = _to_float(position.get("net_pnl_usdt"), 0) + pnl
+        position["total_fee_usdt"] = _to_float(position.get("total_fee_usdt"), 0) + _to_float(net_info.get("close_fee_usdt"), 0)
+        position["total_slippage_cost_usdt"] = _to_float(position.get("total_slippage_cost_usdt"), 0) + _to_float(net_info.get("exit_slippage_cost"), 0)
+        position["theoretical_exit_price"] = price
+        position["actual_exit_price"] = net_info.get("actual_exit_price")
+        position["exit_slippage_rate"] = net_info.get("exit_slippage_rate")
+        position["exit_slippage_cost"] = net_info.get("exit_slippage_cost")
+        position["close_fee_rate"] = net_info.get("close_fee_rate")
+        position["close_fee_usdt"] = net_info.get("close_fee_usdt")
         position["quantity"] = qty - close_qty
         position["margin_usdt"] = _to_float(position.get("margin_usdt"), 0) - released_margin
         position["notional_usdt"] = _to_float(position.get("notional_usdt"), 0) * (1 - ratio)
@@ -770,7 +836,7 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
         if ratio >= 0.999 or position["quantity"] <= 0:
             position["status"] = "closed"
             position["close_reason"] = reason
-            trade = _history_row(position, price, pnl, reason, close_qty=close_qty, close_notional=close_notional)
+            trade = _history_row(position, price, pnl, reason, close_qty=close_qty, close_notional=close_notional, net_info=net_info)
             history.insert(0, trade)
             try:
                 record_sim_close(position, price, pnl, reason)
@@ -804,10 +870,18 @@ def partial_close_sim_position(position_id: str, ratio: float, reason: str, pric
     return close_sim_position(position_id, reason, price, ratio)
 
 
-def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason: str, close_qty: float | None = None, close_notional: float | None = None) -> dict[str, Any]:
+def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason: str, close_qty: float | None = None, close_notional: float | None = None, net_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    net_info = net_info or {}
     entry = _to_float(position.get("entry_price"), 0)
+    theoretical_entry = _to_float(position.get("theoretical_entry_price"), entry)
+    actual_entry = _to_float(position.get("actual_entry_price"), entry)
+    actual_exit = _to_float(net_info.get("actual_exit_price"), _to_float(position.get("actual_exit_price"), exit_price))
     notional = _to_float(close_notional, 0) if close_notional is not None else _to_float(position.get("notional_usdt"), 0)
     r_multiple = calculate_position_r_multiple(position, exit_price)
+    gross_pnl = _to_float(net_info.get("gross_pnl_usdt"), pnl)
+    net_pnl = _to_float(net_info.get("net_pnl_usdt"), pnl)
+    total_fee = _to_float(net_info.get("total_fee_usdt"), 0)
+    total_slippage = _to_float(net_info.get("total_slippage_cost_usdt"), 0)
     snapshot = position.get("committee_snapshot") or {}
     local_snapshot = position.get("local_strategy_snapshot") or {}
     return {
@@ -817,15 +891,35 @@ def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason
         "open_time": position.get("open_time"),
         "close_time": _now(),
         "holding_seconds": max(0, _ts() - int(position.get("open_ts", _ts()))),
-        "entry_price": entry,
-        "exit_price": exit_price,
+        "entry_price": actual_entry,
+        "exit_price": actual_exit,
+        "theoretical_entry_price": theoretical_entry,
+        "actual_entry_price": actual_entry,
+        "entry_slippage_rate": _to_float(position.get("entry_slippage_rate"), 0),
+        "entry_slippage_cost": _to_float(position.get("entry_slippage_cost"), 0),
+        "open_fee_rate": _to_float(net_info.get("open_fee_rate"), _to_float(position.get("open_fee_rate"), 0)),
+        "open_fee_usdt": _to_float(net_info.get("open_fee_usdt"), _to_float(position.get("open_fee_usdt"), 0)),
+        "theoretical_exit_price": exit_price,
+        "actual_exit_price": actual_exit,
+        "exit_slippage_rate": _to_float(net_info.get("exit_slippage_rate"), 0),
+        "exit_slippage_cost": _to_float(net_info.get("exit_slippage_cost"), 0),
+        "close_fee_rate": _to_float(net_info.get("close_fee_rate"), 0),
+        "close_fee_usdt": _to_float(net_info.get("close_fee_usdt"), 0),
         "quantity": close_qty if close_qty is not None else position.get("quantity"),
         "notional_usdt": notional,
         "leverage": position.get("leverage"),
-        "pnl": pnl,
-        "pnl_pct": pnl / notional * 100 if notional else 0,
+        "gross_pnl_usdt": gross_pnl,
+        "gross_pnl_pct": _to_float(net_info.get("gross_pnl_pct"), gross_pnl / notional * 100 if notional else 0),
+        "total_fee_usdt": total_fee,
+        "total_slippage_cost_usdt": total_slippage,
+        "net_pnl_usdt": net_pnl,
+        "net_pnl_pct": _to_float(net_info.get("net_pnl_pct"), net_pnl / notional * 100 if notional else 0),
+        "cost_after_still_profitable": bool(net_info.get("cost_after_still_profitable")),
+        "cost_invalid_profit": bool(net_info.get("cost_invalid_profit")),
+        "pnl": net_pnl,
+        "pnl_pct": _to_float(net_info.get("net_pnl_pct"), net_pnl / notional * 100 if notional else 0),
         "r_multiple": r_multiple if r_multiple is not None else "",
-        "is_win": pnl > 0,
+        "is_win": net_pnl > 0,
         "close_reason": reason,
         "strategy_name": local_snapshot.get("strategy_name") or snapshot.get("strategy_name") or "",
         "committee_action": position.get("committee_action"),
@@ -904,6 +998,9 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
         position["price_status"] = status
         position["last_price_update"] = _now()
         position["unrealized_pnl"] = pnl
+        position["gross_unrealized_pnl"] = _to_float(pnl_info.get("gross_unrealized_pnl"), pnl)
+        position["estimated_fee_usdt"] = _to_float(pnl_info.get("estimated_fee_usdt"), 0)
+        position["estimated_slippage_cost_usdt"] = _to_float(pnl_info.get("estimated_slippage_cost_usdt"), 0)
         position["unrealized_pnl_pct"] = _to_float(pnl_info.get("unrealized_pnl_pct"), 0)
         position["unrealized_pnl_pct_notional"] = _to_float(pnl_info.get("unrealized_pnl_pct_notional"), 0)
         position["r_multiple"] = pnl_info.get("r_multiple")
@@ -965,7 +1062,7 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
                 continue
             price = get_current_price(str(open_position.get("symbol", "")), current_prices)
             if price > 0:
-                unrealized_total += calculate_unrealized_pnl(open_position, price)
+                unrealized_total += _to_float(calculate_position_pnl(open_position, price).get("unrealized_pnl"), 0)
     account["unrealized_pnl"] = unrealized_total
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized_total
     account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + unrealized_total
@@ -988,12 +1085,8 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
     results: list[dict[str, Any]] = []
     if account.get("status") != "running" or settings.get("mode") == "observe":
         return [{"status": "skipped", "reason": "模拟交易未运行或处于仅观察模式。"}]
-    existing_orders = [o for o in load_orders() if o.get("status") == "pending"]
     for signal in signals[:10]:
         symbol = str(signal.get("symbol", "")).upper()
-        if any(o.get("symbol") == symbol for o in existing_orders):
-            results.append({"symbol": symbol, "status": "rejected", "reason": "当前已有待触发模拟订单。"})
-            continue
         price = get_current_price(symbol, current_prices)
         ok, reasons = validate_signal_for_simulation(signal, current_prices)
         if not ok:

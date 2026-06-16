@@ -17,6 +17,7 @@ from services.experience_library_loader import (
     resolve_experience_library_path,
 )
 from services.symbol_profile_engine import build_symbol_profile
+from services.trading_cost_engine import round_trip_cost_rate
 
 
 STATE_VECTOR_KEYS = (
@@ -51,6 +52,8 @@ MATCH_TYPE_WEIGHTS = {
 SIMILARITY_MINIMUM = 70.0
 SIMILARITY_PRIORITY = 80.0
 VECTOR_LOW_SAMPLE_MINIMUM = 60.0
+SIMILARITY_CUTOFF = 75.0
+EDGE_THRESHOLD = 4.0
 LAYER_ORDER = [
     "SYMBOL_EXACT",
     "SYMBOL_SIMILAR",
@@ -638,6 +641,23 @@ def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict
     similar_samples = int(sum(_to_float(level.get("similar_state_sample_count"), 0) for level in levels.values() if level.get("matched")))
     vector_samples = int(sum(_to_float(level.get("vector_nearest_sample_count"), 0) for level in levels.values() if level.get("matched")))
     global_samples = int(_to_float(levels.get("global_level", {}).get("matched_sample_count"), 0))
+    effective_sample_count = 0.0
+    effective_rule_notes: list[str] = []
+    scope_factors = {"symbol_level": 1.0, "group_level": 0.55, "global_level": 0.25}
+    for key, level in levels.items():
+        if not level.get("matched"):
+            continue
+        similarity = _to_float(level.get("avg_similarity") or level.get("similarity"), 0)
+        exact = _to_float(level.get("exact_sample_count"), 0)
+        similar = _to_float(level.get("similar_state_sample_count"), 0)
+        vector = _to_float(level.get("vector_nearest_sample_count"), 0)
+        scope_factor = scope_factors.get(key, 0.25)
+        if similarity < SIMILARITY_CUTOFF and exact <= 0:
+            effective_sample_count += (similar + vector) * scope_factor * 0.10
+            effective_rule_notes.append(f"{key} 相似度低于{SIMILARITY_CUTOFF:.0f}，只作为弱参考。")
+            continue
+        effective_sample_count += exact * scope_factor
+        effective_sample_count += (similar + vector) * scope_factor * max(0.10, min(1.0, similarity / 100)) * 0.50
     avg_similarity = 0.0
     if total_samples > 0:
         avg_similarity = sum(_to_float(level.get("avg_similarity") or level.get("similarity"), 0) * _to_float(level.get("matched_sample_count"), 0) for level in levels.values() if level.get("matched")) / total_samples
@@ -657,6 +677,9 @@ def _blend(levels: dict[str, dict[str, Any]], weights: dict[str, float]) -> dict
             "similar_state_sample_count": similar_samples,
             "vector_nearest_sample_count": vector_samples,
             "global_sample_count": global_samples,
+            "effective_sample_count": round(effective_sample_count, 2),
+            "similarity_cutoff": SIMILARITY_CUTOFF,
+            "effective_sample_note": "；".join(effective_rule_notes),
             "avg_similarity": round(avg_similarity, 2),
             "used_match_layers": used_match_layers,
             "match_expansion_note": expansion_note,
@@ -726,9 +749,18 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
             "experience_participation_status": "弃权",
             "abstain_reason": "三层经验均未命中。",
             "reason": "三层经验均未命中，经验委员弃权。",
+            "base_rate": {"up": 33.33, "sideways": 33.33, "down": 33.33},
+            "edge": 0,
+            "edge_direction": "WAIT",
+            "effective_sample_count": 0,
+            "similarity_cutoff": SIMILARITY_CUTOFF,
+            "cost_adjusted_expectancy": 0,
+            "has_trade_edge": False,
+            "no_edge_wait": True,
         }
     up30 = _to_float(blended.get("historical_30m_up_probability"), 0)
     down30 = _to_float(blended.get("historical_30m_down_probability"), 0)
+    sideways30 = _to_float(blended.get("historical_30m_sideways_probability"), 0)
     avg30 = _to_float(blended.get("avg_return_30m"), 0)
     mfe90 = abs(_to_float(blended.get("mfe_p90"), 0))
     mae90 = abs(_to_float(blended.get("mae_p90"), 0))
@@ -736,11 +768,29 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     trap_risk = _to_float(blended.get("trap_risk_avg"), _to_float((query.get("state_vector") or {}).get("trap_risk_score"), 0))
     matched_layers = list(blended.get("matched_layers") or [])
     sample_count = int(_to_float(blended.get("matched_sample_count"), 0))
+    effective_sample_count = _to_float(blended.get("effective_sample_count"), 0)
     avg_similarity = _to_float(blended.get("avg_similarity"), 0)
     exact_sample_count = int(_to_float(blended.get("exact_sample_count"), 0))
     similar_sample_count = int(_to_float(blended.get("similar_state_sample_count"), 0))
     vector_sample_count = int(_to_float(blended.get("vector_nearest_sample_count"), 0))
     sample_policy = _sample_confidence_policy(sample_count, matched_layers, avg_similarity)
+    base_up = _to_float(blended.get("base_30m_up_probability"), 0)
+    base_down = _to_float(blended.get("base_30m_down_probability"), 0)
+    base_sideways = _to_float(blended.get("base_30m_sideways_probability"), 0)
+    if base_up <= 0 and isinstance(blended.get("_base_rate"), dict):
+        base = blended.get("_base_rate") or {}
+        base_up = _to_float(base.get("up"), 0)
+        base_down = _to_float(base.get("down"), 0)
+        base_sideways = _to_float(base.get("sideways"), 0)
+    if base_up <= 0 and base_down <= 0:
+        base_up = base_down = base_sideways = 33.33
+    long_edge = up30 - base_up
+    short_edge = down30 - base_down
+    edge_direction = "LONG" if long_edge >= short_edge and long_edge > 0 else "SHORT" if short_edge > 0 else "WAIT"
+    edge = max(long_edge, short_edge, 0.0)
+    round_trip_cost = round_trip_cost_rate()
+    cost_adjusted_expectancy = avg30 - round_trip_cost
+    has_trade_edge = bool(edge >= EDGE_THRESHOLD and cost_adjusted_expectancy > 0 and effective_sample_count >= 30 and avg_similarity >= SIMILARITY_CUTOFF)
     raw_experience_confidence = _clamp(blended.get("experience_confidence"), 0)
     exact_ratio = exact_sample_count / max(sample_count, 1)
     global_ratio = _to_float(blended.get("global_sample_count"), 0) / max(sample_count, 1)
@@ -758,10 +808,13 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     data_quality = _clamp(blended.get("experience_data_quality"), 0)
     current_integrity = _clamp((query.get("state_vector") or {}).get("data_integrity_score"), data_quality)
     sample_score = min(20.0, math.log10(max(sample_count, 1)) * 8)
-    prob_edge = up30 - down30
+    prob_edge = edge if edge_direction == "LONG" else -edge if edge_direction == "SHORT" else 0
     return_score = max(-15.0, min(15.0, avg30 * 5000))
     rr_score = max(0.0, min(20.0, (mfe90 / max(mae90, 0.0001)) * 8))
-    score = _clamp(50 + prob_edge * 0.45 + return_score + rr_score + sample_score * 0.5 + data_quality * 0.10 - trap_risk * 0.18 - loss_probability * 0.22)
+    score = _clamp(50 + prob_edge * 0.55 + return_score + rr_score + sample_score * 0.5 + data_quality * 0.10 - trap_risk * 0.18 - loss_probability * 0.22)
+    if not has_trade_edge:
+        score = min(score, 48.0)
+        confidence = min(confidence, 45.0)
     abstain_reason = ""
     if sample_count < 30:
         vote = "ABSTAIN"
@@ -771,16 +824,24 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
         vote = "ABSTAIN"
         direction = "WAIT"
         abstain_reason = "历史经验置信度低于 30，经验委员弃权，仅展示历史参考。"
+    elif not has_trade_edge:
+        vote = "ABSTAIN"
+        direction = "WAIT"
+        abstain_reason = "样本较多，但相对市场基准优势不足，接近平均概率，不具备明显交易优势。"
+    elif cost_adjusted_expectancy <= 0:
+        vote = "ABSTAIN"
+        direction = "WAIT"
+        abstain_reason = "成本后交易期望值小于等于0，经验委员等待。"
     elif data_quality < 35 or mae90 >= 0.08 or loss_probability >= 70:
         vote = "VETO" if mae90 >= 0.12 or data_quality < 20 else "OPPOSE"
         direction = "WAIT"
-    elif down30 >= 60:
+    elif edge_direction == "SHORT" and down30 >= 55:
         vote = "OPPOSE"
         direction = "SHORT"
-    elif up30 >= 60 and avg30 > 0 and mae90 <= max(0.06, mfe90 * 2.2):
+    elif edge_direction == "LONG" and up30 >= 55 and avg30 > 0 and mae90 <= max(0.06, mfe90 * 2.2):
         vote = "SUPPORT" if score >= 70 and confidence >= 50 else "CAUTIOUS_SUPPORT"
         direction = "LONG"
-    elif up30 >= 55:
+    elif edge_direction == "LONG" and up30 >= 52:
         vote = "CAUTIOUS_SUPPORT"
         direction = "LONG"
     else:
@@ -794,8 +855,11 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
     if exact_ratio < 0.20 and (similar_sample_count or vector_sample_count) and vote == "SUPPORT":
         vote = "CAUTIOUS_SUPPORT"
         sample_policy["experience_participation_status"] = "谨慎参与"
-    if avg_similarity < 75 and vote == "SUPPORT":
+    if avg_similarity < SIMILARITY_CUTOFF and vote == "SUPPORT":
         vote = "CAUTIOUS_SUPPORT"
+    if not has_trade_edge and vote in {"SUPPORT", "CAUTIOUS_SUPPORT"}:
+        vote = "ABSTAIN"
+        direction = "WAIT"
     layers = "、".join(str(item) for item in blended.get("matched_layers") or []) or "无"
     used_layers = "、".join(str(item) for item in blended.get("used_match_layers") or []) or "无"
     sample_note = str(sample_policy.get("sample_confidence_note") or "")
@@ -805,8 +869,11 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
         f"匹配层级：{layers}，使用层级：{used_layers}，经验类型：{experience_kind}。"
         f"精确样本{exact_sample_count}，相似状态扩展样本{similar_sample_count}，向量近邻样本{vector_sample_count}，"
         f"总参考样本{int(_to_float(blended.get('matched_sample_count'), 0))}，平均相似度{avg_similarity:.1f}。"
+        f"有效样本{effective_sample_count:.1f}，相似度门槛{SIMILARITY_CUTOFF:.0f}。"
         f"{sample_note}"
-        f"30m上涨/震荡/下跌概率为{up30:.1f}%/{_to_float(blended.get('historical_30m_sideways_probability'), 0):.1f}%/{down30:.1f}%，"
+        f"30m上涨/震荡/下跌概率为{up30:.1f}%/{sideways30:.1f}%/{down30:.1f}%，"
+        f"市场基准概率为{base_up:.1f}%/{base_sideways:.1f}%/{base_down:.1f}%，edge={edge:.1f}pct，方向{edge_direction}。"
+        f"成本后期望值{cost_adjusted_expectancy * 100:.2f}%。"
         f"60m上涨/震荡/下跌概率为{_to_float(blended.get('historical_60m_up_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_sideways_probability'), 0):.1f}%/{_to_float(blended.get('historical_60m_down_probability'), 0):.1f}%。"
         f"MFE90约{mfe90 * 100:.2f}%，MAE90约{-mae90 * 100:.2f}%，平均30m收益{avg30 * 100:.2f}%。"
         f"经验评分{score:.1f}，ExperienceConfidence {confidence:.1f}，DataIntegrity {current_integrity:.1f}，经验数据质量{data_quality:.1f}，因此给出{vote}/{direction}。"
@@ -826,6 +893,18 @@ def _vote_from_blended(blended: dict[str, Any], query: dict[str, Any]) -> dict[s
         "similar_state_sample_count": similar_sample_count,
         "vector_nearest_sample_count": vector_sample_count,
         "total_matched_sample_count": sample_count,
+        "effective_sample_count": round(effective_sample_count, 2),
+        "similarity_cutoff": SIMILARITY_CUTOFF,
+        "base_rate": {"up": round(base_up, 2), "sideways": round(base_sideways, 2), "down": round(base_down, 2)},
+        "edge": round(edge, 2),
+        "edge_long": round(long_edge, 2),
+        "edge_short": round(short_edge, 2),
+        "edge_direction": edge_direction,
+        "edge_threshold": EDGE_THRESHOLD,
+        "cost_adjusted_expectancy": round(cost_adjusted_expectancy, 6),
+        "round_trip_cost_rate": round(round_trip_cost, 6),
+        "has_trade_edge": has_trade_edge,
+        "no_edge_wait": bool(not has_trade_edge),
         "abstain_reason": abstain_reason,
         "reason": reason,
         **sample_policy,
@@ -875,6 +954,21 @@ def match_experience(
     for key, weight in weights.items():
         levels[key]["weight"] = weight
     blended = _blend(levels, weights)
+    global_level = levels.get("global_level") or {}
+    if global_level.get("matched"):
+        blended["_base_rate"] = {
+            "up": _to_float(global_level.get("historical_30m_up_probability"), 33.33),
+            "sideways": _to_float(global_level.get("historical_30m_sideways_probability"), 33.33),
+            "down": _to_float(global_level.get("historical_30m_down_probability"), 33.33),
+        }
+        blended["base_30m_up_probability"] = blended["_base_rate"]["up"]
+        blended["base_30m_sideways_probability"] = blended["_base_rate"]["sideways"]
+        blended["base_30m_down_probability"] = blended["_base_rate"]["down"]
+    else:
+        blended["_base_rate"] = {"up": 33.33, "sideways": 33.33, "down": 33.33}
+        blended["base_30m_up_probability"] = 33.33
+        blended["base_30m_sideways_probability"] = 33.33
+        blended["base_30m_down_probability"] = 33.33
     vote = _vote_from_blended(blended, query)
     all_warnings = []
     for level in levels.values():

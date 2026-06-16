@@ -549,7 +549,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.11.1 融合经验库默认模式版",
+        "version": "AI模型 9.2.12 经验库去平均化与真实净收益模拟版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,

@@ -1,0 +1,10 @@
+{
+  "maker_fee_rate": 0.0002,
+  "taker_fee_rate": 0.0005,
+  "default_fee_mode": "taker",
+  "default_slippage_rate": 0.0005,
+  "high_liquidity_slippage_rate": 0.0002,
+  "mid_liquidity_slippage_rate": 0.0005,
+  "low_liquidity_slippage_rate": 0.0015,
+  "extreme_slippage_rate": 0.003
+}

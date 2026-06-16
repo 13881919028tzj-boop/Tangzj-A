@@ -10,6 +10,7 @@ from services.experience_library_loader import (
     get_experience_library_data_sources,
 )
 from services.experience_matcher import match_experience
+from services.trading_cost_engine import round_trip_cost_rate
 
 
 FUSION_LIBRARY_ORDER = ["current", "funding_v1", "oi_longshort_recent30_v1"]
@@ -47,6 +48,12 @@ FUSED_FIELDS = [
     "mae_p90",
     "mfe_p90",
     "historical_loss_probability",
+    "effective_sample_count",
+    "edge",
+    "edge_long",
+    "edge_short",
+    "cost_adjusted_expectancy",
+    "round_trip_cost_rate",
 ]
 
 
@@ -85,7 +92,14 @@ def _empty_result(reason: str, library_results: dict[str, dict[str, Any]] | None
         "suggested_take_profit_1": 0,
         "suggested_take_profit_2": 0,
         "matched_sample_count": 0,
+        "effective_sample_count": 0,
         "avg_similarity": 0,
+        "base_rate": {"up": 33.33, "sideways": 33.33, "down": 33.33},
+        "edge": 0,
+        "similarity_cutoff": 75,
+        "cost_adjusted_expectancy": 0,
+        "has_trade_edge": False,
+        "no_edge_wait": True,
         "reason": reason,
     }
 
@@ -138,11 +152,18 @@ def _vote_from_fused(fused: dict[str, Any]) -> tuple[str, str, list[str]]:
     up30 = _to_float(fused.get("historical_30m_up_probability"), 0)
     down30 = _to_float(fused.get("historical_30m_down_probability"), 0)
     avg_return = _to_float(fused.get("avg_return_30m"), 0)
+    edge = _to_float(fused.get("edge"), 0)
+    cost_adjusted_expectancy = _to_float(fused.get("cost_adjusted_expectancy"), avg_return - round_trip_cost_rate())
+    has_trade_edge = bool(fused.get("has_trade_edge"))
     mae90 = abs(_to_float(fused.get("mae_p90"), 0))
     loss_probability = _to_float(fused.get("historical_loss_probability"), 0)
     notes: list[str] = []
     if confidence < 30:
         return "ABSTAIN", "WAIT", ["融合置信度低于30，经验委员弃权。"]
+    if not has_trade_edge or edge < 4:
+        return "ABSTAIN", "WAIT", ["样本较多，但相对市场基准优势不足，接近平均概率，不具备明显交易优势。"]
+    if cost_adjusted_expectancy <= 0:
+        return "ABSTAIN", "WAIT", ["融合经验成本后期望值小于等于0，经验委员等待。"]
     if mae90 >= 0.12 or loss_probability >= 70:
         return "VETO", "WAIT", ["融合经验显示风险过高，触发否决倾向。"]
     if down30 >= up30 + 8:
@@ -195,10 +216,22 @@ def build_fused_experience_result(query: dict[str, Any], *, top_k: int = 50) -> 
     for field in FUSED_FIELDS:
         result[field] = round(_weighted_average(library_results, weights, field), 6)
     result["matched_sample_count"] = int(sum(_to_float((library_results.get(version) or {}).get("matched_sample_count"), 0) for version in used_libraries))
+    result["effective_sample_count"] = round(_weighted_average(library_results, weights, "effective_sample_count"), 2)
     result["avg_similarity"] = round(_weighted_average(library_results, weights, "avg_similarity"), 2)
     result["fused_score"] = round(_weighted_average(library_results, weights, "score"), 2)
     result["fused_confidence"] = round(_weighted_average(library_results, weights, "confidence"), 2)
     result["fused_data_integrity_score"] = round(_weighted_average(library_results, weights, "data_integrity_score"), 2)
+    base_up = sum(_to_float(((library_results.get(version) or {}).get("base_rate") or {}).get("up"), 33.33) * weights.get(version, 0) for version in weights)
+    base_sideways = sum(_to_float(((library_results.get(version) or {}).get("base_rate") or {}).get("sideways"), 33.33) * weights.get(version, 0) for version in weights)
+    base_down = sum(_to_float(((library_results.get(version) or {}).get("base_rate") or {}).get("down"), 33.33) * weights.get(version, 0) for version in weights)
+    result["base_rate"] = {"up": round(base_up, 2), "sideways": round(base_sideways, 2), "down": round(base_down, 2)}
+    result["similarity_cutoff"] = max(_to_float((library_results.get(version) or {}).get("similarity_cutoff"), 75) for version in used_libraries)
+    result["edge"] = round(max(_to_float(result.get("historical_30m_up_probability"), 0) - base_up, _to_float(result.get("historical_30m_down_probability"), 0) - base_down, 0), 2)
+    result["edge_direction"] = "LONG" if _to_float(result.get("historical_30m_up_probability"), 0) - base_up >= _to_float(result.get("historical_30m_down_probability"), 0) - base_down and result["edge"] > 0 else "SHORT" if result["edge"] > 0 else "WAIT"
+    if not result.get("cost_adjusted_expectancy"):
+        result["cost_adjusted_expectancy"] = round(_to_float(result.get("avg_return_30m"), 0) - round_trip_cost_rate(), 6)
+    result["has_trade_edge"] = bool(result["edge"] >= 4 and _to_float(result.get("cost_adjusted_expectancy"), 0) > 0 and _to_float(result.get("effective_sample_count"), 0) >= 30 and _to_float(result.get("avg_similarity"), 0) >= _to_float(result.get("similarity_cutoff"), 75))
+    result["no_edge_wait"] = not result["has_trade_edge"]
 
     directions = [_direction_bucket((library_results.get(version) or {}).get("direction")) for version in used_libraries]
     non_wait_directions = [item for item in directions if item != "WAIT"]

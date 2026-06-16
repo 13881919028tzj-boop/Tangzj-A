@@ -292,9 +292,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.11.1"
+APP_TITLE = "AI模型 9.2.12"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.11.1 融合经验库默认模式版"
+VERSION = "AI模型 9.2.12 经验库去平均化与真实净收益模拟版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -3429,6 +3429,12 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     similar_samples = int(float(match.get("similar_state_sample_count") or 0))
     vector_samples = int(float(match.get("vector_nearest_sample_count") or 0))
     avg_similarity = float(match.get("avg_similarity") or 0)
+    base_rate = match.get("base_rate") if isinstance(match.get("base_rate"), dict) else {}
+    edge_value_single = safe_number(match.get("edge"))
+    effective_sample_count = safe_number(match.get("effective_sample_count"))
+    similarity_cutoff = safe_number(match.get("similarity_cutoff"))
+    cost_adjusted_expectancy_single = safe_number(match.get("cost_adjusted_expectancy"))
+    has_trade_edge = bool(match.get("has_trade_edge"))
     used_match_layers_text = "、".join(str(x) for x in list(match.get("used_match_layers") or [])) or "无"
     expansion_note = str(match.get("match_expansion_note") or "")
     sample_level = str(match.get("sample_confidence_level") or "等待样本")
@@ -3524,13 +3530,16 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         else fused_result.get("cost_after_expectancy")
     )
     edge_value = fused_result.get("edge") if fused_result.get("edge") is not None else fused_result.get("expected_edge")
+    fused_base_rate = fused_result.get("base_rate") if isinstance(fused_result.get("base_rate"), dict) else {}
     if selected_mode == DEFAULT_EXPERIENCE_MODE:
         fused_panel = f"""
             <div class="status-card" style="margin-top:8px;">
               <b>多经验库融合结果</b><br>
               使用的经验库：{escape("、".join(str(x) for x in list(fused_result.get("used_libraries") or [])) or "无")}<br>
               权重：{escape(", ".join(f"{k}={v:.1f}%" for k, v in (fused_weights or {}).items()) or "无可用权重")}<br>
-              成本后期望值：{_plain(cost_expectancy, 4)}｜edge：{_plain(edge_value, 4)}<br>
+              base_rate：涨{_plain(fused_base_rate.get("up"))}% / 震荡{_plain(fused_base_rate.get("sideways"))}% / 跌{_plain(fused_base_rate.get("down"))}%<br>
+              edge：{_plain(edge_value)} pct｜有效样本：{_plain(fused_result.get("effective_sample_count"))}｜similarity_cutoff：{_plain(fused_result.get("similarity_cutoff"))}<br>
+              成本后期望值：{_plain(cost_expectancy, 4)}｜存在交易优势：{escape("是" if fused_result.get("has_trade_edge") else "否")}<br>
               明确提示：oi_longshort_recent30_v1 是最近30天修正库，不是长期历史库。
             </div>
             <div class="committee-grid" style="margin-top:8px;">
@@ -3584,6 +3593,11 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
               {_level_card("同类币种匹配", group_level)}
               {_level_card("全市场匹配", global_level)}
               <div class="summary-card"><div class="summary-label">总样本</div><div class="summary-value blue">{total_samples}</div><div class="module-desc">单币种 {int(float(symbol_level.get("matched_sample_count") or 0))}｜同类 {int(float(group_level.get("matched_sample_count") or 0))}｜全市场 {int(float(global_level.get("matched_sample_count") or 0))}</div></div>
+              <div class="summary-card"><div class="summary-label">有效样本数</div><div class="summary-value blue">{_plain(effective_sample_count)}</div><div class="module-desc">低于相似度门槛只作弱参考</div></div>
+              <div class="summary-card"><div class="summary-label">base_rate</div><div class="summary-value yellow">涨{_plain(base_rate.get("up"))}%</div><div class="module-desc">震荡{_plain(base_rate.get("sideways"))}%｜跌{_plain(base_rate.get("down"))}%</div></div>
+              <div class="summary-card"><div class="summary-label">edge 优势</div><div class="summary-value {'green' if has_trade_edge else 'red'}">{_plain(edge_value_single)} pct</div><div class="module-desc">方向 {escape(str(match.get("edge_direction") or "WAIT"))}</div></div>
+              <div class="summary-card"><div class="summary-label">成本后期望值</div><div class="summary-value {'green' if (cost_adjusted_expectancy_single or 0) > 0 else 'red'}">{_ret_pct(cost_adjusted_expectancy_single)}</div><div class="module-desc">无优势则等待：{"否" if has_trade_edge else "是"}</div></div>
+              <div class="summary-card"><div class="summary-label">similarity_cutoff</div><div class="summary-value yellow">{_plain(similarity_cutoff)}</div><div class="module-desc">当前平均相似度 {avg_similarity:.1f}</div></div>
               <div class="summary-card"><div class="summary-label">精确状态样本</div><div class="summary-value blue">{exact_samples}</div><div class="module-desc">exact_state_code</div></div>
               <div class="summary-card"><div class="summary-label">相似状态样本</div><div class="summary-value yellow">{similar_samples}</div><div class="module-desc">similar_state_code，相似度≥70优先≥80</div></div>
               <div class="summary-card"><div class="summary-label">向量近邻样本</div><div class="summary-value yellow">{vector_samples}</div><div class="module-desc">vector_nearest，按状态向量加权距离</div></div>
@@ -5307,8 +5321,11 @@ def render_trading() -> None:
             progress = review.get("position_progress") or {}
             close_result = review.get("close_result") or {}
             feedback = review.get("experience_feedback") or {}
-            pnl_pct = float(close_result.get("final_pnl_pct", 0) or 0)
-            pnl_usdt = float(close_result.get("final_pnl_usdt", 0) or 0)
+            pnl_pct = float(close_result.get("net_pnl_pct", close_result.get("final_pnl_pct", 0)) or 0)
+            pnl_usdt = float(close_result.get("net_pnl_usdt", close_result.get("final_pnl_usdt", 0)) or 0)
+            gross_pct = float(close_result.get("gross_pnl_pct", 0) or 0)
+            fee_usdt = float(close_result.get("total_fee_usdt", 0) or 0)
+            slippage_usdt = float(close_result.get("total_slippage_cost_usdt", 0) or 0)
             state_code = str(open_snapshot.get("state_code") or "-")
             feedback_label = str(feedback.get("experience_feedback_label") or "持仓中")
             color = "green" if pnl_usdt > 0 else "red" if pnl_usdt < 0 else "yellow"
@@ -5316,8 +5333,11 @@ def render_trading() -> None:
                 f"""
                 <div class="status-card">
                   <b>{kline_symbol_link(open_snapshot.get("symbol"), str(open_snapshot.get("symbol") or "-"))}</b>｜{direction_text(open_snapshot.get("side"))}｜{escape(str(close_result.get("close_reason") or review.get("status", "open")))}｜
-                  <span class="{color}">{pnl_usdt:+.2f} USDT / {pnl_pct:+.2f}%</span><br>
-                  入场：{format_waiting_price(open_snapshot.get("entry_price"))}　出场：{format_waiting_price(close_result.get("close_price"))}　持仓：{float(close_result.get("holding_minutes", progress.get("holding_minutes", 0)) or 0):.1f}分钟<br>
+                  净收益：<span class="{color}">{pnl_usdt:+.2f} USDT / {pnl_pct:+.2f}%</span><br>
+                  毛收益：{gross_pct:+.2f}%　手续费：-{fee_usdt:.4f} USDT　滑点：-{slippage_usdt:.4f} USDT　成本后：{escape("有效盈利" if close_result.get("cost_after_still_profitable") else "无效盈利" if close_result.get("cost_invalid_profit") else "亏损/持平")}<br>
+                  入场理论/实际：{format_waiting_price(open_snapshot.get("theoretical_entry_price", open_snapshot.get("entry_price")))} / {format_waiting_price(open_snapshot.get("actual_entry_price", open_snapshot.get("entry_price")))}　出场理论/实际：{format_waiting_price(close_result.get("theoretical_exit_price", close_result.get("close_price")))} / {format_waiting_price(close_result.get("actual_exit_price", close_result.get("close_price")))}<br>
+                  开仓手续费率：{float(open_snapshot.get("open_fee_rate", 0) or 0):.4%}　开仓滑点率：{float(open_snapshot.get("entry_slippage_rate", 0) or 0):.4%}　平仓手续费率：{float(close_result.get("close_fee_rate", 0) or 0):.4%}　平仓滑点率：{float(close_result.get("exit_slippage_rate", 0) or 0):.4%}<br>
+                  持仓：{float(close_result.get("holding_minutes", progress.get("holding_minutes", 0)) or 0):.1f}分钟<br>
                   最大浮盈：{float(progress.get("max_favorable_excursion", 0) or 0):+.2f}%　最大浮亏：{float(progress.get("max_adverse_excursion", 0) or 0):+.2f}%　部分止盈：{int(progress.get("partial_close_count", 0) or 0)}次<br>
                   经验库：{escape(str(open_snapshot.get("experience_library_version") or "-"))}　state_code：{escape(state_code)}　经验委员：{escape(str(open_snapshot.get("experience_vote") or "-"))} / Confidence {float(open_snapshot.get("experience_confidence", 0) or 0):.1f}<br>
                   经验反馈：<span class="{_signal_color(feedback_label)}">{escape(feedback_label)}</span>｜{escape(str(feedback.get("feedback_reason") or "持仓中，等待最终平仓后判断。"))}
@@ -5444,6 +5464,9 @@ def render_trading() -> None:
         for pos in positions:
             pos_price = valid_price(price_map.get(str(pos.get("symbol", "")))) or valid_price(pos.get("current_price"))
             pnl = float(pos.get("unrealized_pnl", 0) or 0)
+            gross_pnl = float(pos.get("gross_unrealized_pnl", pos.get("unrealized_pnl", 0)) or 0)
+            est_fee = float(pos.get("estimated_fee_usdt", pos.get("total_fee_usdt", 0)) or 0)
+            est_slip = float(pos.get("estimated_slippage_cost_usdt", pos.get("total_slippage_cost_usdt", 0)) or 0)
             pnl_class = "green" if pnl >= 0 else "red"
             r_value = calculate_position_r_multiple(pos, pos_price)
             holding = calculate_position_holding_time(pos)
@@ -5451,9 +5474,10 @@ def render_trading() -> None:
                 f"""
                 <div class="status-card">
                   <b>{kline_symbol_link(pos.get("symbol"), str(pos.get("symbol")))}</b>｜{direction_text(pos.get("direction"))}｜模拟持仓｜{pos.get("status")}<br>
-                  开仓：{format_waiting_price(pos.get("entry_price"))}　当前：{format_waiting_price(pos_price)}　数量：{float(pos.get("quantity", 0) or 0):.6f}<br>
+                  开仓理论/实际：{format_waiting_price(pos.get("theoretical_entry_price", pos.get("entry_price")))} / {format_waiting_price(pos.get("actual_entry_price", pos.get("entry_price")))}　当前：{format_waiting_price(pos_price)}　数量：{float(pos.get("quantity", 0) or 0):.6f}<br>
                   模拟保证金：{money(pos.get("margin_usdt"))}　名义仓位：{money(pos.get("notional_usdt"))}　模拟杠杆：{pos.get("leverage", 1)}x<br>
-                  浮动盈亏：<span class="{pnl_class}">{pnl:+.2f} USDT / {float(pos.get("unrealized_pnl_pct", 0) or 0):+.2f}%</span>　已实现：{money(pos.get("realized_pnl"))}<br>
+                  净浮盈：<span class="{pnl_class}">{pnl:+.2f} USDT / {float(pos.get("unrealized_pnl_pct", 0) or 0):+.2f}%</span>　毛浮盈：{gross_pnl:+.2f} USDT　预估手续费：-{est_fee:.4f}　预估滑点：-{est_slip:.4f}<br>
+                  开仓手续费率：{float(pos.get("open_fee_rate", 0) or 0):.4%}　开仓滑点率：{float(pos.get("entry_slippage_rate", 0) or 0):.4%}　已实现净收益：{money(pos.get("realized_pnl"))}<br>
                   止损：{format_waiting_price(pos.get("stop_loss"))}　止盈1：{format_waiting_price(pos.get("take_profit_1"))}　止盈2：{format_waiting_price(pos.get("take_profit_2"))}<br>
                   R倍数：{f"{r_value:+.2f}R" if r_value is not None else "暂无"}　持仓：{escape(str(holding.get("text", "0分钟")))}　止盈1：{"已触发" if pos.get("tp1_hit") else "未触发"}　保本止损：{"已移动" if pos.get("moved_stop_to_breakeven") else "未移动"}<br>
                   委员会：{escape(str(pos.get("committee_action", "等待")))} / 置信度{pos.get("committee_confidence", 0)} / 风险{pos.get("committee_risk_score", 0)}<br>
@@ -5534,13 +5558,18 @@ def render_trading() -> None:
             if reason_filter != "全部":
                 rows = [row for row in rows if str(row.get("close_reason") or "未知") == reason_filter]
             for row in rows[:50]:
-                pnl = float(row.get("pnl", 0) or 0)
+                pnl = float(row.get("net_pnl_usdt", row.get("pnl", 0)) or 0)
+                gross = float(row.get("gross_pnl_usdt", pnl) or 0)
+                fee = float(row.get("total_fee_usdt", 0) or 0)
+                slip = float(row.get("total_slippage_cost_usdt", 0) or 0)
                 klass = "green" if pnl >= 0 else "red"
                 st.markdown(
                     f"""
                     <div class="status-card">
-                      <b>{kline_symbol_link(row.get("symbol"), str(row.get("symbol")))}</b>｜{direction_text(row.get("direction"))}｜{escape(str(row.get("close_reason", "")))}｜<span class="{klass}">{pnl:+.2f} USDT / {float(row.get("pnl_pct", 0) or 0):+.2f}%</span><br>
-                      开仓：{format_price(row.get("entry_price"))}　平仓：{format_price(row.get("exit_price"))}　数量：{float(row.get("quantity", 0) or 0):.6f}　仓位：{money(row.get("notional_usdt"))}<br>
+                      <b>{kline_symbol_link(row.get("symbol"), str(row.get("symbol")))}</b>｜{direction_text(row.get("direction"))}｜{escape(str(row.get("close_reason", "")))}｜净收益 <span class="{klass}">{pnl:+.2f} USDT / {float(row.get("net_pnl_pct", row.get("pnl_pct", 0)) or 0):+.2f}%</span><br>
+                      毛收益：{gross:+.2f} USDT / {float(row.get("gross_pnl_pct", 0) or 0):+.2f}%　手续费：-{fee:.4f}　滑点：-{slip:.4f}　成本后：{escape("有效盈利" if row.get("cost_after_still_profitable") else "无效盈利" if row.get("cost_invalid_profit") else "亏损/持平")}<br>
+                      开仓理论/实际：{format_price(row.get("theoretical_entry_price", row.get("entry_price")))} / {format_price(row.get("actual_entry_price", row.get("entry_price")))}　平仓理论/实际：{format_price(row.get("theoretical_exit_price", row.get("exit_price")))} / {format_price(row.get("actual_exit_price", row.get("exit_price")))}<br>
+                      数量：{float(row.get("quantity", 0) or 0):.6f}　仓位：{money(row.get("notional_usdt"))}　手续费率：{float(row.get("open_fee_rate", 0) or 0):.4%}/{float(row.get("close_fee_rate", 0) or 0):.4%}　滑点率：{float(row.get("entry_slippage_rate", 0) or 0):.4%}/{float(row.get("exit_slippage_rate", 0) or 0):.4%}<br>
                       R倍数：{row.get("r_multiple") if row.get("r_multiple") not in {"", None} else "暂无"}　持仓：{seconds_text(row.get("holding_seconds"))}　委员会：{escape(str(row.get("committee_action", "")))} / 置信度{row.get("committee_confidence", 0)} / 风险{row.get("committee_risk_score", 0)}<br>
                       开仓时间：{escape(str(row.get("open_time", "")))}　平仓时间：{escape(str(row.get("close_time", "")))}
                     </div>
@@ -5588,8 +5617,9 @@ def render_trading() -> None:
             new_settings["initial_balance"] = st.number_input("初始模拟资金 USDT", min_value=100.0, max_value=1000000.0, value=float(settings.get("initial_balance", 1000)), step=100.0)
             new_settings["max_position_pct"] = st.slider("单笔最大仓位比例", 1, 50, int(settings.get("max_position_pct", 10)))
             new_settings["max_risk_pct"] = st.slider("单笔最大风险比例", 1, 10, int(settings.get("max_risk_pct", 1)))
-            new_settings["max_positions"] = st.slider("最大同时持仓数量", 1, 10, int(settings.get("max_positions", 3)))
-            new_settings["max_same_symbol_positions"] = st.slider("同一交易对象最大持仓数量", 1, 3, int(settings.get("max_same_symbol_positions", 1)))
+            new_settings["max_positions"] = 0
+            new_settings["max_same_symbol_positions"] = 0
+            st.caption("模拟交易已取消持仓数量上限：只要模拟账户资金足够且委员会/风控条件通过，就允许继续开仓。")
             new_settings["allow_long"] = st.checkbox("允许模拟做多", value=bool(settings.get("allow_long", True)))
             new_settings["allow_short"] = st.checkbox("允许模拟做空", value=bool(settings.get("allow_short", True)))
             st.info("模拟交易已锁定为 U本位永续合约模拟，杠杆固定 5x，并保持自动持续运行。")
