@@ -1,0 +1,10 @@
+{
+  "default_experience_mode": "FUSED",
+  "allow_single_library_debug": true,
+  "default_single_library": "current",
+  "available_libraries": [
+    "current",
+    "funding_v1",
+    "oi_longshort_recent30_v1"
+  ]
+}

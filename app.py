@@ -128,6 +128,15 @@ from services.experience_library_loader import (
 )
 from services.experience_fusion_engine import build_fused_experience_result
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
+from services.experience_mode_manager import (
+    DEFAULT_EXPERIENCE_MODE,
+    SINGLE_EXPERIENCE_MODE,
+    experience_mode_label,
+    experience_mode_to_legacy,
+    experience_vote_source,
+    load_experience_mode_config,
+    normalize_experience_mode,
+)
 from services.market_risk_radar import analyze_market_risk_radar
 from services.market_scanner import scan_market_opportunities
 from services.local_api_server import get_local_api_port, start_local_api_server
@@ -283,9 +292,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.2.11"
+APP_TITLE = "AI模型 9.2.11.1"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.2.11 多经验库融合决策版"
+VERSION = "AI模型 9.2.11.1 融合经验库默认模式版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -301,8 +310,11 @@ def get_selected_experience_library_version() -> str:
 
 
 def get_selected_experience_mode() -> str:
-    selected = str(st.session_state.get("experience_mode") or "single")
-    return "fused" if selected == "fused" else "single"
+    return normalize_experience_mode(st.session_state.get("experience_mode"))
+
+
+def get_selected_experience_mode_legacy() -> str:
+    return experience_mode_to_legacy(get_selected_experience_mode())
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -372,6 +384,7 @@ PAGE_TITLES = {
 
 def initialize_session_state() -> None:
     """统一初始化首屏需要的状态，不覆盖用户已有选择。"""
+    experience_config = load_experience_mode_config()
     defaults: dict[str, Any] = {
         "active_page": "home",
         "current_symbol": "BTCUSDT",
@@ -383,8 +396,8 @@ def initialize_session_state() -> None:
         "committee_active_symbol": "BTCUSDT",
         "committee_review_queue_symbol": "BTCUSDT",
         "committee_anchor_source": "默认交易对象",
-        "experience_mode": "single",
-        "experience_library_version": DEFAULT_EXPERIENCE_LIBRARY_VERSION,
+        "experience_mode": experience_config.get("default_experience_mode") or DEFAULT_EXPERIENCE_MODE,
+        "experience_library_version": experience_config.get("default_single_library") or DEFAULT_EXPERIENCE_LIBRARY_VERSION,
         "selected_opportunity_symbol": "",
         "topbar_symbol": "BTCUSDT",
         "kline_symbol": "BTCUSDT",
@@ -1585,7 +1598,7 @@ def build_current_committee_decision(symbol: str, ticker: dict[str, Any] | None)
         experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
         experience_library_data_sources=(
             "current + funding_v1 + oi_longshort_recent30_v1"
-            if experience_mode == "fused"
+            if experience_mode == DEFAULT_EXPERIENCE_MODE
             else get_experience_library_data_sources(experience_version)
         ),
     )
@@ -1607,8 +1620,9 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
     opposing = list(decision.get("opposing_members") or [])
     veto_members = list(decision.get("veto_members") or [])
     experience_library = decision.get("experience_library") or {}
-    committee_experience_mode = str(experience_library.get("mode") or get_selected_experience_mode())
+    committee_experience_mode = normalize_experience_mode(experience_library.get("mode") or get_selected_experience_mode())
     committee_experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
+    committee_experience_source = str(experience_library.get("active_source") or experience_vote_source(committee_experience_mode, committee_experience_version))
     committee_experience_sources = str(experience_library.get("data_sources") or get_experience_library_data_sources(committee_experience_version))
     committee_experience_path = str(experience_library.get("path") or EXPERIENCE_LIBRARY_VERSIONS.get(committee_experience_version, ""))
     weight_summary = _committee_weight_summary(decision)
@@ -1657,7 +1671,7 @@ def render_committee_overview_window(decision: dict[str, Any]) -> None:
               <div class="summary-card"><div class="summary-label">风险裁判</div><div class="summary-value {_signal_color("禁止开仓" if v91_risk.get("blocked") else "支持交易")}">{escape(str(v91_risk.get("risk_verdict", "WAIT")))}</div></div>
               <div class="summary-card"><div class="summary-label">仓位委员会</div><div class="summary-value yellow">{float(v91_position.get("position_size_pct", 0) or 0):.2f}% / {int(v91_position.get("leverage", 1) or 1)}x</div></div>
               <div class="summary-card"><div class="summary-label">执行委员会</div><div class="summary-value {_signal_color("支持交易" if v91_execution.get("execution_allowed") else "反对交易")}">{escape(str(v91_execution.get("execution_type", "WAIT")))}</div></div>
-              <div class="summary-card"><div class="summary-label">经验库模式</div><div class="summary-value blue">{escape("融合模式" if committee_experience_mode == "fused" else "单库模式")}</div><div class="module-desc">{escape(committee_experience_version)}｜{escape(committee_experience_sources)}｜经验委员参与正式投票</div></div>
+              <div class="summary-card"><div class="summary-label">经验库模式</div><div class="summary-value blue">{escape(experience_mode_label(committee_experience_mode))}</div><div class="module-desc">交易委员会来源：{escape(committee_experience_source)}｜{escape(committee_experience_sources)}</div></div>
             </div>
             <div class="status-card" style="margin-top:8px;"><b>经验库路径</b><br>{escape(committee_experience_path or "-")}</div>
             {_render_committee_summary_panel(decision)}
@@ -1679,10 +1693,10 @@ def committee_decision_to_sim_signal(decision: dict[str, Any]) -> dict[str, Any]
         return {}
     market_cognition = decision.get("market_cognition") if isinstance(decision.get("market_cognition"), dict) else {}
     experience_library = decision.get("experience_library") if isinstance(decision.get("experience_library"), dict) else {}
-    experience_mode = str(experience_library.get("mode") or get_selected_experience_mode())
+    experience_mode = normalize_experience_mode(experience_library.get("mode") or get_selected_experience_mode())
     experience_version = str(experience_library.get("version") or get_selected_experience_library_version())
     experience_match: dict[str, Any] = {}
-    if experience_mode == "fused" and isinstance(experience_library.get("fused_experience_result"), dict):
+    if experience_mode == DEFAULT_EXPERIENCE_MODE and isinstance(experience_library.get("fused_experience_result"), dict):
         experience_match = experience_library.get("fused_experience_result") or {}
     elif isinstance(experience_library.get("experience_match_result"), dict) and experience_library.get("experience_match_result"):
         experience_match = experience_library.get("experience_match_result") or {}
@@ -1928,7 +1942,7 @@ def render_strategy_committee_preview(strategy: dict[str, Any]) -> None:
         <div class="app-shell">
             <div class="module-card">
               <div class="module-title">策略委员看板</div>
-            <div class="module-desc">本地策略是基础提案层，DeepSeek/Gemini 当前为正式投票委员；观察池委员和策略验证委员暂为影子复核。</div>
+            <div class="module-desc">本地策略是基础提案层，DeepSeek 当前为正式投票委员并承接 Gemini 原权重；Gemini、观察池委员和策略验证委员暂为影子复核。</div>
             <div class="module-grid">
               <div class="status-card">
                 <b>本地策略委员</b><br>
@@ -1938,8 +1952,8 @@ def render_strategy_committee_preview(strategy: dict[str, Any]) -> None:
                 策略：{escape(str(strategy.get("strategy_name", "无有效策略")))}｜仓位：{escape(str(strategy.get("position_suggestion", "0%")))}<br>
                 理由：{escape(str(strategy.get("local_vote_reason", "等待策略数据同步")))}
               </div>
-              <div class="status-card"><b>DeepSeek委员</b><br>正式投票<br>只读取脱敏摘要，不下单、不绕过风控。</div>
-              <div class="status-card"><b>Gemini委员</b><br>正式投票<br>参与权重表决，不读取密钥、不硬否决。</div>
+              <div class="status-card"><b>DeepSeek委员</b><br>正式投票<br>承接 Gemini 原权重，只读取脱敏摘要，不下单、不绕过风控。</div>
+              <div class="status-card"><b>Gemini委员</b><br>影子观察<br>只做参考展示，不参与正式权重表决、不硬否决。</div>
               <div class="status-card"><b>人工仓位干预</b><br>受限启用<br>只能低于风控最大仓位，超系统建议需确认。</div>
             </div>
           </div>
@@ -3323,23 +3337,25 @@ def render_cognition_snapshot_validation_panel() -> None:
 def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
     """Render experience-library status and live matching result."""
     symbol = str(cognition.get("symbol") or st.session_state.get("current_symbol", "")).upper()
+    experience_config = load_experience_mode_config()
     version_statuses = get_cached_experience_library_versions_status()
     version_options = list(EXPERIENCE_LIBRARY_VERSIONS.keys())
     current_version = get_selected_experience_library_version()
     if st.session_state.get("experience_library_version") not in version_options:
-        st.session_state["experience_library_version"] = DEFAULT_EXPERIENCE_LIBRARY_VERSION
-    if st.session_state.get("experience_mode") not in {"single", "fused"}:
-        st.session_state["experience_mode"] = "single"
+        st.session_state["experience_library_version"] = experience_config.get("default_single_library") or DEFAULT_EXPERIENCE_LIBRARY_VERSION
+    st.session_state["experience_mode"] = normalize_experience_mode(st.session_state.get("experience_mode"))
+    current_mode = get_selected_experience_mode()
     selected_mode = st.radio(
         "经验库模式",
-        ["single", "fused"],
-        index=1 if get_selected_experience_mode() == "fused" else 0,
-        format_func=lambda mode: "融合模式" if mode == "fused" else "单库模式",
+        [DEFAULT_EXPERIENCE_MODE, SINGLE_EXPERIENCE_MODE],
+        index=0 if current_mode == DEFAULT_EXPERIENCE_MODE else 1,
+        format_func=experience_mode_label,
         horizontal=True,
         key="experience_mode",
     )
+    selected_mode = normalize_experience_mode(selected_mode)
     selected_version = st.selectbox(
-        "经验库版本选择",
+        "单库调试版本选择",
         version_options,
         index=version_options.index(current_version) if current_version in version_options else 0,
         format_func=lambda version: (
@@ -3407,7 +3423,7 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         version: match_cached_experience(query, version)
         for version in version_options
     }
-    fused_result = build_cached_fused_experience_result(query) if selected_mode == "fused" else {}
+    fused_result = build_cached_fused_experience_result(query)
     total_samples = int(float(match.get("matched_sample_count") or 0))
     exact_samples = int(float(match.get("exact_sample_count") or 0))
     similar_samples = int(float(match.get("similar_state_sample_count") or 0))
@@ -3501,12 +3517,20 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         for version in version_options
     )
     fused_panel = ""
-    if selected_mode == "fused":
+    active_source = experience_vote_source(selected_mode, selected_version)
+    cost_expectancy = (
+        fused_result.get("cost_adjusted_expectancy")
+        if fused_result.get("cost_adjusted_expectancy") is not None
+        else fused_result.get("cost_after_expectancy")
+    )
+    edge_value = fused_result.get("edge") if fused_result.get("edge") is not None else fused_result.get("expected_edge")
+    if selected_mode == DEFAULT_EXPERIENCE_MODE:
         fused_panel = f"""
             <div class="status-card" style="margin-top:8px;">
               <b>多经验库融合结果</b><br>
               使用的经验库：{escape("、".join(str(x) for x in list(fused_result.get("used_libraries") or [])) or "无")}<br>
               权重：{escape(", ".join(f"{k}={v:.1f}%" for k, v in (fused_weights or {}).items()) or "无可用权重")}<br>
+              成本后期望值：{_plain(cost_expectancy, 4)}｜edge：{_plain(edge_value, 4)}<br>
               明确提示：oi_longshort_recent30_v1 是最近30天修正库，不是长期历史库。
             </div>
             <div class="committee-grid" style="margin-top:8px;">
@@ -3533,17 +3557,27 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
         <div class="app-shell">
           <div class="module-card">
             <div class="module-title">经验匹配结果</div>
-            <div class="module-desc">经验委员按单币种、同类币种、全市场三层经验匹配当前市场认知。当前模式：{escape("融合模式" if selected_mode == "fused" else "单库模式")}；单库选择：{escape(selected_version)}。</div>
+            <div class="module-desc">当前用于交易委员会的是：{escape("融合经验库" if selected_mode == DEFAULT_EXPERIENCE_MODE else selected_version)}。单库模式仅用于调试 / 对比 / 观察。</div>
             <div class="committee-grid">
               {version_rows}
             </div>
             <div class="committee-grid">
+              <div class="summary-card"><div class="summary-label">当前经验库模式</div><div class="summary-value blue">{escape(experience_mode_label(selected_mode))}</div></div>
+              <div class="summary-card"><div class="summary-label">委员会经验来源</div><div class="summary-value yellow">{escape(active_source)}</div><div class="module-desc">{escape("FUSED 参与正式投票" if selected_mode == DEFAULT_EXPERIENCE_MODE else "单库调试参与正式投票")}</div></div>
               <div class="summary-card"><div class="summary-label">经验库状态</div><div class="summary-value {status_class}">{escape(status)}</div></div>
               <div class="summary-card"><div class="summary-label">当前经验库版本</div><div class="summary-value blue">{escape(selected_version)}</div><div class="module-desc">{escape(EXPERIENCE_LIBRARY_LABELS.get(selected_version, selected_version))}</div></div>
               <div class="summary-card"><div class="summary-label">data_sources</div><div class="summary-value yellow">{escape(data_sources)}</div></div>
               <div class="summary-card"><div class="summary-label">单币种经验</div><div class="summary-value {'green' if summary.get('symbol_level_found') else 'red'}">{'已发现' if summary.get('symbol_level_found') else '缺失'}</div></div>
               <div class="summary-card"><div class="summary-label">同类币种经验</div><div class="summary-value {'green' if summary.get('group_level_found') else 'red'}">{'已发现' if summary.get('group_level_found') else '缺失'}</div></div>
               <div class="summary-card"><div class="summary-label">全市场经验</div><div class="summary-value {'green' if summary.get('global_level_found') else 'red'}">{'已发现' if summary.get('global_level_found') else '缺失'}</div></div>
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>融合模式说明</b><br>
+              融合模式会同时参考 current、funding_v1、oi_longshort_recent30_v1，但不会物理合并数据文件。
+            </div>
+            <div class="status-card" style="margin-top:8px;">
+              <b>单库调试说明</b><br>
+              单库模式仅用于观察某个经验库的独立判断，不建议长期作为默认决策模式。
             </div>
             <div class="committee-grid" style="margin-top:8px;">
               {_level_card("单币种匹配", symbol_level)}
@@ -3599,7 +3633,7 @@ def render_experience_library_status_panel(cognition: dict[str, Any]) -> None:
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>三库对比</b><br>
-              {escape("融合模式下，交易委员会经验委员使用 fused_experience_result 参与正式投票。" if selected_mode == "fused" else f"单库模式下，交易委员会经验委员使用用户当前选择的经验库版本：{selected_version}。")}
+              {escape("融合模式下，交易委员会经验委员使用 fused_experience_result 参与正式投票，单库结果只作为参考展示。" if selected_mode == DEFAULT_EXPERIENCE_MODE else f"单库调试模式下，交易委员会经验委员使用用户当前选择的经验库版本：{selected_version}。")}
             </div>
             <div class="committee-grid" style="margin-top:8px;">
               {comparison_cards}
@@ -4579,7 +4613,7 @@ def render_ai_committee_decision(decision: dict[str, Any]) -> None:
             </div>
             <div class="status-card" style="margin-top:8px;">
               <b>决策权治理</b><br>
-              本地策略委员定位：基础提案层。风险委员和实盘安全委员拥有硬否决权。DeepSeek/Gemini 当前为正式投票成员；观察池/策略验证暂为影子复核。<br>
+              本地策略委员定位：基础提案层。风险委员和实盘安全委员拥有硬否决权。DeepSeek 当前为正式投票成员并承接 Gemini 原权重；Gemini/观察池/策略验证暂为影子复核。<br>
               硬否决：{escape("已触发" if hard.get("blocked") else "未触发")}｜软否决：{escape(soft_text)}<br>
               权重结果：{escape(weight_vote_text)}｜直接决策权重：{escape(_fmt_weight(weight_summary["direct_weight"]))}｜配置总权重：{escape(_fmt_weight(weight_summary["total_config_weight"]))}
             </div>
@@ -4930,7 +4964,7 @@ def render_signal_analysis(symbol: str, ticker: dict[str, Any] | None) -> None:
         experience_library_path=EXPERIENCE_LIBRARY_VERSIONS.get(experience_version, ""),
         experience_library_data_sources=(
             "current + funding_v1 + oi_longshort_recent30_v1"
-            if experience_mode == "fused"
+            if experience_mode == DEFAULT_EXPERIENCE_MODE
             else get_experience_library_data_sources(experience_version)
         ),
     )
@@ -5741,7 +5775,7 @@ def render_learning() -> None:
 
     with tabs[3]:
         perf = get_external_ai_performance_summary()
-        st.markdown("DeepSeek/Gemini 当前为正式投票委员，参与委员会权重统计；仍不能直接执行交易或绕过风控。")
+        st.markdown("DeepSeek 当前为正式投票委员并承接 Gemini 原权重；Gemini 已降级为影子观察，只作参考展示。两者都不能直接执行交易或绕过风控。")
         for provider, label in [("deepseek", "DeepSeek"), ("gemini", "Gemini")]:
             item = perf.get(provider) or {}
             dirs = item.get("direction_counts") or {}

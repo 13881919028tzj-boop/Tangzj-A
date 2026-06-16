@@ -57,10 +57,20 @@ except Exception:  # pragma: no cover
 try:
     from services.experience_fusion_engine import build_fused_experience_result
     from services.experience_matcher import build_experience_query_from_cognition, match_experience
+    from services.experience_mode_manager import (
+        DEFAULT_EXPERIENCE_MODE,
+        experience_mode_to_legacy,
+        experience_vote_source,
+        normalize_experience_mode,
+    )
 except Exception:  # pragma: no cover
     build_fused_experience_result = None
     build_experience_query_from_cognition = None
     match_experience = None
+    DEFAULT_EXPERIENCE_MODE = "FUSED"
+    experience_mode_to_legacy = lambda value: "fused" if str(value).strip().upper() == "FUSED" else "single"
+    experience_vote_source = lambda mode, selected_library=None: "FUSED" if str(mode).strip().upper() == "FUSED" else str(selected_library or "current")
+    normalize_experience_mode = lambda value: "FUSED" if str(value or "FUSED").strip().upper() in {"FUSED", "FUSION"} else "SINGLE"
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -76,11 +86,11 @@ COMMITTEE_WEIGHTS = {
     "经验委员": 8,
     "风险委员": 14,
     "实盘安全委员": 10,
-    "DeepSeek委员": 10,
-    "Gemini委员": 6,
+    "DeepSeek委员": 16,
+    "Gemini委员": 0,
 }
-SHADOW_MEMBERS = {"观察池委员", "策略验证委员"}
-FORMAL_EXTERNAL_MEMBERS = {"DeepSeek委员", "Gemini委员"}
+SHADOW_MEMBERS = {"观察池委员", "策略验证委员", "Gemini委员"}
+FORMAL_EXTERNAL_MEMBERS = {"DeepSeek委员"}
 OFFICIAL_MEMBERS = set(COMMITTEE_WEIGHTS)
 VOTE_STRENGTH = {
     "strong_support": 1.0,
@@ -377,7 +387,7 @@ def collect_committee_inputs(symbol: str, **kwargs: Any) -> dict[str, Any]:
         "radar": kwargs.get("radar") or {},
         "local_strategy": kwargs.get("local_strategy") or {},
         "market_cognition": kwargs.get("market_cognition") or {},
-        "experience_mode": kwargs.get("experience_mode") or "single",
+        "experience_mode": normalize_experience_mode(kwargs.get("experience_mode")),
         "fused_experience_result": kwargs.get("fused_experience_result") or {},
         "experience_match_result": kwargs.get("experience_match_result") or {},
         "experience_library_version": kwargs.get("experience_library_version") or "current",
@@ -742,11 +752,11 @@ def _experience_vote_to_member_vote(vote: Any, direction: Any) -> tuple[str, str
 
 
 def run_experience_member(data: dict[str, Any]) -> dict[str, Any]:
-    mode = str(data.get("experience_mode") or "single")
+    mode = normalize_experience_mode(data.get("experience_mode"))
     cognition = data.get("market_cognition") or {}
     symbol = str(data.get("symbol") or "BTCUSDT")
     experience_result: dict[str, Any] = {}
-    if mode == "fused":
+    if mode == DEFAULT_EXPERIENCE_MODE:
         experience_result = data.get("fused_experience_result") or {}
         if not experience_result and build_fused_experience_result and build_experience_query_from_cognition and cognition:
             try:
@@ -779,7 +789,21 @@ def run_experience_member(data: dict[str, Any]) -> dict[str, Any]:
             risks=risks or ["历史经验只作为概率参考，仍需风险委员复核。"],
             summary=f"经验库模式：融合模式，使用 fused_experience_result 参与委员会。",
         )
-        member["experience_mode"] = "fused"
+        member["experience_mode"] = "FUSED"
+        member["source"] = "FUSED"
+        member["experience_source"] = "FUSED"
+        member["experience_vote"] = vote_key
+        member["experience_direction"] = direction_key
+        member["experience_score"] = score
+        member["experience_confidence"] = confidence
+        member["experience_member_result"] = {
+            "vote": vote_key,
+            "direction": direction_key,
+            "score": score,
+            "confidence": confidence,
+            "reason": reason,
+            "source": "FUSED",
+        }
         member["fused_experience_result"] = experience_result
         return member
 
@@ -809,7 +833,21 @@ def run_experience_member(data: dict[str, Any]) -> dict[str, Any]:
         risks=[] if support else [reason],
         summary=f"经验库模式：单库模式，当前版本 {data.get('experience_library_version') or 'current'}。",
     )
-    member["experience_mode"] = "single"
+    member["experience_mode"] = "SINGLE"
+    member["source"] = str(data.get("experience_library_version") or "current")
+    member["experience_source"] = str(data.get("experience_library_version") or "current")
+    member["experience_vote"] = vote_key
+    member["experience_direction"] = direction_key
+    member["experience_score"] = _to_int(experience_result.get("score"), 0)
+    member["experience_confidence"] = confidence
+    member["experience_member_result"] = {
+        "vote": vote_key,
+        "direction": direction_key,
+        "score": _to_int(experience_result.get("score"), 0),
+        "confidence": confidence,
+        "reason": reason,
+        "source": str(data.get("experience_library_version") or "current"),
+    }
     member["experience_match_result"] = experience_result
     return member
 
@@ -1191,7 +1229,9 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
         "vote_detail": vote_result,
         "committee_weights": COMMITTEE_WEIGHTS,
         "experience_library": {
-            "mode": data.get("experience_mode") or "single",
+            "mode": normalize_experience_mode(data.get("experience_mode")),
+            "legacy_mode": experience_mode_to_legacy(data.get("experience_mode")),
+            "active_source": experience_vote_source(data.get("experience_mode"), data.get("experience_library_version") or "current"),
             "version": data.get("experience_library_version") or "current",
             "path": data.get("experience_library_path") or "",
             "data_sources": data.get("experience_library_data_sources") or "",

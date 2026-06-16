@@ -34,6 +34,7 @@ from services.experience_library_loader import (
 )
 from services.experience_matcher import build_experience_query_from_cognition, match_experience
 from services.experience_fusion_engine import build_fused_experience_result
+from services.experience_mode_manager import DEFAULT_EXPERIENCE_MODE, normalize_experience_mode
 
 
 BASE_WEIGHTS = {
@@ -206,11 +207,11 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
     symbol = str(decision.get("symbol") or data.get("symbol") or cognition.get("symbol") or "").upper()
     ticker = data.get("ticker") or {}
     state_code = str(cognition.get("state_code") or "")
-    experience_mode = str(data.get("experience_mode") or "single")
+    experience_mode = normalize_experience_mode(data.get("experience_mode"))
     selected_version = normalize_experience_library_version(data.get("experience_library_version"))
     selected_path = str(data.get("experience_library_path") or get_experience_library_path(selected_version))
     query = build_experience_query_from_cognition(symbol, cognition, ticker=ticker)
-    if experience_mode == "fused":
+    if experience_mode == DEFAULT_EXPERIENCE_MODE:
         fused = data.get("fused_experience_result") or build_fused_experience_result(query)
         data["fused_experience_result"] = fused
         reason = fused.get("reason") or "融合经验库未形成可用结论，当前经验委员弃权。"
@@ -243,7 +244,13 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
             result = abstain_member("经验委员", "experience", reason, {"fused_experience_result": fused})
         result.update({
             "enabled": bool(fused.get("available") and fused.get("fused_vote") != VOTE_ABSTAIN),
-            "experience_mode": "fused",
+            "experience_mode": "FUSED",
+            "source": "FUSED",
+            "experience_source": "FUSED",
+            "experience_vote": fused.get("fused_vote") or VOTE_ABSTAIN,
+            "experience_direction": fused.get("fused_direction") or DIRECTION_WAIT,
+            "experience_score": fused.get("fused_score", 0),
+            "experience_confidence": fused.get("fused_confidence", 0),
             "experience_library_available": bool(fused.get("available")),
             "experience_library_path": "current + funding_v1 + oi_longshort_recent30_v1",
             "experience_library_status": {"mode": "FUSED", "used_libraries": fused.get("used_libraries", [])},
@@ -296,6 +303,9 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
     else:
         result = abstain_member("经验委员", "experience", reason, {"match_result": {"matched": match.get("matched"), "warnings": match.get("warnings", [])}})
     result.update({
+        "experience_mode": "SINGLE",
+        "source": selected_version,
+        "experience_source": selected_version,
         "enabled": bool(match.get("matched") and match.get("vote") != VOTE_ABSTAIN),
         "experience_library_available": bool(library_summary.get("available")),
         "experience_library_path": library_path,
@@ -369,12 +379,13 @@ def build_orderbook_member(data: dict[str, Any], decision: dict[str, Any]) -> di
 
 
 def build_reasoning_member(data: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
-    votes = _pick_votes(decision, {"DeepSeek委员", "Gemini委员"})
+    votes = _pick_votes(decision, {"DeepSeek委员"})
     available = [v for v in votes if clamp_score(v.get("confidence"), 0) > 0 and str(v.get("vote_code")) != "observe"]
     integrity = 100.0 if available else 0.0
-    result = _aggregate_old_votes(name="推理委员", role="reasoning", votes=votes, data_integrity_score=integrity, fallback_reason="DeepSeek/Gemini 当前不可用或未形成有效意见，推理委员弃权。")
-    result["model_used"] = "DeepSeek/Gemini" if available else "none"
+    result = _aggregate_old_votes(name="推理委员", role="reasoning", votes=votes, data_integrity_score=integrity, fallback_reason="DeepSeek 当前不可用或未形成有效意见，推理委员弃权。Gemini 已降级为影子观察，不参与正式权重。")
+    result["model_used"] = "DeepSeek" if available else "none"
     result["raw_model_available"] = bool(available)
+    result["shadow_model"] = "Gemini"
     return result
 
 
@@ -538,7 +549,7 @@ def build_trading_committee_v91(data: dict[str, Any], decision: dict[str, Any]) 
     if DIRECTION_LONG in dirs and DIRECTION_SHORT in dirs:
         conflicts.append("委员方向存在LONG/SHORT冲突。")
     return {
-        "version": "AI模型 9.2.11 多经验库融合决策版",
+        "version": "AI模型 9.2.11.1 融合经验库默认模式版",
         "symbol": decision.get("symbol") or data.get("symbol"),
         "final_action": final_action,
         "final_direction": final_direction,
