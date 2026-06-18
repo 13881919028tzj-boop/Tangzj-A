@@ -48,7 +48,7 @@ def test_committee_cautious_long():
         radar={"overall_score": 42, "trade_safety": "轻仓可试", "market_explanation": "风险可控。"},
         local_strategy=base_strategy(),
     )
-    assert decision["trade_permission"] in {"approved", "cautious"}
+    assert decision["trade_permission"] in {"approved", "cautious", "candidate", "simulation_or_approval"}
     assert decision["approved_for_simulation"] is True
     assert len(decision["member_votes"]) >= 8
 

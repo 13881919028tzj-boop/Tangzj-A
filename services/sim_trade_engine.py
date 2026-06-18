@@ -37,8 +37,8 @@ DEFAULT_SETTINGS = {
     "initial_balance": 1000.0,
     "max_position_pct": 10.0,
     "max_risk_pct": 1.0,
-    "max_positions": 3,
-    "max_same_symbol_positions": 1,
+    "max_positions": 0,
+    "max_same_symbol_positions": 0,
     "allow_long": True,
     "allow_short": True,
     "leverage": 5,
@@ -55,6 +55,12 @@ DEFAULT_SETTINGS = {
     "signal_ttl_minutes": 60,
     "cooldown_minutes": 15,
     "mode": "auto",
+    "min_order_margin_usdt": 0.5,
+    "dynamic_stop_loss_base_pct": 1.25,
+    "dynamic_stop_loss_high_risk_pct": 0.85,
+    "dynamic_stop_loss_low_risk_pct": 1.55,
+    "dynamic_take_profit_1_r": 1.4,
+    "dynamic_take_profit_2_r": 2.8,
 }
 
 
@@ -177,6 +183,8 @@ def load_settings() -> dict[str, Any]:
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
         merged["ignore_loss_limits"] = True
+        merged["max_positions"] = 0
+        merged["max_same_symbol_positions"] = 0
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     return merged
@@ -190,6 +198,8 @@ def save_settings(settings: dict[str, Any]) -> None:
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
         merged["ignore_loss_limits"] = True
+        merged["max_positions"] = 0
+        merged["max_same_symbol_positions"] = 0
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     _write_json(SETTINGS_PATH, merged)
@@ -205,6 +215,10 @@ def init_sim_account() -> dict[str, Any]:
     if _positive_float(account.get("initial_balance"), 0.0) <= 0:
         account["initial_balance"] = initial_balance
         account.setdefault("initial_equity", initial_balance)
+        _write_json(ACCOUNT_PATH, account)
+    if settings.get("continuous_run", True) and account.get("status") != "running":
+        account["status"] = "running"
+        account["mode"] = "auto"
         _write_json(ACCOUNT_PATH, account)
     return account
 
@@ -442,6 +456,41 @@ def _price_field(data: dict[str, Any] | None) -> float:
     return _to_float((data or {}).get("price"), 0)
 
 
+def _dynamic_exit_prices(price: float, direction: str, risk_score: float, settings: dict[str, Any]) -> tuple[float, float, float, float]:
+    """Build a conservative two-target plan from entry price and risk score."""
+    base_pct = _to_float(settings.get("dynamic_stop_loss_base_pct"), 1.25) / 100
+    high_risk_pct = _to_float(settings.get("dynamic_stop_loss_high_risk_pct"), 0.85) / 100
+    low_risk_pct = _to_float(settings.get("dynamic_stop_loss_low_risk_pct"), 1.55) / 100
+    if risk_score >= 75:
+        stop_pct = high_risk_pct
+    elif risk_score <= 40:
+        stop_pct = low_risk_pct
+    else:
+        stop_pct = base_pct
+    tp1_r = _to_float(settings.get("dynamic_take_profit_1_r"), 1.4)
+    tp2_r = _to_float(settings.get("dynamic_take_profit_2_r"), 2.8)
+    if direction == "short":
+        return price * (1 + stop_pct), price * (1 - stop_pct * tp1_r), price * (1 - stop_pct * tp2_r), stop_pct
+    return price * (1 - stop_pct), price * (1 + stop_pct * tp1_r), price * (1 + stop_pct * tp2_r), stop_pct
+
+
+def _normalize_signal_exit_plan(signal: dict[str, Any], current_price: float, settings: dict[str, Any]) -> tuple[float, float, float, float]:
+    direction = str(signal.get("direction", "long"))
+    risk_score = _to_float(signal.get("risk_score"), _to_float(signal.get("committee_risk_score"), 50))
+    dynamic_stop, dynamic_tp1, dynamic_tp2, stop_pct = _dynamic_exit_prices(current_price, direction, risk_score, settings)
+    stop = _price_field(signal.get("stop_loss")) or dynamic_stop
+    tp1 = _price_field(signal.get("take_profit_1")) or dynamic_tp1
+    tp2 = _price_field(signal.get("take_profit_2")) or dynamic_tp2
+    invalid = False
+    if direction == "short":
+        invalid = stop <= current_price or tp1 >= current_price or tp2 >= current_price or tp2 >= tp1
+    else:
+        invalid = stop >= current_price or tp1 <= current_price or tp2 <= current_price or tp2 <= tp1
+    if invalid:
+        stop, tp1, tp2 = dynamic_stop, dynamic_tp1, dynamic_tp2
+    return stop, tp1, tp2, stop_pct
+
+
 def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[str, float] | None = None) -> tuple[bool, list[str]]:
     settings = load_settings()
     account = load_sim_account()
@@ -450,9 +499,9 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
     symbol = str(signal.get("symbol", "")).upper()
     action = str(signal.get("action", ""))
     direction = str(signal.get("direction", ""))
-    if action not in {"轻仓试多", "顺势做多", "轻仓试空", "顺势做空"}:
+    if action not in {"轻仓试多", "顺势做多", "轻仓试空", "顺势做空", "高风险轻仓模拟", "高风险轻仓试空", "顺势交易候选"}:
         reasons.append("委员会最终动作不属于可模拟开仓动作。")
-    if str(signal.get("trade_permission", "")) not in {"approved", "cautious", ""}:
+    if str(signal.get("trade_permission", "")) not in {"approved", "cautious", "candidate", "simulation_or_approval", ""}:
         reasons.append("委员会交易许可未通过。")
     if signal.get("approved_for_simulation") is False:
         reasons.append("委员会未批准进入模拟候选。")
@@ -470,14 +519,15 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("参数设置不允许模拟做多。")
     if direction == "short" and not settings.get("allow_short", True):
         reasons.append("参数设置不允许模拟做空。")
-    if len(positions) >= int(settings.get("max_positions", 3)):
+    max_positions = int(_to_float(settings.get("max_positions"), 0))
+    max_same_symbol = int(_to_float(settings.get("max_same_symbol_positions"), 0))
+    if max_positions > 0 and len(positions) >= max_positions:
         reasons.append("当前持仓数量已达到上限。")
     same_symbol = [p for p in positions if p.get("symbol") == symbol]
-    if len(same_symbol) >= int(settings.get("max_same_symbol_positions", 1)):
+    if max_same_symbol > 0 and len(same_symbol) >= max_same_symbol:
         reasons.append(f"当前已持有 {symbol} 模拟仓位。")
-    same_order = [o for o in load_orders() if o.get("status") == "pending" and o.get("symbol") == symbol]
-    if same_order:
-        reasons.append(f"当前已有 {symbol} 待触发模拟订单。")
+    if _to_float(account.get("available_balance"), 0) <= 0:
+        reasons.append("模拟账户可用余额不足，无法继续开仓。")
     ignore_loss_limits = bool(settings.get("continuous_run", True) or settings.get("ignore_loss_limits", True))
     if not ignore_loss_limits:
         if _to_float(account.get("daily_pnl"), 0) <= -_to_float(account.get("initial_balance"), 1000) * _to_float(settings.get("daily_loss_limit_pct"), 3) / 100:
@@ -505,17 +555,16 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
     low, high = _entry_zone(signal, current_price)
     pct = _position_pct(signal, settings)
     if pct <= 0:
-        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason="仓位建议为0%。")
+        pct = min(2.0, float(settings.get("max_position_pct", 10)))
+    available = _to_float(account.get("available_balance"), 0)
+    min_margin = _to_float(settings.get("min_order_margin_usdt"), 0.5)
+    if available < min_margin:
+        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason=f"可用余额低于最小模拟保证金 {min_margin:.2f} USDT。")
         return None
-    margin = min(_to_float(account.get("available_balance"), 0), _to_float(account.get("equity"), 0) * pct / 100)
+    margin = min(available, max(min_margin, _to_float(account.get("equity"), 0) * pct / 100))
     leverage = 5 if settings.get("futures_leverage_locked", True) else max(1, min(20, int(settings.get("leverage", 5))))
     notional = margin * leverage
-    stop = _price_field(signal.get("stop_loss"))
-    tp1 = _price_field(signal.get("take_profit_1"))
-    tp2 = _price_field(signal.get("take_profit_2"))
-    if stop <= 0 or tp1 <= 0 or tp2 <= 0:
-        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason="止损或止盈价格不可用。")
-        return None
+    stop, tp1, tp2, dynamic_stop_pct = _normalize_signal_exit_plan(signal, current_price, settings)
     order = {
         "order_id": f"sim_order_{int(time.time() * 1000)}",
         "symbol": symbol,
@@ -528,6 +577,9 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
         "stop_loss": stop,
         "take_profit_1": tp1,
         "take_profit_2": tp2,
+        "dynamic_stop_loss_pct": round(dynamic_stop_pct * 100, 4),
+        "dynamic_take_profit_1_r": settings.get("dynamic_take_profit_1_r", 1.4),
+        "dynamic_take_profit_2_r": settings.get("dynamic_take_profit_2_r", 2.8),
         "position_pct": signal.get("position_suggestion", "0%"),
         "notional_usdt": notional,
         "margin_usdt": margin,
@@ -548,7 +600,7 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
     if mode == "立即按当前价模拟开仓" or low <= current_price <= high:
         order["status"] = "filled"
         open_sim_position(order, current_price)
-        log_sim_event("模拟开仓", symbol, direction, current_price, content=f"由委员会信号触发，仓位 {margin:.2f} USDT。")
+        log_sim_event("模拟开仓", symbol, direction, current_price, content=f"由委员会信号触发，仓位 {margin:.2f} USDT，动态止损 {dynamic_stop_pct * 100:.2f}%。")
     else:
         orders = load_orders()
         orders.insert(0, order)
@@ -921,12 +973,8 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
     results: list[dict[str, Any]] = []
     if account.get("status") != "running" or settings.get("mode") == "observe":
         return [{"status": "skipped", "reason": "模拟交易未运行或处于仅观察模式。"}]
-    existing_orders = [o for o in load_orders() if o.get("status") == "pending"]
     for signal in signals[:10]:
         symbol = str(signal.get("symbol", "")).upper()
-        if any(o.get("symbol") == symbol for o in existing_orders):
-            results.append({"symbol": symbol, "status": "rejected", "reason": "当前已有待触发模拟订单。"})
-            continue
         price = get_current_price(symbol, current_prices)
         ok, reasons = validate_signal_for_simulation(signal, current_prices)
         if not ok:

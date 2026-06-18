@@ -262,9 +262,9 @@ from services.watchlist_manager import (
 from services.whale_monitor import analyze_dealer_behavior
 
 
-APP_TITLE = "AI模型 9.1.1"
+APP_TITLE = "AI模型 10.0"
 APP_SUBTITLE = "Binance AI Assistant Mobile First"
-VERSION = "AI模型 9.1.1 交易委员会页面残留显示修复版"
+VERSION = "AI模型 10.0 本地策略持续模拟版"
 FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 KLINE_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h"]
 MA_OPTIONS = ["MA5", "MA10", "MA20", "MA60", "MA120"]
@@ -4833,8 +4833,9 @@ def render_trading() -> None:
             new_settings["initial_balance"] = st.number_input("初始模拟资金 USDT", min_value=100.0, max_value=1000000.0, value=float(settings.get("initial_balance", 1000)), step=100.0)
             new_settings["max_position_pct"] = st.slider("单笔最大仓位比例", 1, 50, int(settings.get("max_position_pct", 10)))
             new_settings["max_risk_pct"] = st.slider("单笔最大风险比例", 1, 10, int(settings.get("max_risk_pct", 1)))
-            new_settings["max_positions"] = st.slider("最大同时持仓数量", 1, 10, int(settings.get("max_positions", 3)))
-            new_settings["max_same_symbol_positions"] = st.slider("同一交易对象最大持仓数量", 1, 3, int(settings.get("max_same_symbol_positions", 1)))
+            st.info("10.0 本地策略版已关闭模拟持仓数量上限：只要账户有可用模拟余额，后台会持续按候选信号开仓。")
+            new_settings["max_positions"] = 0
+            new_settings["max_same_symbol_positions"] = 0
             new_settings["allow_long"] = st.checkbox("允许模拟做多", value=bool(settings.get("allow_long", True)))
             new_settings["allow_short"] = st.checkbox("允许模拟做空", value=bool(settings.get("allow_short", True)))
             st.info("模拟交易已锁定为 U本位永续合约模拟，杠杆固定 5x，并保持自动持续运行。")
@@ -4847,6 +4848,11 @@ def render_trading() -> None:
             new_settings["mode"] = "auto"
             new_settings["tp1_close_pct"] = st.slider("止盈1平仓比例", 10, 90, int(settings.get("tp1_close_pct", 50)))
             new_settings["move_sl_to_breakeven"] = st.checkbox("止盈1后移动止损到保本", value=bool(settings.get("move_sl_to_breakeven", True)))
+            new_settings["dynamic_stop_loss_base_pct"] = st.number_input("动态止损基准 %", min_value=0.2, max_value=5.0, value=float(settings.get("dynamic_stop_loss_base_pct", 1.25)), step=0.05)
+            new_settings["dynamic_stop_loss_high_risk_pct"] = st.number_input("高风险动态止损 %", min_value=0.2, max_value=5.0, value=float(settings.get("dynamic_stop_loss_high_risk_pct", 0.85)), step=0.05)
+            new_settings["dynamic_stop_loss_low_risk_pct"] = st.number_input("低风险动态止损 %", min_value=0.2, max_value=5.0, value=float(settings.get("dynamic_stop_loss_low_risk_pct", 1.55)), step=0.05)
+            new_settings["dynamic_take_profit_1_r"] = st.number_input("止盈1 R倍数", min_value=0.5, max_value=5.0, value=float(settings.get("dynamic_take_profit_1_r", 1.4)), step=0.1)
+            new_settings["dynamic_take_profit_2_r"] = st.number_input("止盈2 R倍数", min_value=1.0, max_value=8.0, value=float(settings.get("dynamic_take_profit_2_r", 2.8)), step=0.1)
             new_settings["daily_loss_limit_pct"] = st.slider("每日最大亏损限制", 1, 20, int(settings.get("daily_loss_limit_pct", 3)))
             new_settings["max_drawdown_limit_pct"] = st.slider("最大回撤限制", 1, 30, int(settings.get("max_drawdown_limit_pct", 8)))
             new_settings["consecutive_loss_pause"] = st.slider("连续亏损暂停次数", 1, 10, int(settings.get("consecutive_loss_pause", 3)))

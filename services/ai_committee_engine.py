@@ -57,15 +57,15 @@ COMMITTEE_WEIGHTS = {
     "本地策略委员": 22,
     "趋势委员": 8,
     "资金委员": 9,
-    "盘口委员": 6,
+    "盘口委员": 17,
     "清算委员": 7,
-    "大单 / 庄家委员": 8,
+    "大单 / 庄家委员": 18,
     "风险委员": 14,
-    "实盘安全委员": 10,
-    "DeepSeek委员": 10,
-    "Gemini委员": 6,
+    "实盘安全委员": 0,
+    "DeepSeek委员": 3,
+    "Gemini委员": 2,
 }
-SHADOW_MEMBERS = {"观察池委员", "策略验证委员"}
+SHADOW_MEMBERS = {"观察池委员", "策略验证委员", "实盘安全委员"}
 FORMAL_EXTERNAL_MEMBERS = {"DeepSeek委员", "Gemini委员"}
 OFFICIAL_MEMBERS = set(COMMITTEE_WEIGHTS)
 VOTE_STRENGTH = {
@@ -292,6 +292,9 @@ def _normalize_member(member: dict[str, Any], data: dict[str, Any]) -> dict[str,
     )
     if is_shadow:
         member.setdefault("shadow_reason", "当前样本不足，仅作参考，不参与正式加权投票。")
+    if name == "实盘安全委员":
+        member["execution_gate_only"] = True
+        member["shadow_reason"] = "实盘安全委员只控制真实交易执行链路，不参与模拟方向投票。"
     return member
 
 
@@ -389,9 +392,13 @@ def run_local_strategy_member(data: dict[str, Any]) -> dict[str, Any]:
     risk_score = _to_int(strategy.get("risk_score"), 85)
     reasons = list(strategy.get("reasons") or [])[:3]
     risks = list(strategy.get("risks") or [])[:3]
-    veto = permission == "blocked" or quality == "poor" or action == "禁止开仓"
+    veto = quality == "poor" or action == "禁止开仓"
+    blocked_but_not_veto = permission == "blocked" and not veto
     if veto:
         vote = "否决交易"
+        support = False
+    elif blocked_but_not_veto:
+        vote = "反对交易"
         support = False
     elif direction == "long":
         vote = "支持做多"
@@ -501,12 +508,28 @@ def run_orderbook_member(data: dict[str, Any]) -> dict[str, Any]:
     buy_ratio = _to_float(orderbook.get("buy_ratio"), 50)
     sell_ratio = _to_float(orderbook.get("sell_ratio"), 50)
     bias = str(orderbook.get("bias", "多空均衡"))
+    spread = _to_float(orderbook.get("spread_pct"), _to_float(orderbook.get("spread"), 0))
+    imbalance = abs(buy_ratio - sell_ratio)
     reasons = [f"盘口状态：{bias}，买盘占比约 {buy_ratio:.0f}%。"]
     risks: list[str] = []
+    if spread and spread > 0.18:
+        risks.append("盘口价差偏大，短线深度信号降级。")
+    if imbalance < 10:
+        return _member("盘口委员", "neutral", 45, 55, "建议观望", reasons=reasons, risks=["买卖力量差距不大，盘口暂未给出明确方向。"], summary="盘口委员认为当前盘口偏均衡。")
+    if buy_ratio >= 62:
+        confidence = 72 if buy_ratio < 70 else 82
+        if spread and spread > 0.18:
+            confidence = min(confidence, 62)
+        return _member("盘口委员", "long", confidence, 42, "支持做多", support_trade=True, reasons=reasons + ["买盘深度连续强于卖盘，短线承接较好。"], risks=risks or ["盘口变化较快，只能作为短线确认。"], summary="盘口委员认为买盘力量占优。")
+    if sell_ratio >= 62:
+        confidence = 72 if sell_ratio < 70 else 82
+        if spread and spread > 0.18:
+            confidence = min(confidence, 62)
+        return _member("盘口委员", "short", confidence, 42, "支持做空", support_trade=True, reasons=reasons + ["卖盘深度连续强于买盘，上方压制较明显。"], risks=risks or ["盘口变化较快，只能作为短线确认。"], summary="盘口委员认为卖盘力量占优。")
     if buy_ratio >= 58:
-        return _member("盘口委员", "long", _clamp(buy_ratio), 42, "支持做多", support_trade=True, reasons=reasons + ["买盘深度强于卖盘，短线承接较好。"], risks=risks or ["盘口变化较快，只能作为短线确认。"], summary="盘口委员认为买盘力量占优。")
+        return _member("盘口委员", "long", 56, 48, "中性偏支持", support_trade=True, reasons=reasons + ["买盘略占优，但优势不足以单独定方向。"], risks=risks or ["盘口优势偏弱，需要大单或趋势确认。"], summary="盘口委员给出弱多确认。")
     if sell_ratio >= 58:
-        return _member("盘口委员", "short", _clamp(sell_ratio), 42, "支持做空", support_trade=True, reasons=reasons + ["卖盘深度强于买盘，上方压制较明显。"], risks=risks or ["盘口变化较快，只能作为短线确认。"], summary="盘口委员认为卖盘力量占优。")
+        return _member("盘口委员", "short", 56, 48, "中性偏支持", support_trade=True, reasons=reasons + ["卖盘略占优，但优势不足以单独定方向。"], risks=risks or ["盘口优势偏弱，需要大单或趋势确认。"], summary="盘口委员给出弱空确认。")
     return _member("盘口委员", "neutral", 50, 50, "建议观望", reasons=reasons, risks=["买卖力量差距不大，盘口暂未给出明确方向。"], summary="盘口委员认为当前盘口偏均衡。")
 
 
@@ -537,8 +560,10 @@ def run_liquidation_member(data: dict[str, Any]) -> dict[str, Any]:
 def run_whale_member(data: dict[str, Any]) -> dict[str, Any]:
     whale = data.get("whale") or {}
     dealer = data.get("dealer") or {}
+    ticker = data.get("ticker") or {}
     score = _to_int(whale.get("score"), 50)
     net_flow = _to_float(whale.get("net_flow_15m"), _to_float(whale.get("net_flow_5m"), 0))
+    price_change = _to_float(ticker.get("price_change_percent"), 0)
     state = str(dealer.get("state", "无明显行为"))
     reasons = [str(dealer.get("explanation") or f"庄家行为状态：{state}。")]
     risks: list[str] = []
@@ -546,21 +571,28 @@ def run_whale_member(data: dict[str, Any]) -> dict[str, Any]:
     direction = "neutral"
     vote = "建议观望"
     support = False
-    if net_flow > 0 and score >= 60:
-        direction, vote, support = "long", "支持做多", True
-        reasons.append("大单净流入增强，短线资金更偏向主动买入。")
-    elif net_flow < 0 and score >= 60:
-        direction, vote, support = "short", "支持做空", True
-        reasons.append("大单净流出增强，短线资金更偏向主动卖出。")
-    else:
-        risks.append("大单方向不够连续，暂不适合单独跟随。")
     if "派发" in state or "诱多" in state:
         risks.append("疑似派发或诱多，不建议追多。")
-        if direction == "long":
-            vote, support = "反对交易", False
-    if "诱空" in state and direction == "short":
-        risks.append("疑似诱空，不建议追空。")
+        if net_flow > 0:
+            direction = "long"
         vote, support = "反对交易", False
+    elif "诱空" in state:
+        risks.append("疑似诱空，不建议追空。")
+        if net_flow < 0:
+            direction = "short"
+        vote, support = "反对交易", False
+    elif net_flow > 0 and score >= 60 and price_change >= -1.5:
+        direction, vote, support = "long", "支持做多", True
+        reasons.append("大单净流入增强，短线资金更偏向主动买入。")
+    elif net_flow < 0 and score >= 60 and price_change <= 1.5:
+        direction, vote, support = "short", "支持做空", True
+        reasons.append("大单净流出增强，短线资金更偏向主动卖出。")
+    elif net_flow > 0 and price_change < -1.5:
+        risks.append("大单净流入但价格仍明显下跌，可能是承接不足或对倒。")
+    elif net_flow < 0 and price_change > 1.5:
+        risks.append("大单净流出但价格仍明显上涨，可能是洗盘或被动成交。")
+    else:
+        risks.append("大单方向不够连续，暂不适合单独跟随。")
     return _member("大单 / 庄家委员", direction, score, 100 - min(score, 80), vote, support_trade=support, veto=veto, reasons=reasons, risks=risks, summary="大单委员复核主动买卖和庄家行为初判。")
 
 
@@ -592,10 +624,10 @@ def run_risk_member(data: dict[str, Any]) -> dict[str, Any]:
         veto = True
     if abs(funding_rate) >= 0.0015:
         risks.append("Funding处于极端区间。")
-        veto = True
+        veto = veto or risk_score >= 75 or liquidation_score >= 75
     if account_ratio >= 2.8 or account_ratio <= 0.35:
         risks.append("多空比处于极端拥挤状态。")
-        veto = True
+        veto = veto or risk_score >= 75 or liquidation_score >= 75
     if not risks:
         risks.append("未触发强制风险否决，但仍需控制仓位。")
     vote = "否决交易" if veto else ("建议观望" if risk_score >= 65 else "支持交易")
@@ -948,10 +980,16 @@ def generate_chairman_decision(data: dict[str, Any]) -> dict[str, Any]:
         approved = False
         warnings.append("风险评分达到85以上，触发禁止开仓。")
     elif risk_score >= 80:
-        action = "高风险观察"
-        permission = "no_auto_trade"
-        approved = False
-        warnings.append("风险评分达到80以上，禁止自动交易，只允许人工观察或重新复核。")
+        if majority_support and direction != "neutral":
+            action = "高风险轻仓模拟" if direction == "long" else "高风险轻仓试空"
+            permission = "simulation_or_approval"
+            approved = True
+            warnings.append("风险评分达到80以上但未触发极端风险否决，仅允许极轻仓模拟候选，禁止自动实盘。")
+        else:
+            action = "高风险观察"
+            permission = "no_auto_trade"
+            approved = False
+            warnings.append("风险评分达到80以上且正式委员未形成多数支持，只允许人工观察或重新复核。")
     elif resonance_level == "no_resonance":
         action = "继续观察"
         permission = "observe_only"

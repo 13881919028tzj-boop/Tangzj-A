@@ -29,10 +29,10 @@ from services.committee_types import (
 
 
 BASE_WEIGHTS = {
-    "experience": 50.0,
-    "market": 25.0,
-    "orderbook": 15.0,
-    "reasoning": 10.0,
+    "experience": 0.0,
+    "market": 55.0,
+    "orderbook": 40.0,
+    "reasoning": 5.0,
 }
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 LIVE_AUTO_CONFIG_PATH = DATA_DIR / "live_auto_config.json"
@@ -197,6 +197,9 @@ def build_experience_member(data: dict[str, Any], decision: dict[str, Any]) -> d
     return {
         **abstain_member("经验委员", "experience", "经验库未接入，当前版本弃权。"),
         "enabled": False,
+        "shadow": True,
+        "member_type": "shadow",
+        "shadow_reason": "经验委员当前只做影子参考，不参与正式权重投票。",
         "experience_library_version": "none",
         "sample_count": 0,
         "state_code": "",
@@ -274,6 +277,9 @@ def build_weighted_vote(members: list[dict[str, Any]]) -> dict[str, Any]:
     for member in members:
         role = str(member.get("role"))
         vote = str(member.get("vote"))
+        if member.get("shadow") or member.get("member_type") == "shadow":
+            rows.append({**member, "effective_weight": 0.0, "reason_weight": "影子委员不参与权重。"})
+            continue
         if vote == VOTE_ABSTAIN:
             rows.append({**member, "effective_weight": 0.0, "reason_weight": "ABSTAIN不参与权重。"})
             continue

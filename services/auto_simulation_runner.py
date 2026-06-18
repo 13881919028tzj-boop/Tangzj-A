@@ -131,9 +131,9 @@ def _build_price_map(opportunities: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def _risk_reward_prices(price: float, direction: str) -> tuple[float, float, float]:
-    stop_pct = 0.016
-    tp1_pct = 0.016
-    tp2_pct = 0.032
+    stop_pct = 0.0125
+    tp1_pct = stop_pct * 1.4
+    tp2_pct = stop_pct * 2.8
     if direction == "short":
         return price * (1 + stop_pct), price * (1 - tp1_pct), price * (1 - tp2_pct)
     return price * (1 - stop_pct), price * (1 + tp1_pct), price * (1 + tp2_pct)
@@ -145,7 +145,7 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     price = _price(row)
     score = _to_int(row.get("final_opportunity_score", row.get("opportunity_score")), _to_int(precheck.get("score"), 0))
     risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-    if not symbol or price <= 0 or score < 80 or risk >= 70 or not precheck.get("allowed_candidate"):
+    if not symbol or price <= 0 or score < 75 or risk >= 85 or not precheck.get("allowed_candidate"):
         return None
     direction = _direction(row, precheck)
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
@@ -166,7 +166,7 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         "stop_loss": {"price": stop},
         "take_profit_1": {"price": tp1},
         "take_profit_2": {"price": tp2},
-        "risk_reward_ratio": 2.0,
+        "risk_reward_ratio": 2.8,
         "invalid_condition": "机会榜信号失效、风险升高或委员会后续否决。",
         "chairman_summary": f"后台自动模拟：机会榜TOP{rank or '-'}候选，评分{score}，风险{risk}。仅执行本地模拟订单。",
         "source_opportunity_id": row.get("opportunity_id") or precheck.get("opportunity_id") or f"{symbol}_{direction}",
