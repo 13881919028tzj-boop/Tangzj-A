@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from services import market_cache
+from services.orderbook_analyzer import analyze_orderbook
 
 try:
     from services.watchlist_manager import get_watchlist_candidates_for_committee
@@ -369,6 +370,26 @@ def _symbol_available(symbol: str) -> bool:
     return True
 
 
+def _active_position_symbols(min_notional: float = 1.0) -> set[str]:
+    """Symbols with meaningful open exposure should not occupy trade ranking slots."""
+    symbols: set[str] = set()
+    try:
+        positions = json.loads((DATA_DIR / "sim_positions.json").read_text(encoding="utf-8-sig") or "[]")
+        if not isinstance(positions, list):
+            return set()
+        for position in positions:
+            if not isinstance(position, dict) or position.get("status") not in {"open", "partially_closed"}:
+                continue
+            symbol = str(position.get("symbol") or "").upper().strip()
+            notional = _to_float(position.get("notional_usdt"), 0)
+            margin = _to_float(position.get("margin_usdt"), 0)
+            if symbol and max(abs(notional), abs(margin)) >= min_notional:
+                symbols.add(symbol)
+    except Exception:
+        return set()
+    return symbols
+
+
 def _enrich_lifecycle(row: dict[str, Any]) -> dict[str, Any]:
     symbol = str(row.get("symbol", "")).upper()
     record = _symbol_lifecycle(symbol)
@@ -469,12 +490,21 @@ def _best_top1(rankings: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | No
             candidates.append(item)
     if not candidates:
         return None
-    return max(candidates, key=lambda row: _to_int(row.get("final_opportunity_score", row.get("opportunity_score"))))
+    assessed = [assess_trade_opportunity(row) for row in candidates]
+    return max(
+        assessed,
+        key=lambda row: (
+            1 if row.get("tradable_now") else 0,
+            _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score")))),
+            _to_float(row.get("quote_volume"), 0),
+        ),
+    )
 
 
 def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None = None, limit: int = 10) -> list[dict[str, Any]]:
     rankings = rankings or market_cache.get_rankings() or {}
     by_symbol: dict[str, dict[str, Any]] = {}
+    active_symbols = _active_position_symbols()
     for key, label in [
         ("long_opportunities", "多头机会榜"),
         ("short_opportunities", "空头机会榜"),
@@ -485,12 +515,14 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
             symbol = str(row.get("symbol", "")).upper()
             if not symbol:
                 continue
+            if symbol in active_symbols:
+                continue
             if not _symbol_available(symbol):
                 continue
             item = dict(row)
             item["source_rank"] = key
             item["opportunity_source"] = item.get("opportunity_source") or label
-            item = _enrich_lifecycle(item)
+            item = assess_trade_opportunity(_enrich_lifecycle(item))
             old = by_symbol.get(symbol)
             score = _to_int(item.get("final_opportunity_score", item.get("opportunity_score")))
             old_score = _to_int((old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))) if old else -1
@@ -501,6 +533,8 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
             for candidate in get_watchlist_candidates_for_committee():
                 symbol = str(candidate.get("symbol", "")).upper()
                 if not symbol:
+                    continue
+                if symbol in active_symbols:
                     continue
                 if not _symbol_available(symbol):
                     continue
@@ -530,16 +564,25 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
                     "watch_score": watch_score,
                     "watchlist_candidate": True,
                 }
-                item = _enrich_lifecycle(item)
+                item = assess_trade_opportunity(_enrich_lifecycle(item))
                 old = by_symbol.get(symbol)
                 old_score = _to_int((old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))) if old else -1
                 if old is None or score > old_score:
                     by_symbol[symbol] = item
         except Exception as exc:
             print(f"[观察池] 合并到交易机会榜失败，不影响主榜单。error={repr(exc)}")
-    rows = sorted(by_symbol.values(), key=lambda row: (_to_int(row.get("final_opportunity_score", row.get("opportunity_score"))), _to_float(row.get("quote_volume"), 0), -_to_int(row.get("risk_score"), 50)), reverse=True)[:limit]
+    rows = sorted(
+        by_symbol.values(),
+        key=lambda row: (
+            1 if row.get("tradable_now") else 0,
+            _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score")))),
+            _to_float(row.get("quote_volume"), 0),
+            -_to_int(row.get("risk_score"), 50),
+        ),
+        reverse=True,
+    )[:limit]
     for row in rows:
-        _log_candidate({"time": _now(), "event": "进入机会榜", "symbol": row.get("symbol"), "score": row.get("final_opportunity_score", row.get("opportunity_score")), "result": "有效候选", "reason": f"第{row.get('opportunity_round', 1)}轮，状态 {row.get('status', 'candidate')}。"})
+        _log_candidate({"time": _now(), "event": "进入机会榜", "symbol": row.get("symbol"), "score": row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), "result": row.get("opportunity_class", "有效候选"), "reason": f"第{row.get('opportunity_round', 1)}轮，入场状态 {row.get('entry_state', 'unknown')}。"})
     return rows
 
 
@@ -551,7 +594,297 @@ def _direction(row: dict[str, Any]) -> str:
         return "short"
     long_score = _to_int(row.get("long_score"))
     short_score = _to_int(row.get("short_score"))
-    return "long" if long_score >= short_score else "short"
+    if abs(long_score - short_score) < 12:
+        return "neutral"
+    return "long" if long_score > short_score else "short"
+
+
+def _market_regime() -> dict[str, Any]:
+    """Lightweight market-context committee using cached BTC/ETH 24h changes."""
+    btc = market_cache.get_ticker("BTCUSDT") or {}
+    eth = market_cache.get_ticker("ETHUSDT") or {}
+    btc_change = _to_float(btc.get("price_change_percent"))
+    eth_change = _to_float(eth.get("price_change_percent"))
+    average = (btc_change + eth_change) / 2 if btc or eth else 0.0
+    if average >= 2.0 and btc_change >= 0:
+        regime = "bullish"
+        bias = "long"
+    elif average <= -2.0 and btc_change <= 0:
+        regime = "bearish"
+        bias = "short"
+    elif btc_change > 0.8 and eth_change > 0.8:
+        regime = "rebound"
+        bias = "long"
+    elif btc_change < -0.8 and eth_change < -0.8:
+        regime = "weak"
+        bias = "short"
+    else:
+        regime = "range"
+        bias = "neutral"
+    return {
+        "market_regime": regime,
+        "direction_bias": bias,
+        "btc_change_percent": btc_change,
+        "eth_change_percent": eth_change,
+    }
+
+
+def _market_alignment_score(direction: str, regime: dict[str, Any]) -> tuple[int, str]:
+    bias = str(regime.get("direction_bias") or "neutral")
+    if direction not in {"long", "short"}:
+        return 35, "方向不明确"
+    if bias == "neutral":
+        return 68, "大盘中性"
+    if bias == direction:
+        return 88, "大盘同向"
+    return 35, "大盘反向"
+
+
+def _signal_direction(value: float, positive: float, negative: float) -> str:
+    if value >= positive:
+        return "long"
+    if value <= negative:
+        return "short"
+    return "neutral"
+
+
+def _whale_signal(symbol: str) -> dict[str, Any]:
+    whale = market_cache.get_whales(symbol) or {}
+    stats = whale.get("stats") or {}
+    stats_5m = stats.get("5m") or {}
+    stats_15m = stats.get("15m") or {}
+    net_5m = _to_float(whale.get("net_inflow_5m"), _to_float(stats_5m.get("net_amount"), 0))
+    net_15m = _to_float(whale.get("net_inflow_15m"), _to_float(stats_15m.get("net_amount"), 0))
+    score = _to_int(whale.get("whale_score", whale.get("score")), 0)
+    quality = str(whale.get("data_quality") or ("missing" if not whale else "partial"))
+    threshold = max(1000.0, _to_float(whale.get("threshold"), 0) * 0.5)
+    combined = net_5m * 0.4 + net_15m * 0.6
+    direction = _signal_direction(combined, threshold, -threshold)
+    return {
+        "direction": direction,
+        "net_5m": net_5m,
+        "net_15m": net_15m,
+        "score": score,
+        "quality": quality,
+        "confirming": direction in {"long", "short"} and quality in {"good", "partial"},
+    }
+
+
+def _orderbook_signal(symbol: str, price: float) -> dict[str, Any]:
+    orderbook = market_cache.get_orderbook(symbol) or {}
+    analysis = analyze_orderbook(orderbook, price) if orderbook else {}
+    buy_ratio = _to_float(analysis.get("buy_ratio"), 0)
+    sell_ratio = _to_float(analysis.get("sell_ratio"), 0)
+    direction = "long" if buy_ratio >= 58 else "short" if sell_ratio >= 58 else "neutral"
+    return {
+        "direction": direction,
+        "buy_ratio": buy_ratio,
+        "sell_ratio": sell_ratio,
+        "bias": analysis.get("bias") or "等待数据",
+        "confirming": direction in {"long", "short"},
+    }
+
+
+def _kline_signal(symbol: str) -> dict[str, Any]:
+    interval = market_cache.get_kline_interval()
+    rows = market_cache.get_klines(symbol, interval)
+    if len(rows) < 30:
+        rows = market_cache.get_klines(symbol, "1m")
+    if len(rows) < 30:
+        return {"direction": "neutral", "entry_state": "wait_data", "confirming": False, "reason": "K线样本不足"}
+    closes = [_to_float(row.get("close"), 0) for row in rows[-30:]]
+    highs = [_to_float(row.get("high"), 0) for row in rows[-12:]]
+    lows = [_to_float(row.get("low"), 0) for row in rows[-12:]]
+    close = closes[-1]
+    ma8 = sum(closes[-8:]) / 8
+    ma20 = sum(closes[-20:]) / 20
+    recent_high = max(highs[-5:])
+    prior_high = max(highs[:7])
+    recent_low = min(lows[-5:])
+    prior_low = min(lows[:7])
+    if close < ma8 < ma20 and recent_high <= prior_high * 1.002:
+        return {"direction": "short", "entry_state": "failed_retest_confirmed", "confirming": True, "ma8": ma8, "ma20": ma20}
+    if close > ma8 > ma20 and recent_low >= prior_low * 0.998:
+        return {"direction": "long", "entry_state": "pullback_confirmed", "confirming": True, "ma8": ma8, "ma20": ma20}
+    if close < ma20:
+        return {"direction": "short", "entry_state": "wait_failed_retest", "confirming": False, "ma8": ma8, "ma20": ma20}
+    if close > ma20:
+        return {"direction": "long", "entry_state": "wait_pullback", "confirming": False, "ma8": ma8, "ma20": ma20}
+    return {"direction": "neutral", "entry_state": "range_no_edge", "confirming": False, "ma8": ma8, "ma20": ma20}
+
+
+def _consensus_count(direction: str, signals: dict[str, str]) -> tuple[int, list[str], list[str]]:
+    support: list[str] = []
+    conflict: list[str] = []
+    for name, value in signals.items():
+        if value == direction:
+            support.append(name)
+        elif value in {"long", "short"} and value != direction:
+            conflict.append(name)
+    return len(support), support, conflict
+
+
+def assess_trade_opportunity(row: dict[str, Any]) -> dict[str, Any]:
+    """Convert an anomaly/momentum row into a tradable-opportunity verdict.
+
+    The light scanner can only prove that a symbol is moving. This layer decides
+    whether the current price is a professional entry or merely a watch item.
+    """
+    assessed = dict(row or {})
+    direction = _direction(assessed)
+    long_score = _to_int(assessed.get("long_score"))
+    short_score = _to_int(assessed.get("short_score"))
+    direction_gap = abs(long_score - short_score)
+    risk_score = _to_int(assessed.get("risk_score"), 100)
+    score = _to_int(assessed.get("final_opportunity_score", assessed.get("opportunity_score")))
+    change = _to_float(assessed.get("price_change_percent"))
+    abs_change = abs(change)
+    symbol = str(assessed.get("symbol") or "").upper().strip()
+    price = (
+        _to_float(assessed.get("current_price"), 0)
+        or _to_float(assessed.get("last_price"), 0)
+        or _to_float(assessed.get("price"), 0)
+    )
+    volume_score = _to_int(assessed.get("volume_score", assessed.get("liquidity_score")), 50)
+    data_quality = str(assessed.get("data_quality") or "good")
+    market = _market_regime()
+    market_score, market_note = _market_alignment_score(direction, market)
+    whale = _whale_signal(symbol) if symbol else {"direction": "neutral", "confirming": False, "quality": "missing"}
+    orderbook = _orderbook_signal(symbol, price) if symbol and price > 0 else {"direction": "neutral", "confirming": False, "bias": "价格缺失"}
+    kline = _kline_signal(symbol) if symbol else {"direction": "neutral", "entry_state": "wait_data", "confirming": False}
+    consensus_signals = {
+        "机会榜": direction,
+        "大盘": str(market.get("direction_bias") or "neutral"),
+        "K线": str(kline.get("direction") or "neutral"),
+        "大单": str(whale.get("direction") or "neutral"),
+        "盘口": str(orderbook.get("direction") or "neutral"),
+    }
+    consensus_count, consensus_support, consensus_conflict = _consensus_count(direction, consensus_signals)
+    trend_score = max(long_score, short_score)
+    flow_score = max(35, min(95, volume_score))
+    liquidity_score = flow_score
+    rr_score = 88 if risk_score < 45 else 76 if risk_score < 55 else 62 if risk_score < 65 else 35
+    entry_quality = 80
+    entry_state = "tradable_now"
+    action_gate = "open_now"
+    block_reasons: list[str] = []
+    risk_flags: list[str] = []
+
+    if direction == "neutral" or direction_gap < 12:
+        entry_quality = 35
+        entry_state = "range_no_edge"
+        action_gate = "wait"
+        block_reasons.append("多空分差不足，方向不明确。")
+    if data_quality == "poor":
+        block_reasons.append("数据质量不足。")
+    if score < 78:
+        block_reasons.append(f"交易机会分 {score} 低于专业开仓阈值 78。")
+    if risk_score >= 65:
+        block_reasons.append(f"风险评分 {risk_score} 进入高风险区。")
+    if market_score < 50:
+        block_reasons.append(market_note)
+    if consensus_count < 3:
+        block_reasons.append(f"方向共识不足：{consensus_count}/5，同向来源 {','.join(consensus_support) or '无'}。")
+    if len(consensus_conflict) >= 2:
+        block_reasons.append(f"反向冲突过多：{','.join(consensus_conflict)}。")
+    if whale.get("direction") != direction:
+        block_reasons.append("大单资金未同向确认，禁止由单一榜单开仓。")
+    if str(whale.get("quality") or "missing") in {"missing", "poor"}:
+        block_reasons.append("大单数据质量不足，等待真实大单确认。")
+    if orderbook.get("direction") in {"long", "short"} and orderbook.get("direction") != direction:
+        block_reasons.append("盘口买卖盘方向与开仓方向冲突。")
+    if not kline.get("confirming") or kline.get("direction") != direction:
+        entry_quality = min(entry_quality, 48)
+        entry_state = str(kline.get("entry_state") or "wait_structure")
+        action_gate = "wait"
+        if direction == "long":
+            block_reasons.append("多单未完成回踩/重新走强确认。")
+        elif direction == "short":
+            block_reasons.append("空单未完成反抽失败确认。")
+    else:
+        entry_state = str(kline.get("entry_state") or entry_state)
+
+    if direction == "long":
+        if change >= 8:
+            entry_quality = min(entry_quality, 42)
+            entry_state = "wait_pullback"
+            action_gate = "wait"
+            risk_flags.append("24小时涨幅较大，禁止直接追多，等待回踩确认。")
+        elif change < 1.2:
+            entry_quality = min(entry_quality, 55)
+            entry_state = "wait_breakout"
+            action_gate = "wait"
+            risk_flags.append("多头动量尚未确认。")
+    elif direction == "short":
+        if change <= -8:
+            entry_quality = min(entry_quality, 42)
+            entry_state = "wait_failed_retest"
+            action_gate = "wait"
+            risk_flags.append("24小时跌幅较大，禁止直接追空，等待反抽失败。")
+        elif change > -1.2:
+            entry_quality = min(entry_quality, 55)
+            entry_state = "wait_breakdown"
+            action_gate = "wait"
+            risk_flags.append("空头动量尚未确认。")
+
+    if volume_score < 55:
+        flow_score = min(flow_score, 52)
+        risk_flags.append("成交额确认不足。")
+    if abs_change >= 14:
+        entry_quality = min(entry_quality, 36)
+        if entry_state in {"tradable_now", "pullback_confirmed", "failed_retest_confirmed"}:
+            entry_state = "overextended_no_chase"
+            action_gate = "wait"
+        risk_flags.append("短线波动过大，追涨追空风险高。")
+
+    consensus_score = min(95, 45 + consensus_count * 10 - len(consensus_conflict) * 8)
+    trade_score = round(
+        market_score * 0.10
+        + trend_score * 0.16
+        + entry_quality * 0.24
+        + flow_score * 0.12
+        + rr_score * 0.13
+        + liquidity_score * 0.08
+        + consensus_score * 0.17
+        - max(0, risk_score - 45) * 0.45
+    )
+    open_entry_states = {"tradable_now", "pullback_confirmed", "failed_retest_confirmed"}
+    if entry_state not in open_entry_states:
+        block_reasons.extend(risk_flags or ["当前不是专业入场位置。"])
+    if trade_score < 75:
+        block_reasons.append(f"专业交易分 {trade_score} 低于开仓阈值 75。")
+
+    tradable_now = not block_reasons and entry_state in open_entry_states
+    assessed.update(
+        {
+            **market,
+            "direction": "多头" if direction == "long" else "空头" if direction == "short" else "观察",
+            "trade_direction": direction,
+            "direction_gap": direction_gap,
+            "market_alignment_score": market_score,
+            "market_alignment_note": market_note,
+            "consensus_support_count": consensus_count,
+            "consensus_support_sources": consensus_support,
+            "consensus_conflict_sources": consensus_conflict,
+            "consensus_signals": consensus_signals,
+            "whale_signal": whale,
+            "orderbook_signal": orderbook,
+            "kline_signal": kline,
+            "entry_quality_score": entry_quality,
+            "flow_confirmation_score": flow_score,
+            "risk_reward_score": rr_score,
+            "consensus_score": consensus_score,
+            "professional_trade_score": max(0, min(100, int(trade_score))),
+            "trade_score": max(0, min(100, int(trade_score))),
+            "entry_state": entry_state,
+            "action_gate": "open_now" if tradable_now else action_gate,
+            "tradable_now": tradable_now,
+            "trade_block_reasons": block_reasons,
+            "risk_flags": risk_flags,
+            "opportunity_class": "交易机会榜" if tradable_now else "观察机会榜" if entry_state.startswith("wait") else "异动风险榜",
+        }
+    )
+    return assessed
 
 
 def build_opportunity_id(row: dict[str, Any], bucket_seconds: int = 300) -> str:
@@ -664,6 +997,7 @@ def fast_capture_top1_opportunity(rankings: dict[str, list[dict[str, Any]]] | No
 
     symbol = str(top1.get("symbol", "")).upper()
     score = _to_int(top1.get("final_opportunity_score", top1.get("opportunity_score")))
+    professional_score = _to_int(top1.get("professional_trade_score", score))
     risk_score = _to_int(top1.get("risk_score"), 100)
     data_quality = str(top1.get("data_quality") or "good")
     quote_volume = _to_float(top1.get("quote_volume"))
@@ -673,6 +1007,12 @@ def fast_capture_top1_opportunity(rankings: dict[str, list[dict[str, Any]]] | No
     if score < trigger_score:
         trigger = False
         reasons.append(f"机会评分 {score} 低于触发阈值 {trigger_score}。")
+    if professional_score < 75:
+        trigger = False
+        reasons.append(f"专业交易分 {professional_score} 低于触发阈值 75。")
+    if not top1.get("tradable_now"):
+        trigger = False
+        reasons.extend(str(reason) for reason in top1.get("trade_block_reasons", []) if reason)
     if data_quality == "poor":
         trigger = False
         reasons.append("数据质量 poor。")
@@ -690,7 +1030,8 @@ def fast_capture_top1_opportunity(rankings: dict[str, list[dict[str, Any]]] | No
 
     result = {
         "symbol": symbol,
-        "fast_score": score,
+        "fast_score": professional_score,
+        "raw_opportunity_score": score,
         "still_valid": trigger,
         "trigger_committee_precheck": trigger,
         "risk_fast_up": risk_score >= 70,
@@ -703,7 +1044,7 @@ def fast_capture_top1_opportunity(rankings: dict[str, list[dict[str, Any]]] | No
     }
     _STATE["latest_capture"] = result
     _STATE["last_capture_at"] = time.time()
-    _log_capture({"time": result["timestamp"], "event": "TOP1快速捕捉", "symbol": symbol, "score": score, "result": "通过" if trigger else "未通过", "reason": result["reason"], "elapsed_ms": result["elapsed_ms"]})
+    _log_capture({"time": result["timestamp"], "event": "TOP1快速捕捉", "symbol": symbol, "score": professional_score, "result": "通过" if trigger else "未通过", "reason": result["reason"], "elapsed_ms": result["elapsed_ms"]})
     return result
 
 
@@ -712,23 +1053,28 @@ def run_committee_fast_precheck(symbol: str, opportunity: dict[str, Any] | None 
     settings = get_fast_opportunity_settings()
     trigger_score = int(settings.get("OPPORTUNITY_TRIGGER_SCORE", OPPORTUNITY_TRIGGER_SCORE))
     enabled = bool(settings.get("ENABLE_FAST_COMMITTEE_PRECHECK", ENABLE_FAST_COMMITTEE_PRECHECK))
-    opportunity = opportunity or {}
+    opportunity = assess_trade_opportunity(opportunity or {})
     score = _to_int(opportunity.get("final_opportunity_score", opportunity.get("opportunity_score")))
+    professional_score = _to_int(opportunity.get("professional_trade_score", score))
     risk_score = _to_int(opportunity.get("risk_score"), 100)
     data_quality = str(opportunity.get("data_quality") or "good")
-    direction = _direction(opportunity)
+    direction = str(opportunity.get("trade_direction") or _direction(opportunity))
     block_reasons: list[str] = []
     warnings: list[str] = []
     if not enabled:
         block_reasons.append("委员会快速预判已关闭。")
     if score < trigger_score:
         block_reasons.append(f"机会评分 {score} 未达到 {trigger_score}。")
+    if professional_score < 75:
+        block_reasons.append(f"专业交易分 {professional_score} 未达到 75。")
     if risk_score >= 70:
         block_reasons.append(f"风险评分 {risk_score} 偏高。")
     if data_quality == "poor":
         block_reasons.append("数据质量 poor。")
     if direction not in {"long", "short"}:
         warnings.append("方向不够明确，需要完整复核。")
+    if not opportunity.get("tradable_now"):
+        block_reasons.extend(str(reason) for reason in opportunity.get("trade_block_reasons", []) if reason)
 
     safety = "blocked" if block_reasons else "auto_candidate"
     allowed = not block_reasons
@@ -740,14 +1086,20 @@ def run_committee_fast_precheck(symbol: str, opportunity: dict[str, Any] | None 
         "warnings": warnings,
         "symbol": str(symbol or "").upper(),
         "score": score,
+        "professional_trade_score": professional_score,
         "risk_score": risk_score,
         "direction": direction,
+        "entry_state": opportunity.get("entry_state"),
+        "action_gate": opportunity.get("action_gate"),
+        "tradable_now": bool(opportunity.get("tradable_now")),
+        "market_regime": opportunity.get("market_regime"),
+        "opportunity_class": opportunity.get("opportunity_class"),
         "timestamp": _now(),
         "elapsed_ms": int((time.monotonic() - started) * 1000),
     }
     _STATE["latest_precheck"] = result
     _STATE["last_precheck_at"] = time.time()
-    _log_precheck({"time": result["timestamp"], "event": "委员会快速预判", "symbol": result["symbol"], "score": score, "result": "通过" if allowed else "阻止", "reason": "；".join(block_reasons or warnings or ["进入候选"]), "elapsed_ms": result["elapsed_ms"]})
+    _log_precheck({"time": result["timestamp"], "event": "委员会快速预判", "symbol": result["symbol"], "score": professional_score, "result": "通过" if allowed else "阻止", "reason": "；".join(block_reasons or warnings or ["进入候选"]), "elapsed_ms": result["elapsed_ms"]})
     return result
 
 
@@ -811,6 +1163,7 @@ def run_committee_top10_precheck(rankings: dict[str, list[dict[str, Any]]] | Non
 def _build_candidate_signal(opportunity: dict[str, Any], precheck: dict[str, Any], opportunity_id: str) -> dict[str, Any]:
     price = _to_float(opportunity.get("current_price") or opportunity.get("last_price"))
     score = _to_int(opportunity.get("final_opportunity_score", opportunity.get("opportunity_score")))
+    professional_score = _to_int(opportunity.get("professional_trade_score", score))
     direction = precheck.get("direction") or _direction(opportunity)
     rank = int(precheck.get("rank", 0) or 0)
     now_text = _now()
@@ -821,11 +1174,20 @@ def _build_candidate_signal(opportunity: dict[str, Any], precheck: dict[str, Any
         "direction": direction,
         "action": "轻仓试多" if direction == "long" else "轻仓试空",
         "final_action": "轻仓试多" if direction == "long" else "轻仓试空",
-        "confidence": score,
+        "confidence": professional_score,
         "risk_score": _to_int(opportunity.get("risk_score")),
         "opportunity_score": score,
         "raw_opportunity_score": _to_int(opportunity.get("raw_opportunity_score"), score),
         "final_opportunity_score": score,
+        "professional_trade_score": professional_score,
+        "entry_state": opportunity.get("entry_state"),
+        "action_gate": opportunity.get("action_gate"),
+        "tradable_now": bool(opportunity.get("tradable_now")),
+        "market_regime": opportunity.get("market_regime"),
+        "market_alignment_score": opportunity.get("market_alignment_score"),
+        "direction_gap": opportunity.get("direction_gap"),
+        "trade_block_reasons": opportunity.get("trade_block_reasons", []),
+        "risk_flags": opportunity.get("risk_flags", []),
         "risk_penalty": _to_int(opportunity.get("risk_penalty")),
         "score_cap": _to_int(opportunity.get("score_cap"), 100),
         "opportunity_status": opportunity.get("opportunity_status"),
@@ -847,7 +1209,7 @@ def _build_candidate_signal(opportunity: dict[str, Any], precheck: dict[str, Any
             "entry_price": price,
             "entry_time": now_text,
             "entry_rank": rank,
-            "entry_score": score,
+            "entry_score": professional_score,
             "entry_risk_score": _to_int(opportunity.get("risk_score")),
             "entry_structure": opportunity.get("current_market_state"),
             "entry_reason": opportunity.get("opportunity_status") or opportunity.get("advice"),
@@ -855,14 +1217,14 @@ def _build_candidate_signal(opportunity: dict[str, Any], precheck: dict[str, Any
         "live_snapshot": {
             "live_price": price,
             "live_change_since_entry": 0,
-            "live_opportunity_score": score,
+            "live_opportunity_score": professional_score,
             "live_risk_score": _to_int(opportunity.get("risk_score")),
             "live_committee_status": precheck.get("fast_action"),
             "live_candidate_status": "自动候选",
             "live_updated_at": now_text,
             "data_age_seconds": 0,
         },
-        "summary": "机会评分达到80分，仅进入候选；真实交易仍需完整委员会与风控确认。",
+        "summary": "专业交易预审通过，仅进入候选；真实交易仍需完整委员会与风控确认。",
         "external_ai": {"deepseek": {}, "gemini": {}},
         "committee_snapshot": {"fast_precheck": precheck, "opportunity": opportunity},
     }
@@ -878,6 +1240,7 @@ def maybe_create_multi_opportunity_candidates(prechecks: list[dict[str, Any]]) -
         opportunity = item.get("opportunity") or {}
         symbol = str(item.get("symbol") or opportunity.get("symbol") or "").upper()
         score = _to_int(item.get("score", opportunity.get("final_opportunity_score", opportunity.get("opportunity_score"))))
+        professional_score = _to_int(item.get("professional_trade_score", opportunity.get("professional_trade_score", score)))
         risk_score = _to_int(item.get("risk_score", opportunity.get("risk_score")))
         if rank > review_top_n:
             results.append({"symbol": symbol, "rank": rank, "review_status": "expired", "candidate_created": False, "block_reason": "不在当前TOP10完整复核范围。", "last_review_time": _now()})
@@ -891,13 +1254,14 @@ def maybe_create_multi_opportunity_candidates(prechecks: list[dict[str, Any]]) -
                 continue
             results.append({"symbol": symbol, "rank": rank, "review_status": "blocked", "candidate_created": False, "block_reason": reason, "opportunity_id": opportunity_id, "reject_count": lifecycle.get("reject_count", 0), "opportunity_round": lifecycle.get("opportunity_round", 1), "status": lifecycle.get("status", "rejected"), "cooldown_until": lifecycle.get("cooldown_until", 0), "last_review_time": _now()})
             continue
-        if score < int(settings.get("OPPORTUNITY_TRIGGER_SCORE", OPPORTUNITY_TRIGGER_SCORE) or 80) or risk_score >= 70:
+        if score < int(settings.get("OPPORTUNITY_TRIGGER_SCORE", OPPORTUNITY_TRIGGER_SCORE) or 80) or professional_score < 75 or risk_score >= 70 or not item.get("tradable_now"):
             opportunity_id = build_opportunity_id(opportunity)
-            _record_symbol_review(symbol, "评分或风险未满足候选规则。", opportunity_id, fast_checked=True, blocked=True)
-            lifecycle = _record_opportunity_reject(symbol, "评分或风险未满足候选规则。", opportunity_id)
+            reason = "；".join(item.get("block_reasons") or opportunity.get("trade_block_reasons") or ["评分、风险或入场状态未满足候选规则。"])
+            _record_symbol_review(symbol, reason, opportunity_id, fast_checked=True, blocked=True)
+            lifecycle = _record_opportunity_reject(symbol, reason, opportunity_id)
             if lifecycle.get("status") == "removed":
                 continue
-            results.append({"symbol": symbol, "rank": rank, "review_status": "blocked", "candidate_created": False, "block_reason": "评分或风险未满足候选规则。", "opportunity_id": opportunity_id, "reject_count": lifecycle.get("reject_count", 0), "opportunity_round": lifecycle.get("opportunity_round", 1), "status": lifecycle.get("status", "rejected"), "cooldown_until": lifecycle.get("cooldown_until", 0), "last_review_time": _now()})
+            results.append({"symbol": symbol, "rank": rank, "review_status": "blocked", "candidate_created": False, "block_reason": reason, "opportunity_id": opportunity_id, "reject_count": lifecycle.get("reject_count", 0), "opportunity_round": lifecycle.get("opportunity_round", 1), "status": lifecycle.get("status", "rejected"), "cooldown_until": lifecycle.get("cooldown_until", 0), "last_review_time": _now()})
             continue
         opportunity_id = build_opportunity_id(opportunity)
         review_count = _mark_opportunity_review(opportunity_id)
@@ -917,6 +1281,7 @@ def maybe_create_multi_opportunity_candidates(prechecks: list[dict[str, Any]]) -
             "symbol": symbol,
             "rank": rank,
             "score": score,
+            "professional_trade_score": professional_score,
             "risk_score": risk_score,
             "review_status": "full_done",
             "candidate_created": True,

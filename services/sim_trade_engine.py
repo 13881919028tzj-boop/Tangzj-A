@@ -37,15 +37,16 @@ DEFAULT_SETTINGS = {
     "initial_balance": 1000.0,
     "max_position_pct": 10.0,
     "max_risk_pct": 1.0,
-    "max_positions": 0,
-    "max_same_symbol_positions": 0,
+    "max_positions": 10,
+    "max_same_symbol_positions": 1,
+    "max_same_direction_positions": 5,
     "allow_long": True,
     "allow_short": True,
     "leverage": 5,
     "market_type": "futures",
     "futures_leverage_locked": True,
     "continuous_run": True,
-    "ignore_loss_limits": True,
+    "ignore_loss_limits": False,
     "entry_mode": "立即按当前价模拟开仓",
     "tp1_close_pct": 50.0,
     "move_sl_to_breakeven": True,
@@ -59,8 +60,10 @@ DEFAULT_SETTINGS = {
     "dynamic_stop_loss_base_pct": 1.25,
     "dynamic_stop_loss_high_risk_pct": 0.85,
     "dynamic_stop_loss_low_risk_pct": 1.55,
-    "dynamic_take_profit_1_r": 1.4,
-    "dynamic_take_profit_2_r": 2.8,
+    "dynamic_take_profit_1_r": 1.0,
+    "dynamic_take_profit_2_r": 2.4,
+    "early_exit_min_seconds": 600,
+    "early_exit_adverse_r": 0.5,
 }
 
 
@@ -182,9 +185,9 @@ def load_settings() -> dict[str, Any]:
         merged["market_type"] = "futures"
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
-        merged["ignore_loss_limits"] = True
-        merged["max_positions"] = 0
-        merged["max_same_symbol_positions"] = 0
+        merged["max_positions"] = max(1, int(_to_float(merged.get("max_positions"), 10) or 10))
+        merged["max_same_symbol_positions"] = max(1, int(_to_float(merged.get("max_same_symbol_positions"), 1) or 1))
+        merged["max_same_direction_positions"] = max(1, int(_to_float(merged.get("max_same_direction_positions"), 5) or 5))
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     return merged
@@ -197,9 +200,9 @@ def save_settings(settings: dict[str, Any]) -> None:
         merged["market_type"] = "futures"
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
-        merged["ignore_loss_limits"] = True
-        merged["max_positions"] = 0
-        merged["max_same_symbol_positions"] = 0
+        merged["max_positions"] = max(1, int(_to_float(merged.get("max_positions"), 10) or 10))
+        merged["max_same_symbol_positions"] = max(1, int(_to_float(merged.get("max_same_symbol_positions"), 1) or 1))
+        merged["max_same_direction_positions"] = max(1, int(_to_float(merged.get("max_same_direction_positions"), 5) or 5))
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     _write_json(SETTINGS_PATH, merged)
@@ -467,8 +470,8 @@ def _dynamic_exit_prices(price: float, direction: str, risk_score: float, settin
         stop_pct = low_risk_pct
     else:
         stop_pct = base_pct
-    tp1_r = _to_float(settings.get("dynamic_take_profit_1_r"), 1.4)
-    tp2_r = _to_float(settings.get("dynamic_take_profit_2_r"), 2.8)
+    tp1_r = _to_float(settings.get("dynamic_take_profit_1_r"), 1.0)
+    tp2_r = _to_float(settings.get("dynamic_take_profit_2_r"), 2.4)
     if direction == "short":
         return price * (1 + stop_pct), price * (1 - stop_pct * tp1_r), price * (1 - stop_pct * tp2_r), stop_pct
     return price * (1 - stop_pct), price * (1 + stop_pct * tp1_r), price * (1 + stop_pct * tp2_r), stop_pct
@@ -505,6 +508,10 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("委员会交易许可未通过。")
     if signal.get("approved_for_simulation") is False:
         reasons.append("委员会未批准进入模拟候选。")
+    if "tradable_now" in signal and signal.get("tradable_now") is not True:
+        reasons.append("专业交易预审未通过：当前不是可立即交易位置。")
+    if signal.get("action_gate") and signal.get("action_gate") != "open_now":
+        reasons.append("专业交易预审要求等待确认，不允许立即开仓。")
     if signal.get("veto_members"):
         reasons.append("风险委员或其他委员已触发否决。")
     if _to_float(signal.get("committee_confidence"), 0) < 60:
@@ -521,21 +528,27 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("参数设置不允许模拟做空。")
     max_positions = int(_to_float(settings.get("max_positions"), 0))
     max_same_symbol = int(_to_float(settings.get("max_same_symbol_positions"), 0))
+    max_same_direction = int(_to_float(settings.get("max_same_direction_positions"), 0))
     if max_positions > 0 and len(positions) >= max_positions:
         reasons.append("当前持仓数量已达到上限。")
     same_symbol = [p for p in positions if p.get("symbol") == symbol]
     if max_same_symbol > 0 and len(same_symbol) >= max_same_symbol:
         reasons.append(f"当前已持有 {symbol} 模拟仓位。")
+    same_direction = [
+        p
+        for p in positions
+        if p.get("direction") == direction and max(abs(_to_float(p.get("notional_usdt"), 0)), abs(_to_float(p.get("margin_usdt"), 0))) >= 1
+    ]
+    if direction in {"long", "short"} and max_same_direction > 0 and len(same_direction) >= max_same_direction:
+        reasons.append(f"当前 {direction} 方向持仓数量已达到上限。")
     if _to_float(account.get("available_balance"), 0) <= 0:
         reasons.append("模拟账户可用余额不足，无法继续开仓。")
-    ignore_loss_limits = bool(settings.get("continuous_run", True) or settings.get("ignore_loss_limits", True))
+    ignore_loss_limits = bool(settings.get("ignore_loss_limits", False))
     if not ignore_loss_limits:
         if _to_float(account.get("daily_pnl"), 0) <= -_to_float(account.get("initial_balance"), 1000) * _to_float(settings.get("daily_loss_limit_pct"), 3) / 100:
             reasons.append("已达到每日最大亏损限制。")
         if _to_float(account.get("max_drawdown"), 0) >= _to_float(settings.get("max_drawdown_limit_pct"), 8):
             reasons.append("已达到最大回撤限制。")
-        if int(account.get("consecutive_losses", 0)) >= int(settings.get("consecutive_loss_pause", 3)):
-            reasons.append("连续亏损次数达到暂停阈值。")
     if current_prices is not None and _to_float(current_prices.get(symbol), 0) <= 0:
         reasons.append("当前价格不可用，无法创建模拟订单。")
     return not reasons, reasons
@@ -578,8 +591,8 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "dynamic_stop_loss_pct": round(dynamic_stop_pct * 100, 4),
-        "dynamic_take_profit_1_r": settings.get("dynamic_take_profit_1_r", 1.4),
-        "dynamic_take_profit_2_r": settings.get("dynamic_take_profit_2_r", 2.8),
+        "dynamic_take_profit_1_r": settings.get("dynamic_take_profit_1_r", 1.0),
+        "dynamic_take_profit_2_r": settings.get("dynamic_take_profit_2_r", 2.4),
         "position_pct": signal.get("position_suggestion", "0%"),
         "notional_usdt": notional,
         "margin_usdt": margin,
@@ -885,11 +898,14 @@ def check_pending_orders(current_prices: dict[str, float]) -> None:
 def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[str, str] | None = None) -> None:
     positions = load_positions()
     account = load_sim_account()
+    settings = load_settings()
     unrealized_total = 0.0
     external_position_change = False
     live_count = 0
     stale_count = 0
     missing_count = 0
+    early_exit_seconds = max(0, int(_to_float(settings.get("early_exit_min_seconds"), 600)))
+    early_exit_adverse_r = max(0.0, _to_float(settings.get("early_exit_adverse_r"), 0.5))
     for position in positions:
         if position.get("status") not in {"open", "partially_closed"}:
             continue
@@ -921,6 +937,19 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
         unrealized_total += pnl
         direction = str(position.get("direction"))
         can_auto_exit = status in {"live", "ranking", "stale"}
+        r_multiple = _to_float(position.get("r_multiple"), 0)
+        if (
+            can_auto_exit
+            and not position.get("tp1_hit")
+            and early_exit_seconds > 0
+            and early_exit_adverse_r > 0
+            and int(position.get("holding_seconds", 0) or 0) >= early_exit_seconds
+            and r_multiple <= -early_exit_adverse_r
+        ):
+            _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=early_adverse_review price={price} r={r_multiple:.4f} status={status}")
+            close_sim_position(position["position_id"], "反向复核提前退出", price)
+            external_position_change = True
+            continue
         if can_auto_exit and check_stop_loss(position, price):
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=stop_loss price={price} status={status}")
             close_sim_position(position["position_id"], "触发止损", price)
@@ -931,7 +960,7 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_1 price={price} status={status}")
             partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
             position["tp1_hit"] = True
-            if load_settings().get("move_sl_to_breakeven", True):
+            if settings.get("move_sl_to_breakeven", True):
                 position["stop_loss"] = _to_float(position.get("entry_price"), position.get("stop_loss"))
                 position["moved_stop_to_breakeven"] = True
                 log_sim_event("移动止损到保本", symbol, direction, price, reason="止盈1已触发。")

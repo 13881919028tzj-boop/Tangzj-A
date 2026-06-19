@@ -132,8 +132,8 @@ def _build_price_map(opportunities: list[dict[str, Any]]) -> dict[str, float]:
 
 def _risk_reward_prices(price: float, direction: str) -> tuple[float, float, float]:
     stop_pct = 0.0125
-    tp1_pct = stop_pct * 1.4
-    tp2_pct = stop_pct * 2.8
+    tp1_pct = stop_pct * 1.0
+    tp2_pct = stop_pct * 2.4
     if direction == "short":
         return price * (1 + stop_pct), price * (1 - tp1_pct), price * (1 - tp2_pct)
     return price * (1 - stop_pct), price * (1 + tp1_pct), price * (1 + tp2_pct)
@@ -143,11 +143,13 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     row = precheck.get("opportunity") or {}
     symbol = str(precheck.get("symbol") or row.get("symbol") or "").upper()
     price = _price(row)
-    score = _to_int(row.get("final_opportunity_score", row.get("opportunity_score")), _to_int(precheck.get("score"), 0))
+    score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
     risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-    if not symbol or price <= 0 or score < 75 or risk >= 85 or not precheck.get("allowed_candidate"):
+    if not symbol or price <= 0 or score < 75 or risk >= 65 or not precheck.get("allowed_candidate") or not row.get("tradable_now"):
         return None
-    direction = _direction(row, precheck)
+    direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
+    if direction not in {"long", "short"}:
+        return None
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
     action = "顺势做多" if direction == "long" and score >= 88 else "轻仓试多" if direction == "long" else "顺势做空" if score >= 88 else "轻仓试空"
     rank = int(precheck.get("rank", 0) or 0)
@@ -166,9 +168,17 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         "stop_loss": {"price": stop},
         "take_profit_1": {"price": tp1},
         "take_profit_2": {"price": tp2},
-        "risk_reward_ratio": 2.8,
+        "risk_reward_ratio": 2.4,
         "invalid_condition": "机会榜信号失效、风险升高或委员会后续否决。",
         "chairman_summary": f"后台自动模拟：机会榜TOP{rank or '-'}候选，评分{score}，风险{risk}。仅执行本地模拟订单。",
+        "professional_trade_score": score,
+        "entry_state": row.get("entry_state"),
+        "action_gate": row.get("action_gate"),
+        "tradable_now": bool(row.get("tradable_now")),
+        "market_regime": row.get("market_regime"),
+        "market_alignment_score": row.get("market_alignment_score"),
+        "direction_gap": row.get("direction_gap"),
+        "risk_flags": row.get("risk_flags", []),
         "source_opportunity_id": row.get("opportunity_id") or precheck.get("opportunity_id") or f"{symbol}_{direction}",
         "source_board_rank": rank,
         "current_market_state": row.get("current_market_state") or row.get("opportunity_status") or "机会榜自动模拟候选",
@@ -193,7 +203,7 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
     account = load_sim_account()
     signals: list[dict[str, Any]] = []
     if account.get("status") == "running" and settings.get("mode") == "auto":
-        prechecks = run_committee_top10_precheck(rankings, limit=10)
+        prechecks = run_committee_top10_precheck(rankings, limit=3)
         for precheck in prechecks:
             signal = _signal_from_precheck(precheck)
             if signal:
