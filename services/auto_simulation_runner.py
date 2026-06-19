@@ -29,6 +29,13 @@ _MIN_INTERVAL_SECONDS = 3.0
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
 _LAST_PRICE_STATUS: dict[str, str] = {}
+MIN_AUTO_SIM_DIRECTION_GAP = 20
+MIN_AUTO_SIM_CONSENSUS_SUPPORT = 3
+MIN_AUTO_SIM_MARKET_ALIGNMENT = 80
+SHORT_NO_CHASE_CHANGE_PCT = -8.0
+LONG_NO_CHASE_CHANGE_PCT = 8.0
+LONG_CONFIRMED_ENTRY_STATES = {"pullback_confirmed", "breakout_confirmed"}
+SHORT_CONFIRMED_ENTRY_STATES = {"failed_retest_confirmed", "breakdown_confirmed"}
 
 
 def _debug_log(message: str) -> None:
@@ -139,6 +146,74 @@ def _risk_reward_prices(price: float, direction: str) -> tuple[float, float, flo
     return price * (1 - stop_pct), price * (1 + tp1_pct), price * (1 + tp2_pct)
 
 
+def _market_bias(row: dict[str, Any], precheck: dict[str, Any]) -> str:
+    bias = str(row.get("direction_bias") or precheck.get("direction_bias") or "").lower()
+    if bias in {"long", "short", "neutral"}:
+        return bias
+    regime = str(row.get("market_regime") or precheck.get("market_regime") or "").lower()
+    if regime in {"bullish", "rebound"}:
+        return "long"
+    if regime in {"bearish", "weak"}:
+        return "short"
+    return "neutral"
+
+
+def _same_direction(value: Any, direction: str) -> bool:
+    text = str(value or "").lower()
+    if direction == "long":
+        return text in {"long", "多头", "buy", "bullish"}
+    if direction == "short":
+        return text in {"short", "空头", "sell", "bearish"}
+    return False
+
+
+def _strict_auto_sim_reject_reasons(row: dict[str, Any], precheck: dict[str, Any], direction: str) -> list[str]:
+    """Hard gate for auto-simulation entries.
+
+    Opportunity-board rank and score are only candidate signals. New simulated
+    positions require direction confirmation, confirmed entry structure and
+    market alignment so the runner does not chase extended one-way moves.
+    """
+    reasons: list[str] = []
+    direction_gap = _to_float(row.get("direction_gap"), _to_float(precheck.get("direction_gap"), 0))
+    market_alignment = _to_float(row.get("market_alignment_score"), _to_float(precheck.get("market_alignment_score"), 0))
+    consensus_count = _to_int(row.get("consensus_support_count"), _to_int(precheck.get("consensus_support_count"), 0))
+    entry_state = str(row.get("entry_state") or precheck.get("entry_state") or "")
+    change_pct = _to_float(row.get("price_change_percent"), _to_float(row.get("change_percent"), 0))
+    risk_flags = [str(item) for item in row.get("risk_flags", []) or []]
+    block_reasons = [str(item) for item in row.get("trade_block_reasons", []) or precheck.get("block_reasons", []) or []]
+    kline = row.get("kline_signal") or {}
+    whale = row.get("whale_signal") or {}
+    orderbook = row.get("orderbook_signal") or {}
+
+    if direction_gap < MIN_AUTO_SIM_DIRECTION_GAP:
+        reasons.append(f"方向分差 {direction_gap:.0f} 低于自动模拟硬门槛 {MIN_AUTO_SIM_DIRECTION_GAP}。")
+    if consensus_count < MIN_AUTO_SIM_CONSENSUS_SUPPORT:
+        reasons.append(f"方向共识 {consensus_count}/5 不足，禁止仅凭机会榜开仓。")
+    if market_alignment < MIN_AUTO_SIM_MARKET_ALIGNMENT or _market_bias(row, precheck) != direction:
+        reasons.append("大盘未与开仓方向同向。")
+    if kline and not _same_direction(kline.get("direction"), direction):
+        reasons.append("K线方向未确认同向。")
+    if whale and not _same_direction(whale.get("direction"), direction):
+        reasons.append("大单资金未确认同向。")
+    if orderbook and orderbook.get("direction") in {"long", "short"} and not _same_direction(orderbook.get("direction"), direction):
+        reasons.append("盘口方向与开仓方向冲突。")
+
+    if direction == "short":
+        if entry_state not in SHORT_CONFIRMED_ENTRY_STATES:
+            reasons.append("空单未完成反抽失败/跌破确认。")
+        if change_pct <= SHORT_NO_CHASE_CHANGE_PCT or any("追空" in item or "跌幅较大" in item for item in risk_flags + block_reasons):
+            reasons.append("24小时跌幅较大，禁止直接追空。")
+    elif direction == "long":
+        if entry_state not in LONG_CONFIRMED_ENTRY_STATES:
+            reasons.append("多单未完成回踩/突破确认。")
+        if change_pct >= LONG_NO_CHASE_CHANGE_PCT or any("追多" in item or "涨幅较大" in item for item in risk_flags + block_reasons):
+            reasons.append("24小时涨幅较大，禁止直接追多。")
+    else:
+        reasons.append("方向不是 long/short。")
+    return reasons
+
+
 def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     row = precheck.get("opportunity") or {}
     symbol = str(precheck.get("symbol") or row.get("symbol") or "").upper()
@@ -149,6 +224,10 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         return None
     direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
     if direction not in {"long", "short"}:
+        return None
+    reject_reasons = _strict_auto_sim_reject_reasons(row, precheck, direction)
+    if reject_reasons:
+        log_sim_event("拒绝自动模拟候选", symbol, direction, price, reason="；".join(reject_reasons))
         return None
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
     action = "顺势做多" if direction == "long" and score >= 88 else "轻仓试多" if direction == "long" else "顺势做空" if score >= 88 else "轻仓试空"
