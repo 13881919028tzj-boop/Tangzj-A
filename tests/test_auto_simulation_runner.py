@@ -41,6 +41,13 @@ def precheck(**row_overrides):
         "price_change_percent": -2.5,
         "consensus_support_count": 4,
         "consensus_conflict_sources": [],
+        "liquidity_quality_score": 70,
+        "relative_strength_score": 68,
+        "signal_freshness_score": 72,
+        "historical_tradability_score": 60,
+        "portfolio_fit_score": 76,
+        "base_quality_score": 70,
+        "simulation_score": 72,
         "kline_signal": {"direction": "short", "confirming": True},
         "whale_signal": {"direction": "short", "confirming": True, "quality": "good"},
         "orderbook_signal": {"direction": "short", "confirming": True},
@@ -120,6 +127,20 @@ def test_auto_sim_allows_blocked_precheck_for_sampling(tmp_path):
     assert signal["sampling_override"] is True
 
 
+def test_auto_sim_rejects_poor_liquidity_quality(tmp_path):
+    use_temp_store(tmp_path)
+
+    signal = runner._signal_from_precheck(
+        precheck(
+            liquidity_quality_score=35,
+            base_quality_score=68,
+            simulation_score=70,
+        )
+    )
+
+    assert signal is None
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_confirmed_short_precheck_becomes_sim_signal(Path(raw) / "case1")
@@ -129,4 +150,6 @@ if __name__ == "__main__":
         test_auto_sim_allows_market_misalignment_for_sampling(Path(raw) / "case3")
     with tempfile.TemporaryDirectory() as raw:
         test_auto_sim_allows_blocked_precheck_for_sampling(Path(raw) / "case4")
+    with tempfile.TemporaryDirectory() as raw:
+        test_auto_sim_rejects_poor_liquidity_quality(Path(raw) / "case5")
     print("auto_simulation_runner tests passed")

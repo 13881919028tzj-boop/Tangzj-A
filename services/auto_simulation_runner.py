@@ -222,13 +222,35 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     price = _price(row)
     score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
     risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-    if not symbol or price <= 0 or score < MIN_AUTO_SIM_SAMPLING_SCORE or risk >= MAX_AUTO_SIM_SAMPLING_RISK:
+    simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SAMPLING_SCORE))
+    base_quality = _to_int(row.get("base_quality_score"), max(65, min(80, simulation_score)))
+    liquidity_quality = _to_int(row.get("liquidity_quality_score"), 70)
+    relative_strength = _to_int(row.get("relative_strength_score"), 65)
+    signal_freshness = _to_int(row.get("signal_freshness_score"), 65)
+    historical_tradability = _to_int(row.get("historical_tradability_score"), 60)
+    portfolio_fit = _to_int(row.get("portfolio_fit_score"), 75)
+    if (
+        not symbol
+        or price <= 0
+        or score < MIN_AUTO_SIM_SAMPLING_SCORE
+        or simulation_score < MIN_AUTO_SIM_SAMPLING_SCORE
+        or base_quality < 50
+        or liquidity_quality < 40
+        or portfolio_fit < 25
+        or risk >= MAX_AUTO_SIM_SAMPLING_RISK
+    ):
         return None
     direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
     if direction not in {"long", "short"}:
         return None
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
     action = "顺势做多" if direction == "long" and score >= 88 else "轻仓试多" if direction == "long" else "顺势做空" if score >= 88 else "轻仓试空"
+    if simulation_score < 66 or liquidity_quality < 55 or portfolio_fit < 50 or risk >= 60:
+        position_suggestion = "1%-3%"
+    elif simulation_score >= 82 and liquidity_quality >= 72 and portfolio_fit >= 70 and risk <= 45:
+        position_suggestion = "5%-10%"
+    else:
+        position_suggestion = "3%-5%"
     rank = int(precheck.get("rank", 0) or 0)
     return {
         "symbol": symbol,
@@ -239,16 +261,28 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         "veto_members": [],
         "committee_confidence": max(60, min(95, score)),
         "risk_score": risk,
-        "position_suggestion": "1%-3%" if risk >= 60 else "3%-5%",
-        "system_position_suggestion": "1%-3%" if risk >= 60 else "3%-5%",
+        "position_suggestion": position_suggestion,
+        "system_position_suggestion": position_suggestion,
         "entry_zone": {"low": price * 0.999, "high": price * 1.001},
         "stop_loss": {"price": stop},
         "take_profit_1": {"price": tp1},
         "take_profit_2": {"price": tp2},
         "risk_reward_ratio": 2.4,
         "invalid_condition": "机会榜信号失效、风险升高或委员会后续否决。",
-        "chairman_summary": f"后台自动模拟：机会榜TOP{rank or '-'}候选，评分{score}，风险{risk}。仅执行本地模拟订单。",
+        "chairman_summary": (
+            f"后台自动模拟：机会榜TOP{rank or '-'}候选，专业分{score}，模拟分{simulation_score}，"
+            f"基础分{base_quality}，流动性{liquidity_quality}，新鲜度{signal_freshness}，"
+            f"历史{historical_tradability}，组合{portfolio_fit}，风险{risk}。仅执行本地模拟订单。"
+        ),
         "professional_trade_score": score,
+        "simulation_score": simulation_score,
+        "base_quality_score": base_quality,
+        "liquidity_quality_score": liquidity_quality,
+        "relative_strength_score": relative_strength,
+        "signal_freshness_score": signal_freshness,
+        "historical_tradability_score": historical_tradability,
+        "portfolio_fit_score": portfolio_fit,
+        "base_score_breakdown": row.get("base_score_breakdown"),
         "entry_state": row.get("entry_state"),
         "action_gate": "open_now",
         "tradable_now": True,

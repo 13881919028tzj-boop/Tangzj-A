@@ -29,6 +29,8 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 SETTINGS_PATH = DATA_DIR / "fast_opportunity_settings.json"
+SIM_POSITIONS_PATH = DATA_DIR / "sim_positions.json"
+SIM_HISTORY_PATH = DATA_DIR / "sim_trade_history.json"
 
 DEFAULT_SETTINGS = {
     "TOP10_OPPORTUNITY_REFRESH_SECONDS": 3,
@@ -100,6 +102,7 @@ _STATE: dict[str, Any] = {
     "latest_multi_review": [],
     "latest_candidate": {},
 }
+_TRADABILITY_CACHE: dict[str, Any] = {"loaded_at": 0.0, "rows": []}
 
 
 def _now() -> str:
@@ -117,6 +120,10 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 def _to_int(value: Any, default: int = 0) -> int:
     return int(round(_to_float(value, default)))
+
+
+def _clamp_score(value: Any, minimum: int = 0, maximum: int = 100) -> int:
+    return max(minimum, min(maximum, _to_int(value)))
 
 
 def _ensure_data_dir() -> None:
@@ -524,8 +531,8 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
             item["opportunity_source"] = item.get("opportunity_source") or label
             item = assess_trade_opportunity(_enrich_lifecycle(item))
             old = by_symbol.get(symbol)
-            score = _to_int(item.get("final_opportunity_score", item.get("opportunity_score")))
-            old_score = _to_int((old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))) if old else -1
+            score = _to_int(item.get("simulation_score", item.get("professional_trade_score", item.get("final_opportunity_score", item.get("opportunity_score")))))
+            old_score = _to_int((old or {}).get("simulation_score", (old or {}).get("professional_trade_score", (old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))))) if old else -1
             if old is None or score > old_score:
                 by_symbol[symbol] = item
     if get_watchlist_candidates_for_committee:
@@ -566,8 +573,9 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
                 }
                 item = assess_trade_opportunity(_enrich_lifecycle(item))
                 old = by_symbol.get(symbol)
-                old_score = _to_int((old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))) if old else -1
-                if old is None or score > old_score:
+                item_score = _to_int(item.get("simulation_score", item.get("professional_trade_score", score)))
+                old_score = _to_int((old or {}).get("simulation_score", (old or {}).get("professional_trade_score", (old or {}).get("final_opportunity_score", (old or {}).get("opportunity_score"))))) if old else -1
+                if old is None or item_score > old_score:
                     by_symbol[symbol] = item
         except Exception as exc:
             print(f"[观察池] 合并到交易机会榜失败，不影响主榜单。error={repr(exc)}")
@@ -575,7 +583,9 @@ def collect_top10_opportunities(rankings: dict[str, list[dict[str, Any]]] | None
         by_symbol.values(),
         key=lambda row: (
             1 if row.get("tradable_now") else 0,
+            _to_int(row.get("simulation_score"), 0),
             _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score")))),
+            _to_int(row.get("base_quality_score"), 0),
             _to_float(row.get("quote_volume"), 0),
             -_to_int(row.get("risk_score"), 50),
         ),
@@ -638,6 +648,173 @@ def _market_alignment_score(direction: str, regime: dict[str, Any]) -> tuple[int
     if bias == direction:
         return 88, "大盘同向"
     return 35, "大盘反向"
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    try:
+        if not path.exists():
+            return default
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return default
+
+
+def _open_sim_positions() -> list[dict[str, Any]]:
+    rows = _read_json_file(SIM_POSITIONS_PATH, [])
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and row.get("status") in {"open", "partially_closed"}]
+
+
+def _recent_sim_history() -> list[dict[str, Any]]:
+    now = time.time()
+    if now - float(_TRADABILITY_CACHE.get("loaded_at", 0) or 0) < 30:
+        return list(_TRADABILITY_CACHE.get("rows") or [])
+    rows = _read_json_file(SIM_HISTORY_PATH, [])
+    if not isinstance(rows, list):
+        rows = []
+    rows = [row for row in rows if isinstance(row, dict)]
+    _TRADABILITY_CACHE["loaded_at"] = now
+    _TRADABILITY_CACHE["rows"] = rows[:300]
+    return rows[:300]
+
+
+def _liquidity_quality_score(row: dict[str, Any], price: float, change: float, orderbook: dict[str, Any]) -> tuple[int, list[str]]:
+    notes: list[str] = []
+    volume_score = _to_int(row.get("volume_score", row.get("liquidity_score")), 50)
+    tradeability = _to_int(row.get("tradeability_score"), volume_score)
+    quote_volume = _to_float(row.get("quote_volume"), 0)
+    score = volume_score * 0.55 + tradeability * 0.25 + _to_int(row.get("liquidity_score"), volume_score) * 0.20
+    if quote_volume <= 0:
+        score -= 18
+        notes.append("成交额缺失")
+    elif quote_volume < 1_000_000:
+        score -= 10
+        notes.append("成交额偏低")
+    if price <= 0:
+        score -= 30
+        notes.append("价格不可用")
+    if abs(change) >= 18:
+        score -= 14
+        notes.append("24小时波动过大")
+    if str(orderbook.get("bias") or "").startswith("订单簿"):
+        score -= 8
+        notes.append("盘口样本不足")
+    return _clamp_score(score), notes or ["流动性可用"]
+
+
+def _relative_strength_score(row: dict[str, Any], direction: str, market: dict[str, Any], change: float) -> tuple[int, str]:
+    market_change = (_to_float(market.get("btc_change_percent")) + _to_float(market.get("eth_change_percent"))) / 2
+    relative = change - market_change
+    direction_gap = _to_int(row.get("direction_gap"), abs(_to_int(row.get("long_score")) - _to_int(row.get("short_score"))))
+    base = 52 + min(20, direction_gap * 0.45)
+    if direction == "long":
+        score = base + relative * 4
+        note = f"相对大盘强弱 {relative:.2f}%"
+    elif direction == "short":
+        score = base - relative * 4
+        note = f"相对大盘弱势 {relative:.2f}%"
+    else:
+        score = 35
+        note = "方向不明确"
+    return _clamp_score(score), note
+
+
+def _signal_freshness_score(row: dict[str, Any], entry_state: str, change: float) -> tuple[int, list[str]]:
+    notes: list[str] = []
+    score = 75
+    review_count = _to_int(row.get("review_count"))
+    reject_count = _to_int(row.get("reject_count"))
+    block_count = _to_int(row.get("block_count"))
+    opportunity_round = max(1, _to_int(row.get("opportunity_round"), 1))
+    score -= min(24, review_count * 5 + reject_count * 8 + block_count * 8)
+    if opportunity_round >= 4:
+        score -= min(16, (opportunity_round - 3) * 4)
+        notes.append("机会已多轮停留")
+    if entry_state.startswith("wait") or "wait" in entry_state:
+        score -= 12
+        notes.append("入场确认未完成")
+    if abs(change) >= 12:
+        score -= 8
+        notes.append("波动扩张后信号衰减")
+    if entry_state in {"tradable_now", "pullback_confirmed", "failed_retest_confirmed"}:
+        score += 8
+        notes.append("入场状态新鲜")
+    return _clamp_score(score), notes or ["信号新鲜度正常"]
+
+
+def _historical_tradability_score(symbol: str, direction: str) -> tuple[int, list[str]]:
+    rows = [row for row in _recent_sim_history() if str(row.get("symbol") or "").upper() == symbol]
+    if direction in {"long", "short"}:
+        same_direction = [row for row in rows if str(row.get("direction") or "") == direction]
+        if same_direction:
+            rows = same_direction
+    rows = rows[:20]
+    if not rows:
+        return 60, ["缺少该币近期模拟样本，按中性处理"]
+    wins = 0
+    total_pnl = 0.0
+    stop_count = 0
+    tp_count = 0
+    for row in rows:
+        pnl = _to_float(row.get("realized_pnl", row.get("pnl_usdt")))
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        reason = str(row.get("close_reason") or "")
+        if "止损" in reason:
+            stop_count += 1
+        if "止盈" in reason or "TP" in reason.upper():
+            tp_count += 1
+    win_rate = wins / len(rows)
+    avg_pnl = total_pnl / len(rows)
+    score = 45 + win_rate * 34 + min(14, max(-14, avg_pnl * 2)) + tp_count * 2 - stop_count * 4
+    return _clamp_score(score, 25, 90), [f"近期样本{len(rows)}笔，胜率{win_rate * 100:.0f}%"]
+
+
+def _portfolio_fit_score(symbol: str, direction: str) -> tuple[int, list[str]]:
+    positions = _open_sim_positions()
+    notes: list[str] = []
+    same_symbol = [p for p in positions if str(p.get("symbol") or "").upper() == symbol]
+    same_direction = [p for p in positions if str(p.get("direction") or "") == direction]
+    opposite = [p for p in positions if str(p.get("direction") or "") in {"long", "short"} and str(p.get("direction") or "") != direction]
+    score = 82
+    if same_symbol:
+        score -= 32
+        notes.append("同币种已有敞口")
+    if len(same_direction) >= 4:
+        score -= min(24, (len(same_direction) - 3) * 6)
+        notes.append("同方向仓位偏多")
+    if len(positions) >= 10:
+        score -= min(20, (len(positions) - 9) * 4)
+        notes.append("组合仓位较密集")
+    if opposite and len(opposite) >= len(same_direction) + 3:
+        score -= 6
+        notes.append("多空结构冲突")
+    return _clamp_score(score, 20, 95), notes or ["组合敞口适配"]
+
+
+def _base_quality_score(
+    liquidity: int,
+    relative_strength: int,
+    freshness: int,
+    historical: int,
+    portfolio_fit: int,
+    risk_score: int,
+    data_quality: str,
+) -> int:
+    score = (
+        liquidity * 0.25
+        + relative_strength * 0.20
+        + freshness * 0.15
+        + historical * 0.15
+        + portfolio_fit * 0.15
+        + (100 - risk_score) * 0.10
+    )
+    if data_quality == "poor":
+        score -= 12
+    return _clamp_score(score)
 
 
 def _signal_direction(value: float, positive: float, negative: float) -> str:
@@ -837,8 +1014,29 @@ def assess_trade_opportunity(row: dict[str, Any]) -> dict[str, Any]:
             action_gate = "wait"
         risk_flags.append("短线波动过大，追涨追空风险高。")
 
+    liquidity_quality, liquidity_notes = _liquidity_quality_score(assessed, price, change, orderbook)
+    relative_strength, relative_note = _relative_strength_score(assessed, direction, market, change)
+    signal_freshness, freshness_notes = _signal_freshness_score(assessed, entry_state, change)
+    historical_tradability, historical_notes = _historical_tradability_score(symbol, direction)
+    portfolio_fit, portfolio_notes = _portfolio_fit_score(symbol, direction)
+    base_quality = _base_quality_score(
+        liquidity_quality,
+        relative_strength,
+        signal_freshness,
+        historical_tradability,
+        portfolio_fit,
+        risk_score,
+        data_quality,
+    )
+    if liquidity_quality < 38:
+        block_reasons.append(f"流动性质量 {liquidity_quality} 过低，成交/滑点风险不适合模拟开仓。")
+    if signal_freshness < 32:
+        block_reasons.append(f"信号新鲜度 {signal_freshness} 过低，机会已衰减。")
+    if portfolio_fit < 25:
+        block_reasons.append(f"组合适配 {portfolio_fit} 过低，当前敞口过于拥挤。")
+
     consensus_score = min(95, 45 + consensus_count * 10 - len(consensus_conflict) * 8)
-    trade_score = round(
+    raw_trade_score = round(
         market_score * 0.10
         + trend_score * 0.16
         + entry_quality * 0.24
@@ -848,6 +1046,8 @@ def assess_trade_opportunity(row: dict[str, Any]) -> dict[str, Any]:
         + consensus_score * 0.17
         - max(0, risk_score - 45) * 0.45
     )
+    trade_score = round(raw_trade_score * 0.72 + base_quality * 0.28)
+    simulation_score = _clamp_score(trade_score * 0.45 + base_quality * 0.45 + (100 - risk_score) * 0.10)
     open_entry_states = {"tradable_now", "pullback_confirmed", "failed_retest_confirmed"}
     if entry_state not in open_entry_states:
         block_reasons.extend(risk_flags or ["当前不是专业入场位置。"])
@@ -874,6 +1074,20 @@ def assess_trade_opportunity(row: dict[str, Any]) -> dict[str, Any]:
             "flow_confirmation_score": flow_score,
             "risk_reward_score": rr_score,
             "consensus_score": consensus_score,
+            "liquidity_quality_score": liquidity_quality,
+            "relative_strength_score": relative_strength,
+            "signal_freshness_score": signal_freshness,
+            "historical_tradability_score": historical_tradability,
+            "portfolio_fit_score": portfolio_fit,
+            "base_quality_score": base_quality,
+            "simulation_score": simulation_score,
+            "base_score_breakdown": {
+                "liquidity_quality": {"score": liquidity_quality, "notes": liquidity_notes},
+                "relative_strength": {"score": relative_strength, "notes": [relative_note]},
+                "signal_freshness": {"score": signal_freshness, "notes": freshness_notes},
+                "historical_tradability": {"score": historical_tradability, "notes": historical_notes},
+                "portfolio_fit": {"score": portfolio_fit, "notes": portfolio_notes},
+            },
             "professional_trade_score": max(0, min(100, int(trade_score))),
             "trade_score": max(0, min(100, int(trade_score))),
             "entry_state": entry_state,

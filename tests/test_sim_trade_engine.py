@@ -31,6 +31,13 @@ def approved_signal(**overrides):
         "veto_members": [],
         "committee_confidence": 72,
         "risk_score": 42,
+        "simulation_score": 72,
+        "base_quality_score": 68,
+        "liquidity_quality_score": 70,
+        "relative_strength_score": 65,
+        "signal_freshness_score": 72,
+        "historical_tradability_score": 60,
+        "portfolio_fit_score": 75,
         "position_suggestion": "3%-5%",
         "entry_zone": {"low": 99, "high": 101},
         "stop_loss": {"price": 95},
@@ -119,6 +126,33 @@ def test_zero_position_limits_mean_unlimited(tmp_path):
     assert not any("持仓数量已达到上限" in reason or "当前已持有" in reason for reason in reasons)
 
 
+def test_low_liquidity_quality_signal_is_rejected(tmp_path):
+    prepare_running_account(tmp_path)
+    signal = approved_signal(liquidity_quality_score=35, simulation_score=70, base_quality_score=70)
+    ok, reasons = sim.validate_signal_for_simulation(signal, {"BTCUSDT": 100})
+
+    assert ok is False
+    assert any("流动性质量" in reason for reason in reasons)
+
+
+def test_quality_scores_reduce_position_size(tmp_path):
+    prepare_running_account(tmp_path)
+    settings = sim.load_settings()
+
+    pct = sim._position_pct(
+        approved_signal(
+            position_suggestion="5%-10%",
+            action="顺势做多",
+            simulation_score=61,
+            liquidity_quality_score=52,
+            portfolio_fit_score=46,
+        ),
+        settings,
+    )
+
+    assert pct == 2.0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -130,4 +164,8 @@ if __name__ == "__main__":
         test_take_profit_1_is_persisted_after_partial_close(Path(raw) / "case4")
     with tempfile.TemporaryDirectory() as raw:
         test_zero_position_limits_mean_unlimited(Path(raw) / "case5")
+    with tempfile.TemporaryDirectory() as raw:
+        test_low_liquidity_quality_signal_is_rejected(Path(raw) / "case6")
+    with tempfile.TemporaryDirectory() as raw:
+        test_quality_scores_reduce_position_size(Path(raw) / "case7")
     print("sim_trade_engine tests passed")

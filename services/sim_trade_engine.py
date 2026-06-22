@@ -443,6 +443,21 @@ def _position_pct(signal: dict[str, Any], settings: dict[str, Any]) -> float:
     risk_score = _to_float(signal.get("risk_score"), 50)
     if risk_score >= 70:
         pct = min(pct, 3.0)
+    simulation_score = _to_float(signal.get("simulation_score"), 70)
+    liquidity_quality = _to_float(signal.get("liquidity_quality_score"), 70)
+    portfolio_fit = _to_float(signal.get("portfolio_fit_score"), 70)
+    historical_tradability = _to_float(signal.get("historical_tradability_score"), 60)
+    signal_freshness = _to_float(signal.get("signal_freshness_score"), 60)
+    if simulation_score < 66:
+        pct = min(pct, 2.0)
+    if liquidity_quality < 55:
+        pct = min(pct, 2.0)
+    if portfolio_fit < 50:
+        pct = min(pct, 2.0)
+    if historical_tradability < 45:
+        pct = min(pct, 2.0)
+    if signal_freshness < 45:
+        pct = min(pct, 2.0)
     return min(pct, float(settings.get("max_position_pct", 10)))
 
 
@@ -518,6 +533,14 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("委员会置信度不足。")
     if _rr_value(signal) and _rr_value(signal) < 1.2:
         reasons.append("风险收益比低于1:1.2。")
+    if "simulation_score" in signal and _to_float(signal.get("simulation_score"), 0) < 60:
+        reasons.append("模拟适配分低于60，暂不创建模拟订单。")
+    if "base_quality_score" in signal and _to_float(signal.get("base_quality_score"), 0) < 50:
+        reasons.append("基础质量分低于50，暂不创建模拟订单。")
+    if "liquidity_quality_score" in signal and _to_float(signal.get("liquidity_quality_score"), 0) < 40:
+        reasons.append("流动性质量低于40，滑点风险过高。")
+    if "portfolio_fit_score" in signal and _to_float(signal.get("portfolio_fit_score"), 0) < 25:
+        reasons.append("组合适配分低于25，当前模拟敞口过于拥挤。")
     if account.get("status") != "running":
         reasons.append("模拟交易未处于运行状态。")
     if settings.get("mode") == "observe":
