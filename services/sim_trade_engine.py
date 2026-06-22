@@ -27,6 +27,7 @@ ORDERS_PATH = DATA_DIR / "sim_orders.json"
 HISTORY_JSON_PATH = DATA_DIR / "sim_trade_history.json"
 HISTORY_CSV_PATH = DATA_DIR / "sim_trade_history.csv"
 LOG_PATH = DATA_DIR / "sim_trade_log.json"
+DIAGNOSTICS_PATH = DATA_DIR / "sim_diagnostics.json"
 EQUITY_JSON_PATH = DATA_DIR / "sim_equity_curve.json"
 EQUITY_CSV_PATH = DATA_DIR / "sim_equity_curve.csv"
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
@@ -155,6 +156,29 @@ def log_sim_event(event_type: str, symbol: str = "", direction: str = "", price:
         },
     )
     _write_json(LOG_PATH, logs[:500])
+
+
+def append_sim_diagnostic(event_type: str, symbol: str = "", status: str = "", reason: str = "", details: dict[str, Any] | None = None) -> None:
+    rows = _read_json(DIAGNOSTICS_PATH, [])
+    rows.insert(
+        0,
+        {
+            "time": _now(),
+            "event_type": event_type,
+            "symbol": symbol,
+            "status": status,
+            "reason": reason,
+            "details": details or {},
+        },
+    )
+    _write_json(DIAGNOSTICS_PATH, rows[:300])
+
+
+def load_sim_diagnostics(limit: int = 80) -> list[dict[str, Any]]:
+    rows = _read_json(DIAGNOSTICS_PATH, [])
+    if not isinstance(rows, list):
+        return []
+    return rows[:limit]
 
 
 def default_account(initial_balance: float = 1000.0) -> dict[str, Any]:
@@ -1037,10 +1061,43 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
         price = get_current_price(symbol, current_prices)
         ok, reasons = validate_signal_for_simulation(signal, current_prices)
         if not ok:
-            results.append({"symbol": symbol, "status": "rejected", "reason": "；".join(reasons)})
+            reason = "；".join(reasons)
+            results.append({"symbol": symbol, "status": "rejected", "reason": reason})
+            append_sim_diagnostic(
+                "模拟信号拒绝",
+                symbol,
+                "rejected",
+                reason,
+                {
+                    "price": price,
+                    "direction": signal.get("direction"),
+                    "simulation_score": signal.get("simulation_score"),
+                    "base_quality_score": signal.get("base_quality_score"),
+                    "liquidity_quality_score": signal.get("liquidity_quality_score"),
+                    "portfolio_fit_score": signal.get("portfolio_fit_score"),
+                    "risk_score": signal.get("risk_score"),
+                },
+            )
             continue
         order = create_pending_sim_order(signal, price)
-        results.append({"symbol": symbol, "status": "created" if order else "rejected", "reason": "已创建模拟订单。" if order else "模拟订单创建失败。"})
+        status = "created" if order else "rejected"
+        reason = "已创建模拟订单。" if order else "模拟订单创建失败。"
+        results.append({"symbol": symbol, "status": status, "reason": reason})
+        append_sim_diagnostic(
+            "模拟信号执行",
+            symbol,
+            status,
+            reason,
+            {
+                "price": price,
+                "direction": signal.get("direction"),
+                "simulation_score": signal.get("simulation_score"),
+                "base_quality_score": signal.get("base_quality_score"),
+                "liquidity_quality_score": signal.get("liquidity_quality_score"),
+                "portfolio_fit_score": signal.get("portfolio_fit_score"),
+                "risk_score": signal.get("risk_score"),
+            },
+        )
     return results
 
 
@@ -1226,6 +1283,71 @@ def get_recent_trade_results(limit: int = 10) -> list[dict[str, Any]]:
     return load_sim_trade_history()[:limit]
 
 
+def _score_bucket(value: Any) -> str:
+    score = _to_float(value, 0)
+    if score >= 75:
+        return "高"
+    if score >= 60:
+        return "中"
+    return "低"
+
+
+def calculate_sim_score_feedback(history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Summarize how the new base scores relate to closed simulated trades."""
+    rows = history if history is not None else load_sim_trade_history()
+    fields = [
+        ("simulation_score", "模拟适配分"),
+        ("base_quality_score", "基础质量分"),
+        ("liquidity_quality_score", "流动性质量"),
+        ("relative_strength_score", "相对强弱"),
+        ("signal_freshness_score", "信号新鲜度"),
+        ("historical_tradability_score", "历史可交易性"),
+        ("portfolio_fit_score", "组合适配"),
+    ]
+    stats: list[dict[str, Any]] = []
+    suggestions: list[str] = []
+    for key, label in fields:
+        buckets: dict[str, dict[str, Any]] = {
+            "高": {"count": 0, "wins": 0, "pnl": 0.0},
+            "中": {"count": 0, "wins": 0, "pnl": 0.0},
+            "低": {"count": 0, "wins": 0, "pnl": 0.0},
+        }
+        for row in rows:
+            snapshot = row.get("committee_snapshot") or {}
+            if key not in snapshot:
+                continue
+            bucket = _score_bucket(snapshot.get(key))
+            item = buckets[bucket]
+            item["count"] += 1
+            item["wins"] += 1 if row.get("is_win") else 0
+            item["pnl"] += _to_float(row.get("pnl"), 0)
+        high = buckets["高"]
+        low = buckets["低"]
+        high_win_rate = high["wins"] / high["count"] * 100 if high["count"] else 0
+        low_win_rate = low["wins"] / low["count"] * 100 if low["count"] else 0
+        row_stats = {
+            "评分项": label,
+            "高分样本": high["count"],
+            "高分胜率": round(high_win_rate, 2),
+            "高分盈亏": round(high["pnl"], 4),
+            "低分样本": low["count"],
+            "低分胜率": round(low_win_rate, 2),
+            "低分盈亏": round(low["pnl"], 4),
+        }
+        stats.append(row_stats)
+        if high["count"] >= 3 and high["pnl"] < 0:
+            suggestions.append(f"{label}高分样本仍亏损，建议下调该评分权重或提高风险惩罚。")
+        if low["count"] >= 3 and low["pnl"] > 0:
+            suggestions.append(f"{label}低分样本表现为正，建议检查该评分是否过严。")
+    sample_count = len([row for row in rows if row.get("committee_snapshot")])
+    return {
+        "sample_count": sample_count,
+        "stats": stats,
+        "suggestions": suggestions or ["当前样本尚未暴露明显评分偏差，继续积累模拟交易结果。"],
+        "sample_warning": "样本少于20笔，评分反馈只作观察，不自动改权重。" if sample_count < 20 else "",
+    }
+
+
 def calculate_sim_performance_stats() -> dict[str, Any]:
     stats = calculate_sim_stats()
     account = enrich_sim_account(load_sim_account())
@@ -1262,6 +1384,8 @@ def get_sim_account_summary(process_results: list[dict[str, Any]] | None = None)
         "equity_curve": get_sim_equity_curve(300),
         "risk_summary": risk_summary,
         "events": load_sim_events(30),
+        "diagnostics": load_sim_diagnostics(80),
+        "score_feedback": calculate_sim_score_feedback(history),
         "stats": stats,
         "process_results": process_results or [],
         "safety_notice": "当前为模拟交易，不会使用真实资金，不会执行真实订单。",

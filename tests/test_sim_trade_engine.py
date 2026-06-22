@@ -18,6 +18,9 @@ def use_temp_store(tmp_path):
     sim.HISTORY_JSON_PATH = tmp_path / "sim_trade_history.json"
     sim.HISTORY_CSV_PATH = tmp_path / "sim_trade_history.csv"
     sim.LOG_PATH = tmp_path / "sim_trade_log.json"
+    sim.DIAGNOSTICS_PATH = tmp_path / "sim_diagnostics.json"
+    sim.EQUITY_JSON_PATH = tmp_path / "sim_equity_curve.json"
+    sim.EQUITY_CSV_PATH = tmp_path / "sim_equity_curve.csv"
     tmp_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -153,6 +156,53 @@ def test_quality_scores_reduce_position_size(tmp_path):
     assert pct == 2.0
 
 
+def test_rejected_signal_writes_diagnostic(tmp_path):
+    prepare_running_account(tmp_path)
+    settings = sim.load_settings()
+    settings["mode"] = "auto"
+    sim.save_settings(settings)
+
+    results = sim.process_committee_signals(
+        {"BTCUSDT": 100},
+        [approved_signal(liquidity_quality_score=35, simulation_score=70, base_quality_score=70)],
+    )
+    diagnostics = sim.load_sim_diagnostics()
+
+    assert results[0]["status"] == "rejected"
+    assert diagnostics[0]["event_type"] == "模拟信号拒绝"
+    assert diagnostics[0]["details"]["liquidity_quality_score"] == 35
+
+
+def test_score_feedback_summarizes_quality_buckets(tmp_path):
+    use_temp_store(tmp_path)
+    history = [
+        {
+            "pnl": -2.0,
+            "is_win": False,
+            "committee_snapshot": {
+                "simulation_score": 80,
+                "base_quality_score": 78,
+                "liquidity_quality_score": 76,
+            },
+        },
+        {
+            "pnl": 1.5,
+            "is_win": True,
+            "committee_snapshot": {
+                "simulation_score": 58,
+                "base_quality_score": 55,
+                "liquidity_quality_score": 52,
+            },
+        },
+    ]
+
+    feedback = sim.calculate_sim_score_feedback(history)
+
+    assert feedback["sample_count"] == 2
+    assert feedback["stats"][0]["评分项"] == "模拟适配分"
+    assert feedback["stats"][0]["高分样本"] == 1
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -168,4 +218,8 @@ if __name__ == "__main__":
         test_low_liquidity_quality_signal_is_rejected(Path(raw) / "case6")
     with tempfile.TemporaryDirectory() as raw:
         test_quality_scores_reduce_position_size(Path(raw) / "case7")
+    with tempfile.TemporaryDirectory() as raw:
+        test_rejected_signal_writes_diagnostic(Path(raw) / "case8")
+    with tempfile.TemporaryDirectory() as raw:
+        test_score_feedback_summarizes_quality_buckets(Path(raw) / "case9")
     print("sim_trade_engine tests passed")

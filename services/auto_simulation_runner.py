@@ -15,6 +15,7 @@ from services import market_cache
 from services.binance_public import get_24hr_ticker
 from services.fast_opportunity_engine import collect_top10_opportunities, run_committee_top10_precheck
 from services.sim_trade_engine import (
+    append_sim_diagnostic,
     get_open_positions,
     get_pending_orders,
     load_settings,
@@ -148,6 +149,36 @@ def _risk_reward_prices(price: float, direction: str) -> tuple[float, float, flo
     return price * (1 - stop_pct), price * (1 + tp1_pct), price * (1 + tp2_pct)
 
 
+def _sampling_reject_reasons(
+    symbol: str,
+    price: float,
+    score: int,
+    simulation_score: int,
+    base_quality: int,
+    liquidity_quality: int,
+    portfolio_fit: int,
+    risk: int,
+) -> list[str]:
+    reasons: list[str] = []
+    if not symbol:
+        reasons.append("交易对象缺失。")
+    if price <= 0:
+        reasons.append("价格不可用。")
+    if score < MIN_AUTO_SIM_SAMPLING_SCORE:
+        reasons.append(f"专业分 {score} 低于自动模拟采样阈值 {MIN_AUTO_SIM_SAMPLING_SCORE}。")
+    if simulation_score < MIN_AUTO_SIM_SAMPLING_SCORE:
+        reasons.append(f"模拟适配分 {simulation_score} 低于自动模拟采样阈值 {MIN_AUTO_SIM_SAMPLING_SCORE}。")
+    if base_quality < 50:
+        reasons.append(f"基础质量分 {base_quality} 低于50。")
+    if liquidity_quality < 40:
+        reasons.append(f"流动性质量 {liquidity_quality} 低于40。")
+    if portfolio_fit < 25:
+        reasons.append(f"组合适配分 {portfolio_fit} 低于25。")
+    if risk >= MAX_AUTO_SIM_SAMPLING_RISK:
+        reasons.append(f"风险分 {risk} 达到或超过 {MAX_AUTO_SIM_SAMPLING_RISK}。")
+    return reasons
+
+
 def _market_bias(row: dict[str, Any], precheck: dict[str, Any]) -> str:
     bias = str(row.get("direction_bias") or precheck.get("direction_bias") or "").lower()
     if bias in {"long", "short", "neutral"}:
@@ -229,16 +260,7 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     signal_freshness = _to_int(row.get("signal_freshness_score"), 65)
     historical_tradability = _to_int(row.get("historical_tradability_score"), 60)
     portfolio_fit = _to_int(row.get("portfolio_fit_score"), 75)
-    if (
-        not symbol
-        or price <= 0
-        or score < MIN_AUTO_SIM_SAMPLING_SCORE
-        or simulation_score < MIN_AUTO_SIM_SAMPLING_SCORE
-        or base_quality < 50
-        or liquidity_quality < 40
-        or portfolio_fit < 25
-        or risk >= MAX_AUTO_SIM_SAMPLING_RISK
-    ):
+    if _sampling_reject_reasons(symbol, price, score, simulation_score, base_quality, liquidity_quality, portfolio_fit, risk):
         return None
     direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
     if direction not in {"long", "short"}:
@@ -323,8 +345,48 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
             signal = _signal_from_precheck(precheck)
             if signal:
                 signals.append(signal)
+            else:
+                row = precheck.get("opportunity") or {}
+                symbol = str(precheck.get("symbol") or row.get("symbol") or "").upper()
+                score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
+                risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
+                simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SAMPLING_SCORE))
+                base_quality = _to_int(row.get("base_quality_score"), max(65, min(80, simulation_score)))
+                liquidity_quality = _to_int(row.get("liquidity_quality_score"), 70)
+                portfolio_fit = _to_int(row.get("portfolio_fit_score"), 75)
+                price = _price(row)
+                direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
+                reasons = _sampling_reject_reasons(symbol, price, score, simulation_score, base_quality, liquidity_quality, portfolio_fit, risk)
+                if direction not in {"long", "short"}:
+                    reasons.append("方向不是 long/short。")
+                append_sim_diagnostic(
+                    "自动模拟候选拒绝",
+                    symbol,
+                    "rejected",
+                    "；".join(reasons or ["未通过自动模拟采样。"]),
+                    {
+                        "rank": precheck.get("rank"),
+                        "price": price,
+                        "direction": direction,
+                        "professional_trade_score": score,
+                        "simulation_score": simulation_score,
+                        "base_quality_score": base_quality,
+                        "liquidity_quality_score": liquidity_quality,
+                        "portfolio_fit_score": portfolio_fit,
+                        "risk_score": risk,
+                        "entry_state": row.get("entry_state"),
+                        "action_gate": row.get("action_gate"),
+                    },
+                )
     summary = update_simulation(price_map, signals, _LAST_PRICE_STATUS)
     _debug_log(f"update_simulation signals={len(signals)} prices={len(price_map)}")
     if signals:
         log_sim_event("后台自动模拟扫描", content=f"本轮候选 {len(signals)} 个，已交给模拟风控执行。")
+    elif account.get("status") == "running" and settings.get("mode") == "auto":
+        append_sim_diagnostic(
+            "后台自动模拟扫描",
+            status="no_signal",
+            reason="本轮无可执行模拟信号。",
+            details={"opportunities": len(opportunities), "prices": len(price_map)},
+        )
     return {"ok": True, "signals": len(signals), "prices": len(price_map), "summary": summary}

@@ -19,6 +19,7 @@ def use_temp_store(tmp_path):
     sim.HISTORY_JSON_PATH = tmp_path / "sim_trade_history.json"
     sim.HISTORY_CSV_PATH = tmp_path / "sim_trade_history.csv"
     sim.LOG_PATH = tmp_path / "sim_trade_log.json"
+    sim.DIAGNOSTICS_PATH = tmp_path / "sim_diagnostics.json"
     sim.EQUITY_JSON_PATH = tmp_path / "sim_equity_curve.json"
     sim.EQUITY_CSV_PATH = tmp_path / "sim_equity_curve.csv"
     tmp_path.mkdir(parents=True, exist_ok=True)
