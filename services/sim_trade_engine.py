@@ -37,9 +37,9 @@ DEFAULT_SETTINGS = {
     "initial_balance": 1000.0,
     "max_position_pct": 10.0,
     "max_risk_pct": 1.0,
-    "max_positions": 10,
-    "max_same_symbol_positions": 1,
-    "max_same_direction_positions": 5,
+    "max_positions": 0,
+    "max_same_symbol_positions": 0,
+    "max_same_direction_positions": 0,
     "allow_long": True,
     "allow_short": True,
     "leverage": 5,
@@ -185,9 +185,9 @@ def load_settings() -> dict[str, Any]:
         merged["market_type"] = "futures"
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
-        merged["max_positions"] = max(1, int(_to_float(merged.get("max_positions"), 10) or 10))
-        merged["max_same_symbol_positions"] = max(1, int(_to_float(merged.get("max_same_symbol_positions"), 1) or 1))
-        merged["max_same_direction_positions"] = max(1, int(_to_float(merged.get("max_same_direction_positions"), 5) or 5))
+        merged["max_positions"] = max(0, int(_to_float(merged.get("max_positions"), 0)))
+        merged["max_same_symbol_positions"] = max(0, int(_to_float(merged.get("max_same_symbol_positions"), 0)))
+        merged["max_same_direction_positions"] = max(0, int(_to_float(merged.get("max_same_direction_positions"), 0)))
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     return merged
@@ -200,9 +200,9 @@ def save_settings(settings: dict[str, Any]) -> None:
         merged["market_type"] = "futures"
         merged["leverage"] = 5
     if merged.get("continuous_run", True):
-        merged["max_positions"] = max(1, int(_to_float(merged.get("max_positions"), 10) or 10))
-        merged["max_same_symbol_positions"] = max(1, int(_to_float(merged.get("max_same_symbol_positions"), 1) or 1))
-        merged["max_same_direction_positions"] = max(1, int(_to_float(merged.get("max_same_direction_positions"), 5) or 5))
+        merged["max_positions"] = max(0, int(_to_float(merged.get("max_positions"), 0)))
+        merged["max_same_symbol_positions"] = max(0, int(_to_float(merged.get("max_same_symbol_positions"), 0)))
+        merged["max_same_direction_positions"] = max(0, int(_to_float(merged.get("max_same_direction_positions"), 0)))
         if merged.get("mode") == "observe":
             merged["mode"] = "auto"
     _write_json(SETTINGS_PATH, merged)
@@ -958,11 +958,18 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
         take_profit_hit = check_take_profit(position, price)
         if can_auto_exit and take_profit_hit == "tp1":
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=take_profit_1 price={price} status={status}")
-            partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
-            position["tp1_hit"] = True
-            if settings.get("move_sl_to_breakeven", True):
-                position["stop_loss"] = _to_float(position.get("entry_price"), position.get("stop_loss"))
-                position["moved_stop_to_breakeven"] = True
+            updated_position = partial_close_sim_position(position["position_id"], 0.5, "触发止盈1", price)
+            if updated_position:
+                saved_positions = load_positions()
+                for saved_position in saved_positions:
+                    if saved_position.get("position_id") != position.get("position_id"):
+                        continue
+                    saved_position["tp1_hit"] = True
+                    if settings.get("move_sl_to_breakeven", True):
+                        saved_position["stop_loss"] = _to_float(saved_position.get("entry_price"), saved_position.get("stop_loss"))
+                        saved_position["moved_stop_to_breakeven"] = True
+                    break
+                save_positions(saved_positions)
                 log_sim_event("移动止损到保本", symbol, direction, price, reason="止盈1已触发。")
             external_position_change = True
         if can_auto_exit and take_profit_hit == "tp2":

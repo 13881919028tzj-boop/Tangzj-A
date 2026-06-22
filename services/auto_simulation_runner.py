@@ -32,6 +32,8 @@ _LAST_PRICE_STATUS: dict[str, str] = {}
 MIN_AUTO_SIM_DIRECTION_GAP = 20
 MIN_AUTO_SIM_CONSENSUS_SUPPORT = 3
 MIN_AUTO_SIM_MARKET_ALIGNMENT = 80
+MIN_AUTO_SIM_SAMPLING_SCORE = 60
+MAX_AUTO_SIM_SAMPLING_RISK = 75
 SHORT_NO_CHASE_CHANGE_PCT = -8.0
 LONG_NO_CHASE_CHANGE_PCT = 8.0
 LONG_CONFIRMED_ENTRY_STATES = {"pullback_confirmed", "breakout_confirmed"}
@@ -220,14 +222,10 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     price = _price(row)
     score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
     risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-    if not symbol or price <= 0 or score < 75 or risk >= 65 or not precheck.get("allowed_candidate") or not row.get("tradable_now"):
+    if not symbol or price <= 0 or score < MIN_AUTO_SIM_SAMPLING_SCORE or risk >= MAX_AUTO_SIM_SAMPLING_RISK:
         return None
     direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
     if direction not in {"long", "short"}:
-        return None
-    reject_reasons = _strict_auto_sim_reject_reasons(row, precheck, direction)
-    if reject_reasons:
-        log_sim_event("拒绝自动模拟候选", symbol, direction, price, reason="；".join(reject_reasons))
         return None
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
     action = "顺势做多" if direction == "long" and score >= 88 else "轻仓试多" if direction == "long" else "顺势做空" if score >= 88 else "轻仓试空"
@@ -252,8 +250,12 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         "chairman_summary": f"后台自动模拟：机会榜TOP{rank or '-'}候选，评分{score}，风险{risk}。仅执行本地模拟订单。",
         "professional_trade_score": score,
         "entry_state": row.get("entry_state"),
-        "action_gate": row.get("action_gate"),
-        "tradable_now": bool(row.get("tradable_now")),
+        "action_gate": "open_now",
+        "tradable_now": True,
+        "sampling_override": not bool(precheck.get("allowed_candidate")) or not bool(row.get("tradable_now")) or row.get("action_gate") != "open_now",
+        "original_allowed_candidate": bool(precheck.get("allowed_candidate")),
+        "original_action_gate": row.get("action_gate"),
+        "original_tradable_now": bool(row.get("tradable_now")),
         "market_regime": row.get("market_regime"),
         "market_alignment_score": row.get("market_alignment_score"),
         "direction_gap": row.get("direction_gap"),

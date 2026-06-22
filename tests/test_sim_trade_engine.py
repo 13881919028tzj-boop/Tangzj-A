@@ -86,6 +86,39 @@ def test_pending_order_fills_and_stop_loss_closes(tmp_path):
     assert summary["history"][0]["close_reason"] == "触发止损"
 
 
+def test_take_profit_1_is_persisted_after_partial_close(tmp_path):
+    prepare_running_account(tmp_path)
+    order = sim.create_pending_sim_order(approved_signal(), 100)
+    assert order and order["status"] == "filled"
+
+    sim.update_simulation({"BTCUSDT": 104}, [])
+    summary = sim.get_sim_account_summary()
+    position = next(p for p in summary["positions"] if p["status"] == "partially_closed")
+    quantity_after_tp1 = position["quantity"]
+    assert position["tp1_hit"] is True
+    assert position["stop_loss"] == position["entry_price"]
+
+    sim.update_simulation({"BTCUSDT": 104}, [])
+    summary = sim.get_sim_account_summary()
+    position = next(p for p in summary["positions"] if p["status"] == "partially_closed")
+    assert position["quantity"] == quantity_after_tp1
+
+
+def test_zero_position_limits_mean_unlimited(tmp_path):
+    prepare_running_account(tmp_path)
+    settings = sim.load_settings()
+    settings["max_positions"] = 0
+    settings["max_same_symbol_positions"] = 0
+    settings["max_same_direction_positions"] = 0
+    sim.save_settings(settings)
+    assert sim.create_pending_sim_order(approved_signal(), 100)
+
+    ok, reasons = sim.validate_signal_for_simulation(approved_signal(), {"BTCUSDT": 100})
+
+    assert ok is True
+    assert not any("持仓数量已达到上限" in reason or "当前已持有" in reason for reason in reasons)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -93,4 +126,8 @@ if __name__ == "__main__":
         test_blocked_signal_is_rejected(Path(raw) / "case2")
     with tempfile.TemporaryDirectory() as raw:
         test_pending_order_fills_and_stop_loss_closes(Path(raw) / "case3")
+    with tempfile.TemporaryDirectory() as raw:
+        test_take_profit_1_is_persisted_after_partial_close(Path(raw) / "case4")
+    with tempfile.TemporaryDirectory() as raw:
+        test_zero_position_limits_mean_unlimited(Path(raw) / "case5")
     print("sim_trade_engine tests passed")

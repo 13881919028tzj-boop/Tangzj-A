@@ -48,7 +48,7 @@ def precheck(**row_overrides):
     row.update(row_overrides)
     return {
         "symbol": row["symbol"],
-        "allowed_candidate": True,
+        "allowed_candidate": row.pop("allowed_candidate", True),
         "direction": row.get("trade_direction"),
         "score": row["professional_trade_score"],
         "risk_score": row["risk_score"],
@@ -68,7 +68,7 @@ def test_confirmed_short_precheck_becomes_sim_signal(tmp_path):
     assert signal["action"] == "轻仓试空"
 
 
-def test_auto_sim_rejects_short_chasing_after_large_drop(tmp_path):
+def test_auto_sim_allows_short_chasing_after_large_drop_for_sampling(tmp_path):
     use_temp_store(tmp_path)
 
     signal = runner._signal_from_precheck(
@@ -79,14 +79,12 @@ def test_auto_sim_rejects_short_chasing_after_large_drop(tmp_path):
         )
     )
 
-    assert signal is None
-    logs = sim.load_sim_events()
-    assert logs
-    assert "禁止直接追空" in logs[0]["reason"]
-    assert "反抽失败" in logs[0]["reason"]
+    assert signal is not None
+    assert signal["direction"] == "short"
+    assert signal["action"] == "轻仓试空"
 
 
-def test_auto_sim_rejects_market_misalignment(tmp_path):
+def test_auto_sim_allows_market_misalignment_for_sampling(tmp_path):
     use_temp_store(tmp_path)
 
     signal = runner._signal_from_precheck(
@@ -97,16 +95,38 @@ def test_auto_sim_rejects_market_misalignment(tmp_path):
         )
     )
 
-    assert signal is None
-    logs = sim.load_sim_events()
-    assert "大盘未与开仓方向同向" in logs[0]["reason"]
+    assert signal is not None
+    assert signal["direction"] == "short"
+
+
+def test_auto_sim_allows_blocked_precheck_for_sampling(tmp_path):
+    use_temp_store(tmp_path)
+
+    signal = runner._signal_from_precheck(
+        precheck(
+            allowed_candidate=False,
+            professional_trade_score=66,
+            risk_score=62,
+            tradable_now=False,
+            action_gate="wait_confirm",
+            entry_state="waiting_retest",
+        )
+    )
+
+    assert signal is not None
+    assert signal["direction"] == "short"
+    assert signal["tradable_now"] is True
+    assert signal["action_gate"] == "open_now"
+    assert signal["sampling_override"] is True
 
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_confirmed_short_precheck_becomes_sim_signal(Path(raw) / "case1")
     with tempfile.TemporaryDirectory() as raw:
-        test_auto_sim_rejects_short_chasing_after_large_drop(Path(raw) / "case2")
+        test_auto_sim_allows_short_chasing_after_large_drop_for_sampling(Path(raw) / "case2")
     with tempfile.TemporaryDirectory() as raw:
-        test_auto_sim_rejects_market_misalignment(Path(raw) / "case3")
+        test_auto_sim_allows_market_misalignment_for_sampling(Path(raw) / "case3")
+    with tempfile.TemporaryDirectory() as raw:
+        test_auto_sim_allows_blocked_precheck_for_sampling(Path(raw) / "case4")
     print("auto_simulation_runner tests passed")
