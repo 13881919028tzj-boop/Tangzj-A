@@ -112,7 +112,7 @@ def account_initial_balance(account: dict[str, Any] | None = None, settings: dic
     return 1000.0
 
 
-def _read_json(path: Path, default: Any) -> Any:
+def _read_json(path: Path, default: Any, *, rewrite_on_error: bool = True) -> Any:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if not path.exists():
@@ -128,7 +128,8 @@ def _read_json(path: Path, default: Any) -> Any:
                 path.rename(backup)
         except Exception:
             pass
-        _write_json(path, default)
+        if rewrite_on_error:
+            _write_json(path, default)
         return default
 
 
@@ -321,13 +322,50 @@ def clear_sim_history() -> None:
     log_sim_event("清空模拟历史", content="用户清空模拟交易历史。")
 
 
+def _positions_last_good_path() -> Path:
+    return POSITIONS_PATH.with_suffix(POSITIONS_PATH.suffix + ".last_good")
+
+
 def load_positions() -> list[dict[str, Any]]:
-    data = _read_json(POSITIONS_PATH, [])
-    return data if isinstance(data, list) else []
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not POSITIONS_PATH.exists():
+            _write_json(POSITIONS_PATH, [])
+            return []
+        data = json.loads(POSITIONS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        print(f"[模拟交易] 读取文件失败 {POSITIONS_PATH.name} error={exc!r}")
+        broken = POSITIONS_PATH.with_suffix(POSITIONS_PATH.suffix + f".broken_{int(time.time())}")
+        try:
+            if POSITIONS_PATH.exists():
+                POSITIONS_PATH.rename(broken)
+        except Exception:
+            pass
+        try:
+            backup = json.loads(_positions_last_good_path().read_text(encoding="utf-8"))
+            if isinstance(backup, list):
+                _write_json(POSITIONS_PATH, backup)
+                append_sim_diagnostic(
+                    "模拟持仓文件自动恢复",
+                    status="recovered",
+                    reason="sim_positions.json 损坏，已从 last_good 备份恢复，避免账户保证金被错误清零。",
+                    details={"broken_file": str(broken), "restored_positions": len(backup)},
+                )
+                return backup
+        except Exception as backup_exc:
+            append_sim_diagnostic(
+                "模拟持仓文件恢复失败",
+                status="failed",
+                reason="sim_positions.json 损坏且 last_good 备份不可用，已返回空持仓但不覆盖账户。",
+                details={"error": repr(exc), "backup_error": repr(backup_exc), "broken_file": str(broken)},
+            )
+        return []
 
 
 def save_positions(positions: list[dict[str, Any]]) -> None:
     _write_json(POSITIONS_PATH, positions)
+    _write_json(_positions_last_good_path(), positions)
 
 
 def load_orders() -> list[dict[str, Any]]:

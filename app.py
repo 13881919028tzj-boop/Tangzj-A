@@ -477,8 +477,9 @@ def _multi_review_map() -> dict[str, dict[str, Any]]:
 
 
 def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]] | None = None) -> None:
-    """默认锚定机会榜TOP1；TOP1不满足时切换到已进入候选的币。"""
-    if is_user_selected_symbol_source():
+    """Keep the global current symbol, topbar and committee target anchored to opportunity TOP1."""
+    current_source = str(st.session_state.get("current_symbol_source", ""))
+    if current_source == "manual_select" or current_source.endswith("_search") or current_source.startswith("watch_"):
         current = str(st.session_state.get("current_symbol", "")).upper().strip()
         st.session_state["committee_active_symbol"] = current
         st.session_state["committee_target_symbol"] = current
@@ -488,34 +489,19 @@ def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]]
     settings = status.get("settings") or {}
     if not bool(settings.get("ENABLE_COMMITTEE_ANCHOR_TOP1", True)):
         return
-    trigger_score = int(settings.get("OPPORTUNITY_TRIGGER_SCORE", 80) or 80)
     top_rows = _combined_trade_opportunities(rankings, 10) if rankings else []
     top1 = top_rows[0] if top_rows else {}
     target = str(top1.get("symbol") or status.get("current_target") or "").upper().strip()
-    score = safe_score(top1.get("final_opportunity_score", top1.get("opportunity_score")), safe_score(status.get("target_score"), 0)) or 0
     if not target:
         return
-    precheck = _top10_precheck_map(rankings).get(target, {}) if rankings else {}
-    multi = _multi_review_map()
-    top1_multi = multi.get(target, {})
-    risk = safe_score(top1.get("risk_score"), 100)
-    top1_satisfies = bool(top1_multi.get("candidate_created")) or (bool(precheck.get("allowed_candidate")) and score >= trigger_score and risk is not None and risk < 70)
-    candidate = next(
-        (item for item in sorted(multi.values(), key=lambda row: int(row.get("rank", 999) or 999)) if item.get("candidate_created") and str(item.get("symbol", "")).upper()),
-        None,
-    )
     selected_target = target
     selected_source = "opportunity_top1_default"
-    if not top1_satisfies and candidate:
-        selected_target = str(candidate.get("symbol", target)).upper().strip()
-        selected_source = "candidate_auto_switch"
-    current_source = str(st.session_state.get("current_symbol_source", ""))
-    if selected_target != str(st.session_state.get("current_symbol", "")).upper() and current_source in {"", "default_bootstrap", "opportunity_top1_default", "candidate_auto_switch"}:
+    if selected_target != str(st.session_state.get("current_symbol", "")).upper() and current_source in {"", "default_bootstrap", "url_param", "opportunity_top1_default", "candidate_auto_switch", "opportunity_board_click"}:
         set_current_symbol(selected_target, source=selected_source)
     st.session_state["committee_active_symbol"] = selected_target
     st.session_state["committee_target_symbol"] = selected_target
     st.session_state["committee_review_queue_symbol"] = target
-    st.session_state["committee_anchor_source"] = "候选币自动切换" if selected_source == "candidate_auto_switch" else "机会榜TOP1默认对象"
+    st.session_state["committee_anchor_source"] = "机会榜TOP1默认对象"
     try:
         if not market_cache.get_ticker(selected_target):
             refresh_symbol_now(selected_target)

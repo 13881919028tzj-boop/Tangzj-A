@@ -315,6 +315,19 @@ def test_sim_fee_and_slippage_are_applied_to_entry_and_exit(tmp_path):
     assert trade["fee_usdt"] > expected_exit_fee
 
 
+def test_corrupted_positions_restore_from_last_good_backup(tmp_path):
+    use_temp_store(tmp_path)
+    rows = [{"position_id": "safe_pos_1", "symbol": "BTCUSDT", "status": "open", "margin_usdt": 10}]
+    sim.save_positions(rows)
+    sim.POSITIONS_PATH.write_text("", encoding="utf-8")
+
+    restored = sim.load_positions()
+
+    assert restored == rows
+    assert sim.POSITIONS_PATH.exists()
+    assert sim._positions_last_good_path().exists()
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -342,4 +355,6 @@ if __name__ == "__main__":
         test_structure_levels_override_signal_exit_plan_when_valid(Path(raw) / "case11")
     with tempfile.TemporaryDirectory() as raw:
         test_sim_fee_and_slippage_are_applied_to_entry_and_exit(Path(raw) / "case12")
+    with tempfile.TemporaryDirectory() as raw:
+        test_corrupted_positions_restore_from_last_good_backup(Path(raw) / "case13")
     print("sim_trade_engine tests passed")
