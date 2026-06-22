@@ -15,7 +15,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from services import market_cache
 from services.ai_committee_engine import get_committee_approved_signals
+from services.structure_level_engine import build_structure_exit_plan
 from services.trading_database import record_sim_close, record_sim_open
 
 
@@ -30,6 +32,7 @@ LOG_PATH = DATA_DIR / "sim_trade_log.json"
 DIAGNOSTICS_PATH = DATA_DIR / "sim_diagnostics.json"
 EQUITY_JSON_PATH = DATA_DIR / "sim_equity_curve.json"
 EQUITY_CSV_PATH = DATA_DIR / "sim_equity_curve.csv"
+EARLY_EXIT_SHADOW_PATH = DATA_DIR / "sim_early_exit_shadow.json"
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 POSITION_PRICE_LOG = LOG_DIR / "position_price_debug.log"
 
@@ -65,6 +68,8 @@ DEFAULT_SETTINGS = {
     "dynamic_take_profit_2_r": 2.4,
     "early_exit_min_seconds": 600,
     "early_exit_adverse_r": 0.5,
+    "sim_fee_rate": 0.0004,
+    "sim_slippage_pct": 0.0003,
 }
 
 
@@ -181,6 +186,31 @@ def load_sim_diagnostics(limit: int = 80) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+def load_early_exit_shadow_rows(limit: int | None = None) -> list[dict[str, Any]]:
+    rows = _read_json(EARLY_EXIT_SHADOW_PATH, [])
+    if not isinstance(rows, list):
+        return []
+    return rows[:limit] if limit else rows
+
+
+def save_early_exit_shadow_rows(rows: list[dict[str, Any]]) -> None:
+    _write_json(EARLY_EXIT_SHADOW_PATH, rows[:1000])
+
+
+def get_pending_early_exit_shadow_symbols() -> list[str]:
+    symbols: list[str] = []
+    now_ts = _ts()
+    for row in load_early_exit_shadow_rows():
+        if row.get("status") == "completed":
+            continue
+        if row.get("deadline_ts") and now_ts > int(row.get("deadline_ts", 0)) + 300:
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
+
+
 def default_account(initial_balance: float = 1000.0) -> dict[str, Any]:
     return {
         "initial_balance": initial_balance,
@@ -189,6 +219,8 @@ def default_account(initial_balance: float = 1000.0) -> dict[str, Any]:
         "equity": initial_balance,
         "unrealized_pnl": 0.0,
         "realized_pnl": 0.0,
+        "total_fee_usdt": 0.0,
+        "total_slippage_cost_usdt": 0.0,
         "total_pnl": 0.0,
         "return_pct": 0.0,
         "max_equity": initial_balance,
@@ -461,9 +493,6 @@ def _position_pct(signal: dict[str, Any], settings: dict[str, Any]) -> float:
         pct = 10.0
     else:
         pct = 0.0
-    action = str(signal.get("action", ""))
-    if "轻仓" in action:
-        pct = min(pct, 3.0 if pct <= 4 else pct * 0.7)
     risk_score = _to_float(signal.get("risk_score"), 50)
     if risk_score >= 70:
         pct = min(pct, 3.0)
@@ -482,7 +511,7 @@ def _position_pct(signal: dict[str, Any], settings: dict[str, Any]) -> float:
         pct = min(pct, 2.0)
     if signal_freshness < 45:
         pct = min(pct, 2.0)
-    return min(pct, float(settings.get("max_position_pct", 10)))
+    return min(pct * 4, 100.0)
 
 
 def _entry_zone(signal: dict[str, Any], current_price: float) -> tuple[float, float]:
@@ -516,21 +545,82 @@ def _dynamic_exit_prices(price: float, direction: str, risk_score: float, settin
     return price * (1 - stop_pct), price * (1 + stop_pct * tp1_r), price * (1 + stop_pct * tp2_r), stop_pct
 
 
-def _normalize_signal_exit_plan(signal: dict[str, Any], current_price: float, settings: dict[str, Any]) -> tuple[float, float, float, float]:
+def _fee_rate(settings: dict[str, Any] | None = None) -> float:
+    settings = settings or load_settings()
+    return max(0.0, min(0.01, _to_float(settings.get("sim_fee_rate"), DEFAULT_SETTINGS["sim_fee_rate"])))
+
+
+def _slippage_pct(settings: dict[str, Any] | None = None) -> float:
+    settings = settings or load_settings()
+    return max(0.0, min(0.02, _to_float(settings.get("sim_slippage_pct"), DEFAULT_SETTINGS["sim_slippage_pct"])))
+
+
+def apply_sim_slippage(price: float, direction: str, side: str, settings: dict[str, Any] | None = None) -> float:
+    """Return the worse executable price after simulated market-order slippage."""
+    price = _to_float(price, 0)
+    if price <= 0:
+        return 0.0
+    slip = _slippage_pct(settings)
+    direction = str(direction or "long")
+    side = str(side or "entry")
+    if side == "entry":
+        return price * (1 + slip) if direction != "short" else price * (1 - slip)
+    return price * (1 - slip) if direction != "short" else price * (1 + slip)
+
+
+def calculate_sim_fee(notional: float, settings: dict[str, Any] | None = None) -> float:
+    return abs(_to_float(notional, 0)) * _fee_rate(settings)
+
+
+def _slippage_cost(reference_price: float, execution_price: float, quantity: float) -> float:
+    return abs(_to_float(execution_price, 0) - _to_float(reference_price, 0)) * abs(_to_float(quantity, 0))
+
+
+def _valid_exit_plan(direction: str, current_price: float, stop: float, tp1: float, tp2: float) -> bool:
+    if current_price <= 0 or stop <= 0 or tp1 <= 0 or tp2 <= 0:
+        return False
+    if direction == "short":
+        return stop > current_price and tp1 < current_price and tp2 < current_price and tp2 < tp1
+    return stop < current_price and tp1 > current_price and tp2 > current_price and tp2 > tp1
+
+
+def _normalize_signal_exit_plan(signal: dict[str, Any], current_price: float, settings: dict[str, Any]) -> tuple[float, float, float, float, str, dict[str, Any]]:
     direction = str(signal.get("direction", "long"))
     risk_score = _to_float(signal.get("risk_score"), _to_float(signal.get("committee_risk_score"), 50))
     dynamic_stop, dynamic_tp1, dynamic_tp2, stop_pct = _dynamic_exit_prices(current_price, direction, risk_score, settings)
+    symbol = str(signal.get("symbol") or "").upper().strip()
+    interval = market_cache.get_kline_interval()
+    rows = market_cache.get_klines(symbol, interval) if symbol else []
+    structure_plan = build_structure_exit_plan(symbol, direction, current_price, rows, risk_score)
+    if structure_plan.get("valid"):
+        stop = _to_float(structure_plan.get("stop_loss"))
+        tp1 = _to_float(structure_plan.get("take_profit_1"))
+        tp2 = _to_float(structure_plan.get("take_profit_2"))
+        if _valid_exit_plan(direction, current_price, stop, tp1, tp2):
+            return stop, tp1, tp2, _to_float(structure_plan.get("stop_pct"), stop_pct), "structure_levels", structure_plan
+
     stop = _price_field(signal.get("stop_loss")) or dynamic_stop
     tp1 = _price_field(signal.get("take_profit_1")) or dynamic_tp1
     tp2 = _price_field(signal.get("take_profit_2")) or dynamic_tp2
-    invalid = False
-    if direction == "short":
-        invalid = stop <= current_price or tp1 >= current_price or tp2 >= current_price or tp2 >= tp1
-    else:
-        invalid = stop >= current_price or tp1 <= current_price or tp2 <= current_price or tp2 <= tp1
-    if invalid:
-        stop, tp1, tp2 = dynamic_stop, dynamic_tp1, dynamic_tp2
-    return stop, tp1, tp2, stop_pct
+    if _valid_exit_plan(direction, current_price, stop, tp1, tp2):
+        signal_plan = {
+            "valid": True,
+            "source": "signal_exit_plan",
+            "structure_fallback_reason": structure_plan.get("reason"),
+            "stop_loss": stop,
+            "take_profit_1": tp1,
+            "take_profit_2": tp2,
+        }
+        return stop, tp1, tp2, abs(current_price - stop) / current_price if current_price else stop_pct, "signal_exit_plan", signal_plan
+    dynamic_plan = {
+        "valid": True,
+        "source": "dynamic_r_fallback",
+        "structure_fallback_reason": structure_plan.get("reason"),
+        "stop_loss": dynamic_stop,
+        "take_profit_1": dynamic_tp1,
+        "take_profit_2": dynamic_tp2,
+    }
+    return dynamic_stop, dynamic_tp1, dynamic_tp2, stop_pct, "dynamic_r_fallback", dynamic_plan
 
 
 def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[str, float] | None = None) -> tuple[bool, list[str]]:
@@ -621,10 +711,14 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
     if available < min_margin:
         log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason=f"可用余额低于最小模拟保证金 {min_margin:.2f} USDT。")
         return None
-    margin = min(available, max(min_margin, _to_float(account.get("equity"), 0) * pct / 100))
     leverage = 5 if settings.get("futures_leverage_locked", True) else max(1, min(20, int(settings.get("leverage", 5))))
+    max_affordable_margin = available / (1 + leverage * _fee_rate(settings))
+    if max_affordable_margin < min_margin:
+        log_sim_event("拒绝创建模拟订单", symbol, direction, current_price, reason="可用余额不足以覆盖最小保证金和开仓手续费。")
+        return None
+    margin = min(max_affordable_margin, max(min_margin, _to_float(account.get("equity"), 0) * pct / 100))
     notional = margin * leverage
-    stop, tp1, tp2, dynamic_stop_pct = _normalize_signal_exit_plan(signal, current_price, settings)
+    stop, tp1, tp2, dynamic_stop_pct, exit_plan_source, exit_plan_detail = _normalize_signal_exit_plan(signal, current_price, settings)
     order = {
         "order_id": f"sim_order_{int(time.time() * 1000)}",
         "symbol": symbol,
@@ -640,10 +734,16 @@ def create_pending_sim_order(signal: dict[str, Any], current_price: float) -> di
         "dynamic_stop_loss_pct": round(dynamic_stop_pct * 100, 4),
         "dynamic_take_profit_1_r": settings.get("dynamic_take_profit_1_r", 1.0),
         "dynamic_take_profit_2_r": settings.get("dynamic_take_profit_2_r", 2.4),
+        "exit_plan_source": exit_plan_source,
+        "structure_exit_plan": exit_plan_detail,
         "position_pct": signal.get("position_suggestion", "0%"),
         "notional_usdt": notional,
         "margin_usdt": margin,
         "quantity": notional / current_price if current_price > 0 else 0,
+        "sim_fee_rate": _fee_rate(settings),
+        "sim_slippage_pct": _slippage_pct(settings),
+        "estimated_entry_fee": calculate_sim_fee(notional, settings),
+        "estimated_entry_slippage_cost": _slippage_cost(current_price, apply_sim_slippage(current_price, direction, "entry", settings), notional / current_price if current_price > 0 else 0),
         "leverage": leverage,
         "market_type": settings.get("market_type", "futures"),
         "contract_type": "USDT_PERPETUAL" if settings.get("market_type") == "futures" else "SPOT_SIM",
@@ -674,22 +774,29 @@ def get_current_price(symbol: str, current_prices: dict[str, float] | None = Non
 
 
 def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
+    settings = load_settings()
     account = load_sim_account()
     margin = _to_float(order.get("margin_usdt"), 0)
-    if margin > _to_float(account.get("available_balance"), 0):
-        log_sim_event("拒绝模拟开仓", order.get("symbol", ""), order.get("direction", ""), price, reason="可用余额不足。")
+    direction = str(order.get("direction", "long"))
+    execution_price = apply_sim_slippage(price, direction, "entry", settings)
+    notional = _to_float(order.get("notional_usdt"), 0)
+    entry_fee = calculate_sim_fee(notional, settings)
+    if margin + entry_fee > _to_float(account.get("available_balance"), 0):
+        log_sim_event("拒绝模拟开仓", order.get("symbol", ""), order.get("direction", ""), price, reason="可用余额不足以覆盖保证金和开仓手续费。")
         return {}
-    quantity = _to_float(order.get("notional_usdt"), 0) / price if price > 0 else 0
+    quantity = notional / execution_price if execution_price > 0 else 0
+    entry_slippage_cost = _slippage_cost(price, execution_price, quantity)
     position = {
         "position_id": f"sim_pos_{int(time.time() * 1000)}",
         "symbol": order.get("symbol"),
-        "direction": order.get("direction"),
+        "direction": direction,
         "status": "open",
-        "entry_price": price,
+        "entry_price": execution_price,
+        "entry_reference_price": price,
         "current_price": price,
         "quantity": quantity,
         "margin_usdt": margin,
-        "notional_usdt": _to_float(order.get("notional_usdt"), 0),
+        "notional_usdt": notional,
         "leverage": int(order.get("leverage", 1)),
         "market_type": order.get("market_type", "futures"),
         "contract_type": order.get("contract_type", "USDT_PERPETUAL"),
@@ -701,12 +808,22 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "stop_loss": _to_float(order.get("stop_loss"), 0),
         "take_profit_1": _to_float(order.get("take_profit_1"), 0),
         "take_profit_2": _to_float(order.get("take_profit_2"), 0),
+        "exit_plan_source": order.get("exit_plan_source", "dynamic_r_fallback"),
+        "structure_exit_plan": order.get("structure_exit_plan") or {},
         "tp1_hit": False,
         "tp2_hit": False,
         "moved_stop_to_breakeven": False,
         "unrealized_pnl": 0.0,
         "unrealized_pnl_pct": 0.0,
         "realized_pnl": 0.0,
+        "entry_fee": entry_fee,
+        "exit_fee": 0.0,
+        "total_fee": entry_fee,
+        "entry_slippage_cost": entry_slippage_cost,
+        "exit_slippage_cost": 0.0,
+        "total_slippage_cost": entry_slippage_cost,
+        "sim_fee_rate": _fee_rate(settings),
+        "sim_slippage_pct": _slippage_pct(settings),
         "risk_reward_ratio": order.get("committee_snapshot", {}).get("risk_reward_ratio"),
         "committee_confidence": order.get("committee_snapshot", {}).get("committee_confidence"),
         "committee_risk_score": order.get("committee_snapshot", {}).get("risk_score"),
@@ -721,8 +838,14 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
     positions = load_positions()
     positions.insert(0, position)
     save_positions(positions)
-    account["available_balance"] = _to_float(account.get("available_balance"), 0) - margin
+    account["available_balance"] = _to_float(account.get("available_balance"), 0) - margin - entry_fee
     account["used_margin"] = _to_float(account.get("used_margin"), 0) + margin
+    account["realized_pnl"] = _to_float(account.get("realized_pnl"), 0) - entry_fee
+    account["daily_pnl"] = _to_float(account.get("daily_pnl"), 0) - entry_fee
+    account["total_fee_usdt"] = _to_float(account.get("total_fee_usdt"), 0) + entry_fee
+    account["total_slippage_cost_usdt"] = _to_float(account.get("total_slippage_cost_usdt"), 0) + entry_slippage_cost
+    account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + _to_float(account.get("unrealized_pnl"), 0)
+    account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + _to_float(account.get("unrealized_pnl"), 0)
     save_sim_account(account)
     try:
         record_sim_open(position)
@@ -758,6 +881,144 @@ def calculate_position_r_multiple(position: dict[str, Any], current_price: float
     return reward_per_unit / risk_per_unit
 
 
+def _shadow_pnl(entry_price: float, price: float, quantity: float, direction: str) -> float:
+    if entry_price <= 0 or price <= 0 or quantity <= 0:
+        return 0.0
+    if direction == "short":
+        return (entry_price - price) * quantity
+    return (price - entry_price) * quantity
+
+
+def _shadow_result(entry_price: float, price: float, direction: str) -> str:
+    if price <= 0 or entry_price <= 0:
+        return "unknown"
+    if direction == "short":
+        if price < entry_price:
+            return "win"
+        if price > entry_price:
+            return "loss"
+        return "flat"
+    if price > entry_price:
+        return "win"
+    if price < entry_price:
+        return "loss"
+    return "flat"
+
+
+def create_early_exit_shadow(position: dict[str, Any], exit_price: float, r_multiple: float | None = None) -> None:
+    """Track what would have happened 30/60 minutes after early adverse exits."""
+    symbol = str(position.get("symbol") or "").upper().strip()
+    position_id = str(position.get("position_id") or "")
+    if not symbol or not position_id:
+        return
+    rows = load_early_exit_shadow_rows()
+    if any(row.get("position_id") == position_id for row in rows):
+        return
+    close_ts = _ts()
+    entry_price = _to_float(position.get("entry_price"), 0)
+    quantity = _to_float(position.get("quantity"), 0)
+    close_pnl = _shadow_pnl(entry_price, exit_price, quantity, str(position.get("direction")))
+    rows.insert(
+        0,
+        {
+            "position_id": position_id,
+            "symbol": symbol,
+            "direction": position.get("direction"),
+            "status": "tracking",
+            "open_time": position.get("open_time"),
+            "open_ts": position.get("open_ts"),
+            "close_time": _now(),
+            "close_ts": close_ts,
+            "deadline_ts": close_ts + 3900,
+            "entry_price": entry_price,
+            "early_exit_price": exit_price,
+            "quantity": quantity,
+            "notional_usdt": position.get("notional_usdt"),
+            "leverage": position.get("leverage"),
+            "early_exit_pnl": close_pnl,
+            "early_exit_r_multiple": r_multiple if r_multiple is not None else calculate_position_r_multiple(position, exit_price),
+            "check_30m_ts": close_ts + 1800,
+            "check_60m_ts": close_ts + 3600,
+            "check_30m": {},
+            "check_60m": {},
+            "created_at": _now(),
+            "updated_at": _now(),
+        },
+    )
+    save_early_exit_shadow_rows(rows)
+    append_sim_diagnostic(
+        "反向复核影子跟踪",
+        symbol,
+        "tracking",
+        "已记录反向复核退出后的30/60分钟观察任务。",
+        {"position_id": position_id, "early_exit_price": exit_price, "early_exit_pnl": close_pnl},
+    )
+
+
+def update_early_exit_shadow_tracks(current_prices: dict[str, float], price_statuses: dict[str, str] | None = None) -> None:
+    rows = load_early_exit_shadow_rows()
+    if not rows:
+        return
+    now_ts = _ts()
+    changed = False
+    for row in rows:
+        if row.get("status") == "completed":
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        price = get_current_price(symbol, current_prices)
+        if price <= 0:
+            if row.get("deadline_ts") and now_ts > int(row.get("deadline_ts", 0)):
+                row["status"] = "expired"
+                row["updated_at"] = _now()
+                changed = True
+            continue
+        entry_price = _to_float(row.get("entry_price"), 0)
+        quantity = _to_float(row.get("quantity"), 0)
+        direction = str(row.get("direction") or "")
+        status = str((price_statuses or {}).get(symbol) or "live")
+        for label, target_key in (("30m", "check_30m_ts"), ("60m", "check_60m_ts")):
+            result_key = f"check_{label}"
+            if row.get(result_key):
+                continue
+            if now_ts < int(row.get(target_key, 0) or 0):
+                continue
+            pnl = _shadow_pnl(entry_price, price, quantity, direction)
+            row[result_key] = {
+                "time": _now(),
+                "ts": now_ts,
+                "price": price,
+                "price_status": status,
+                "pnl": pnl,
+                "pnl_delta_vs_early_exit": pnl - _to_float(row.get("early_exit_pnl"), 0),
+                "result": _shadow_result(entry_price, price, direction),
+            }
+            row["updated_at"] = _now()
+            changed = True
+            append_sim_diagnostic(
+                "反向复核影子结果",
+                symbol,
+                str(row[result_key]["result"]),
+                f"反向复核退出后{label}观察完成。",
+                {
+                    "position_id": row.get("position_id"),
+                    "price": price,
+                    "pnl": pnl,
+                    "pnl_delta_vs_early_exit": row[result_key]["pnl_delta_vs_early_exit"],
+                    "early_exit_pnl": row.get("early_exit_pnl"),
+                },
+            )
+        if row.get("check_30m") and row.get("check_60m"):
+            row["status"] = "completed"
+            row["completed_at"] = _now()
+            changed = True
+        elif row.get("deadline_ts") and now_ts > int(row.get("deadline_ts", 0)):
+            row["status"] = "expired"
+            row["updated_at"] = _now()
+            changed = True
+    if changed:
+        save_early_exit_shadow_rows(rows)
+
+
 def calculate_position_holding_time(position: dict[str, Any]) -> dict[str, Any]:
     seconds = max(0, _ts() - int(position.get("open_ts", _ts())))
     minutes = seconds // 60
@@ -769,15 +1030,26 @@ def calculate_position_holding_time(position: dict[str, Any]) -> dict[str, Any]:
 
 
 def calculate_position_pnl(position: dict[str, Any], current_price: float) -> dict[str, Any]:
-    pnl = calculate_unrealized_pnl(position, current_price)
+    settings = load_settings()
+    direction = str(position.get("direction"))
+    exit_price = apply_sim_slippage(current_price, direction, "exit", settings)
+    qty = _to_float(position.get("quantity"), 0)
+    close_notional = abs(exit_price * qty)
+    gross_pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), exit_price, qty, direction)
+    estimated_exit_fee = calculate_sim_fee(close_notional, settings)
+    pnl = gross_pnl - estimated_exit_fee
     margin = _to_float(position.get("margin_usdt"), 0)
     notional = _to_float(position.get("notional_usdt"), 0)
-    r_multiple = calculate_position_r_multiple(position, current_price)
+    r_multiple = calculate_position_r_multiple(position, exit_price)
     return {
         "unrealized_pnl": pnl,
+        "unrealized_gross_pnl": gross_pnl,
         "unrealized_pnl_pct": pnl / margin * 100 if margin else 0,
         "unrealized_pnl_pct_notional": pnl / notional * 100 if notional else 0,
         "r_multiple": r_multiple,
+        "estimated_exit_price": exit_price,
+        "estimated_exit_fee": estimated_exit_fee,
+        "estimated_exit_slippage_cost": _slippage_cost(current_price, exit_price, qty),
     }
 
 
@@ -831,26 +1103,44 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
             continue
         qty = _to_float(position.get("quantity"), 0)
         close_qty = qty * ratio
-        close_notional = _to_float(position.get("notional_usdt"), 0) * ratio
-        pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), price, close_qty, str(position.get("direction")))
+        direction = str(position.get("direction"))
+        settings = load_settings()
+        execution_price = apply_sim_slippage(price, direction, "exit", settings)
+        close_notional = abs(execution_price * close_qty)
+        gross_pnl = calculate_realized_pnl(_to_float(position.get("entry_price"), 0), execution_price, close_qty, direction)
+        exit_fee = calculate_sim_fee(close_notional, settings)
+        exit_slippage_cost = _slippage_cost(price, execution_price, close_qty)
+        pnl = gross_pnl - exit_fee
         released_margin = _to_float(position.get("margin_usdt"), 0) * ratio
         position["realized_pnl"] = _to_float(position.get("realized_pnl"), 0) + pnl
+        position["exit_fee"] = _to_float(position.get("exit_fee"), 0) + exit_fee
+        position["total_fee"] = _to_float(position.get("total_fee"), _to_float(position.get("entry_fee"), 0)) + exit_fee
+        position["exit_slippage_cost"] = _to_float(position.get("exit_slippage_cost"), 0) + exit_slippage_cost
+        position["total_slippage_cost"] = _to_float(position.get("total_slippage_cost"), _to_float(position.get("entry_slippage_cost"), 0)) + exit_slippage_cost
         position["quantity"] = qty - close_qty
         position["margin_usdt"] = _to_float(position.get("margin_usdt"), 0) - released_margin
         position["notional_usdt"] = _to_float(position.get("notional_usdt"), 0) * (1 - ratio)
-        position["current_price"] = price
+        position["current_price"] = execution_price
+        position["last_reference_price"] = price
         position["update_time"] = _now()
         account["available_balance"] = _to_float(account.get("available_balance"), 0) + released_margin + pnl
         account["used_margin"] = max(0.0, _to_float(account.get("used_margin"), 0) - released_margin)
         account["realized_pnl"] = _to_float(account.get("realized_pnl"), 0) + pnl
         account["daily_pnl"] = _to_float(account.get("daily_pnl"), 0) + pnl
+        account["total_fee_usdt"] = _to_float(account.get("total_fee_usdt"), 0) + exit_fee
+        account["total_slippage_cost_usdt"] = _to_float(account.get("total_slippage_cost_usdt"), 0) + exit_slippage_cost
         if ratio >= 0.999 or position["quantity"] <= 0:
             position["status"] = "closed"
             position["close_reason"] = reason
-            trade = _history_row(position, price, pnl, reason, close_qty=close_qty, close_notional=close_notional)
+            trade = _history_row(position, execution_price, pnl, reason, close_qty=close_qty, close_notional=close_notional)
+            trade["reference_exit_price"] = price
+            trade["gross_pnl"] = gross_pnl
+            trade["exit_fee"] = exit_fee
+            trade["fee_usdt"] = _to_float(position.get("entry_fee"), 0) * ratio + exit_fee
+            trade["slippage_cost_usdt"] = _to_float(position.get("entry_slippage_cost"), 0) * ratio + exit_slippage_cost
             history.insert(0, trade)
             try:
-                record_sim_close(position, price, pnl, reason)
+                record_sim_close(position, execution_price, pnl, reason)
             except Exception as exc:
                 log_sim_event("模拟交易数据库写入失败", position.get("symbol", ""), position.get("direction", ""), price, reason=f"平仓记录未写入SQLite：{exc!r}")
             if pnl < 0:
@@ -864,7 +1154,7 @@ def close_sim_position(position_id: str, reason: str, price: float, ratio: float
         save_positions(positions)
         save_sim_account(account)
         save_sim_trade_history(history)
-        log_sim_event("模拟平仓" if ratio >= 0.999 else "模拟部分平仓", position.get("symbol", ""), position.get("direction", ""), price, content=f"盈亏 {pnl:.2f} USDT", reason=reason)
+        log_sim_event("模拟平仓" if ratio >= 0.999 else "模拟部分平仓", position.get("symbol", ""), position.get("direction", ""), execution_price, content=f"净盈亏 {pnl:.2f} USDT，手续费 {exit_fee:.4f} USDT", reason=reason)
         return position
     return None
 
@@ -888,6 +1178,14 @@ def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason
         "holding_seconds": max(0, _ts() - int(position.get("open_ts", _ts()))),
         "entry_price": entry,
         "exit_price": exit_price,
+        "entry_fee": position.get("entry_fee", 0),
+        "exit_fee": position.get("exit_fee", 0),
+        "total_fee": position.get("total_fee", 0),
+        "entry_slippage_cost": position.get("entry_slippage_cost", 0),
+        "exit_slippage_cost": position.get("exit_slippage_cost", 0),
+        "total_slippage_cost": position.get("total_slippage_cost", 0),
+        "sim_fee_rate": position.get("sim_fee_rate"),
+        "sim_slippage_pct": position.get("sim_slippage_pct"),
         "quantity": close_qty if close_qty is not None else position.get("quantity"),
         "notional_usdt": notional,
         "leverage": position.get("leverage"),
@@ -902,6 +1200,8 @@ def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason
         "committee_risk_score": position.get("committee_risk_score"),
         "local_strategy_action": position.get("local_strategy_action"),
         "risk_reward_ratio": position.get("risk_reward_ratio"),
+        "exit_plan_source": position.get("exit_plan_source", "unknown"),
+        "structure_exit_plan": position.get("structure_exit_plan") or {},
         "chairman_summary": snapshot.get("chairman_summary"),
         "main_reasons": snapshot.get("main_reasons"),
         "main_risks": snapshot.get("main_risks"),
@@ -994,6 +1294,7 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
             and r_multiple <= -early_exit_adverse_r
         ):
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=early_adverse_review price={price} r={r_multiple:.4f} status={status}")
+            create_early_exit_shadow(position, price, r_multiple)
             close_sim_position(position["position_id"], "反向复核提前退出", price)
             external_position_change = True
             continue
@@ -1033,7 +1334,7 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
                 continue
             price = get_current_price(str(open_position.get("symbol", "")), current_prices)
             if price > 0:
-                unrealized_total += calculate_unrealized_pnl(open_position, price)
+                unrealized_total += _to_float(calculate_position_pnl(open_position, price).get("unrealized_pnl"), 0)
     account["unrealized_pnl"] = unrealized_total
     account["total_pnl"] = _to_float(account.get("realized_pnl"), 0) + unrealized_total
     account["equity"] = _to_float(account.get("available_balance"), 0) + _to_float(account.get("used_margin"), 0) + unrealized_total
@@ -1104,6 +1405,7 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
 def update_simulation(current_prices: dict[str, float], signals: list[dict[str, Any]] | None = None, price_statuses: dict[str, str] | None = None) -> dict[str, Any]:
     check_pending_orders(current_prices)
     update_sim_positions(current_prices, price_statuses)
+    update_early_exit_shadow_tracks(current_prices, price_statuses)
     process_results = process_committee_signals(current_prices, signals)
     return get_sim_account_summary(process_results=process_results)
 

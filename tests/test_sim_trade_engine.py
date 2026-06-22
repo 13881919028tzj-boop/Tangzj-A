@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services import sim_trade_engine as sim
+from services import market_cache
 
 
 def use_temp_store(tmp_path):
@@ -21,6 +22,7 @@ def use_temp_store(tmp_path):
     sim.DIAGNOSTICS_PATH = tmp_path / "sim_diagnostics.json"
     sim.EQUITY_JSON_PATH = tmp_path / "sim_equity_curve.json"
     sim.EQUITY_CSV_PATH = tmp_path / "sim_equity_curve.csv"
+    sim.EARLY_EXIT_SHADOW_PATH = tmp_path / "sim_early_exit_shadow.json"
     tmp_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -153,7 +155,16 @@ def test_quality_scores_reduce_position_size(tmp_path):
         settings,
     )
 
-    assert pct == 2.0
+    assert pct == 8.0
+
+
+def test_position_suggestion_text_is_kept_when_execution_size_is_scaled(tmp_path):
+    prepare_running_account(tmp_path)
+    order = sim.create_pending_sim_order(approved_signal(position_suggestion="3%-5%"), 100)
+
+    assert order is not None
+    assert order["position_pct"] == "3%-5%"
+    assert 159 <= order["margin_usdt"] <= 160
 
 
 def test_rejected_signal_writes_diagnostic(tmp_path):
@@ -203,6 +214,107 @@ def test_score_feedback_summarizes_quality_buckets(tmp_path):
     assert feedback["stats"][0]["高分样本"] == 1
 
 
+def test_early_exit_shadow_records_30m_and_60m_results(tmp_path):
+    prepare_running_account(tmp_path)
+    position = {
+        "position_id": "shadow_case_1",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+        "entry_price": 100.0,
+        "quantity": 2.0,
+        "notional_usdt": 200.0,
+        "leverage": 5,
+        "open_time": "2026-06-22 00:00:00",
+        "open_ts": sim._ts() - 900,
+        "stop_loss": 98.0,
+    }
+
+    sim.create_early_exit_shadow(position, 99.0, -0.5)
+    rows = sim.load_early_exit_shadow_rows()
+    assert rows[0]["symbol"] == "BTCUSDT"
+    assert rows[0]["early_exit_pnl"] == -2.0
+
+    rows[0]["check_30m_ts"] = sim._ts() - 1
+    rows[0]["check_60m_ts"] = sim._ts() - 1
+    sim.save_early_exit_shadow_rows(rows)
+    sim.update_early_exit_shadow_tracks({"BTCUSDT": 101.0}, {"BTCUSDT": "live"})
+    rows = sim.load_early_exit_shadow_rows()
+
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["check_30m"]["result"] == "win"
+    assert rows[0]["check_60m"]["pnl_delta_vs_early_exit"] == 4.0
+
+
+def test_structure_levels_override_signal_exit_plan_when_valid(tmp_path):
+    prepare_running_account(tmp_path)
+    symbol = "STRUCTUSDT"
+    rows = []
+    closes = [
+        98, 99, 100, 101, 102, 103, 104, 105, 104, 103,
+        102, 101, 100, 99, 98, 99, 100, 101, 102, 103,
+        104, 105, 106, 105, 104, 103, 102, 101, 100, 99,
+        98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
+        108, 107, 106, 105, 104, 103, 102, 101, 100, 99,
+        98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
+        108, 107, 106, 105, 104, 103, 102, 101, 100, 100,
+    ]
+    for index, close in enumerate(closes):
+        rows.append({"open": close, "high": close + 0.4, "low": close - 0.4, "close": close, "volume": 1000 + index})
+    market_cache.set_klines(symbol, "1m", rows)
+
+    order = sim.create_pending_sim_order(
+        approved_signal(
+            symbol=symbol,
+            entry_zone={"low": 99, "high": 101},
+            stop_loss={"price": 95},
+            take_profit_1={"price": 101},
+            take_profit_2={"price": 102},
+            risk_score=35,
+        ),
+        100,
+    )
+    assert order is not None
+    assert order["status"] == "filled"
+    assert order["exit_plan_source"] == "structure_levels"
+    position = sim.get_open_positions()[0]
+    assert position["exit_plan_source"] == "structure_levels"
+    assert position["stop_loss"] > 95
+
+
+def test_sim_fee_and_slippage_are_applied_to_entry_and_exit(tmp_path):
+    prepare_running_account(tmp_path)
+    settings = sim.load_settings()
+    settings["sim_fee_rate"] = 0.001
+    settings["sim_slippage_pct"] = 0.01
+    sim.save_settings(settings)
+
+    order = sim.create_pending_sim_order(
+        approved_signal(entry_zone={"low": 99, "high": 101}, stop_loss={"price": 90}, take_profit_1={"price": 120}, take_profit_2={"price": 130}),
+        100,
+    )
+    assert order and order["status"] == "filled"
+
+    position = sim.get_open_positions()[0]
+    assert abs(position["entry_price"] - 101.0) < 1e-9
+    assert position["entry_fee"] > 0
+    account_after_open = sim.load_sim_account()
+    assert account_after_open["total_fee_usdt"] == position["entry_fee"]
+    assert account_after_open["realized_pnl"] == -position["entry_fee"]
+
+    sim.close_sim_position(position["position_id"], "测试平仓", 110)
+    history = sim.load_sim_trade_history()
+    trade = history[0]
+    expected_exit_price = 108.9
+    expected_gross = (expected_exit_price - position["entry_price"]) * position["quantity"]
+    expected_exit_fee = expected_exit_price * position["quantity"] * 0.001
+
+    assert abs(trade["exit_price"] - expected_exit_price) < 1e-9
+    assert abs(trade["gross_pnl"] - expected_gross) < 1e-9
+    assert abs(trade["exit_fee"] - expected_exit_fee) < 1e-9
+    assert abs(trade["pnl"] - (expected_gross - expected_exit_fee)) < 1e-9
+    assert trade["fee_usdt"] > expected_exit_fee
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -219,7 +331,15 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_quality_scores_reduce_position_size(Path(raw) / "case7")
     with tempfile.TemporaryDirectory() as raw:
+        test_position_suggestion_text_is_kept_when_execution_size_is_scaled(Path(raw) / "case7b")
+    with tempfile.TemporaryDirectory() as raw:
         test_rejected_signal_writes_diagnostic(Path(raw) / "case8")
     with tempfile.TemporaryDirectory() as raw:
         test_score_feedback_summarizes_quality_buckets(Path(raw) / "case9")
+    with tempfile.TemporaryDirectory() as raw:
+        test_early_exit_shadow_records_30m_and_60m_results(Path(raw) / "case10")
+    with tempfile.TemporaryDirectory() as raw:
+        test_structure_levels_override_signal_exit_plan_when_valid(Path(raw) / "case11")
+    with tempfile.TemporaryDirectory() as raw:
+        test_sim_fee_and_slippage_are_applied_to_entry_and_exit(Path(raw) / "case12")
     print("sim_trade_engine tests passed")

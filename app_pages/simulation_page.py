@@ -412,6 +412,8 @@ def render_trading(build_current_committee_decision: Callable[[str, dict[str, An
             new_settings["dynamic_stop_loss_low_risk_pct"] = st.number_input("低风险动态止损 %", min_value=0.2, max_value=5.0, value=float(settings.get("dynamic_stop_loss_low_risk_pct", 1.55)), step=0.05)
             new_settings["dynamic_take_profit_1_r"] = st.number_input("止盈1 R倍数", min_value=0.5, max_value=5.0, value=float(settings.get("dynamic_take_profit_1_r", 1.4)), step=0.1)
             new_settings["dynamic_take_profit_2_r"] = st.number_input("止盈2 R倍数", min_value=1.0, max_value=8.0, value=float(settings.get("dynamic_take_profit_2_r", 2.8)), step=0.1)
+            new_settings["sim_fee_rate"] = st.number_input("模拟手续费率", min_value=0.0, max_value=0.01, value=float(settings.get("sim_fee_rate", 0.0004)), step=0.0001, format="%.4f")
+            new_settings["sim_slippage_pct"] = st.number_input("模拟滑点比例", min_value=0.0, max_value=0.02, value=float(settings.get("sim_slippage_pct", 0.0003)), step=0.0001, format="%.4f")
             new_settings["daily_loss_limit_pct"] = st.slider("每日最大亏损限制", 1, 20, int(settings.get("daily_loss_limit_pct", 3)))
             new_settings["max_drawdown_limit_pct"] = st.slider("最大回撤限制", 1, 30, int(settings.get("max_drawdown_limit_pct", 8)))
             new_settings["consecutive_loss_pause"] = st.slider("连续亏损暂停次数", 1, 10, int(settings.get("consecutive_loss_pause", 3)))
@@ -452,4 +454,3 @@ def render_trading(build_current_committee_decision: Callable[[str, dict[str, An
             st.info("暂无可用于评分反馈的平仓样本。")
         for suggestion in feedback.get("suggestions", []) or []:
             st.caption(str(suggestion))
-

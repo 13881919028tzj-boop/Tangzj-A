@@ -10,6 +10,11 @@ from services import auto_simulation_runner as runner
 from services import sim_trade_engine as sim
 
 
+class SimpleMonkeyPatch:
+    def setattr(self, obj, name, value):
+        setattr(obj, name, value)
+
+
 def use_temp_store(tmp_path):
     sim.DATA_DIR = tmp_path
     sim.ACCOUNT_PATH = tmp_path / "sim_account.json"
@@ -22,6 +27,7 @@ def use_temp_store(tmp_path):
     sim.DIAGNOSTICS_PATH = tmp_path / "sim_diagnostics.json"
     sim.EQUITY_JSON_PATH = tmp_path / "sim_equity_curve.json"
     sim.EQUITY_CSV_PATH = tmp_path / "sim_equity_curve.csv"
+    sim.EARLY_EXIT_SHADOW_PATH = tmp_path / "sim_early_exit_shadow.json"
     tmp_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -142,6 +148,25 @@ def test_auto_sim_rejects_poor_liquidity_quality(tmp_path):
     assert signal is None
 
 
+def test_price_map_includes_pending_early_exit_shadow_symbol(tmp_path, monkeypatch):
+    use_temp_store(tmp_path)
+    sim.save_early_exit_shadow_rows(
+        [
+            {
+                "position_id": "shadow_case_1",
+                "symbol": "ETHUSDT",
+                "status": "tracking",
+                "deadline_ts": sim._ts() + 3600,
+            }
+        ]
+    )
+    monkeypatch.setattr(runner, "_fetch_live_price", lambda symbol: 123.0 if symbol == "ETHUSDT" else 0.0)
+
+    prices = runner._build_price_map([])
+
+    assert prices["ETHUSDT"] == 123.0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_confirmed_short_precheck_becomes_sim_signal(Path(raw) / "case1")
@@ -153,4 +178,6 @@ if __name__ == "__main__":
         test_auto_sim_allows_blocked_precheck_for_sampling(Path(raw) / "case4")
     with tempfile.TemporaryDirectory() as raw:
         test_auto_sim_rejects_poor_liquidity_quality(Path(raw) / "case5")
+    with tempfile.TemporaryDirectory() as raw:
+        test_price_map_includes_pending_early_exit_shadow_symbol(Path(raw) / "case6", SimpleMonkeyPatch())
     print("auto_simulation_runner tests passed")

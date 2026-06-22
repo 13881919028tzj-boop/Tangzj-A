@@ -17,6 +17,7 @@ from services.fast_opportunity_engine import collect_top10_opportunities, run_co
 from services.sim_trade_engine import (
     append_sim_diagnostic,
     get_open_positions,
+    get_pending_early_exit_shadow_symbols,
     get_pending_orders,
     load_settings,
     load_sim_account,
@@ -106,6 +107,7 @@ def _build_price_map(opportunities: list[dict[str, Any]]) -> dict[str, float]:
     symbols = {str(item.get("symbol") or "").upper() for item in opportunities}
     symbols.update(str(item.get("symbol") or "").upper() for item in get_open_positions())
     symbols.update(str(item.get("symbol") or "").upper() for item in get_pending_orders())
+    symbols.update(get_pending_early_exit_shadow_symbols())
     price_map: dict[str, float] = {}
     statuses: dict[str, str] = {}
     by_symbol = {str(item.get("symbol") or "").upper(): item for item in opportunities}

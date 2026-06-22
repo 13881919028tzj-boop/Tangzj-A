@@ -529,6 +529,7 @@ def _update_item_from_board_row(item: dict[str, Any], row: dict[str, Any]) -> No
     confidence = max(int(_to_float(previous_strategy.get("confidence"), 0)), min(90, opportunity))
     action = row.get("advice") or previous_strategy.get("action") or "观察"
     direction = row.get("direction") or previous_strategy.get("direction") or "neutral"
+    data_quality = {"level": str(row.get("data_quality") or row.get("data_quality_level") or "good"), "missing_fields": []}
     strategy = {
         **previous_strategy,
         "direction": direction,
@@ -540,13 +541,14 @@ def _update_item_from_board_row(item: dict[str, Any], row: dict[str, Any]) -> No
         "opportunity_score": opportunity,
         "trade_permission": "blocked" if risk >= 80 else "candidate" if opportunity >= 75 else "observe",
         "invalid_condition": row.get("opportunity_status") or "等待更多确认。",
+        "data_quality": data_quality,
     }
     previous = json.loads(json.dumps(item, ensure_ascii=False))
     item["local_strategy"] = strategy
     item["current_price"] = row.get("last_price", row.get("current_price", item.get("current_price", 0)))
     item["price_change_24h"] = row.get("price_change_percent", item.get("price_change_24h", 0))
     item["last_update_time"] = now
-    item["data_quality"] = {"level": "good", "missing_fields": []}
+    item["data_quality"] = data_quality
     tracking = _tracking_status(strategy, previous if previous.get("local_strategy") else None)
     watch_score, watch_level, watch_explanation = _watch_score(strategy, previous if previous.get("local_strategy") else None)
     item["tracking"] = tracking
