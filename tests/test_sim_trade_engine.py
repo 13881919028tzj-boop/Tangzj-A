@@ -36,8 +36,9 @@ def approved_signal(**overrides):
         "veto_members": [],
         "committee_confidence": 72,
         "risk_score": 42,
+        "professional_trade_score": 78,
         "simulation_score": 72,
-        "base_quality_score": 68,
+        "base_quality_score": 72,
         "liquidity_quality_score": 70,
         "relative_strength_score": 65,
         "signal_freshness_score": 72,
@@ -315,6 +316,37 @@ def test_sim_fee_and_slippage_are_applied_to_entry_and_exit(tmp_path):
     assert trade["fee_usdt"] > expected_exit_fee
 
 
+def test_closed_trade_history_keeps_calibration_tags(tmp_path):
+    prepare_running_account(tmp_path)
+    order = sim.create_pending_sim_order(
+        approved_signal(
+            entry_zone={"low": 99, "high": 101},
+            entry_state="pullback_confirmed",
+            consensus_count=4,
+            kline_signal={"direction": "long", "confirming": True},
+            whale_signal={"direction": "long", "confirming": True},
+            orderbook_signal={"direction": "long", "confirming": False},
+            market_regime="bullish",
+        ),
+        100,
+    )
+    assert order and order["status"] == "filled"
+
+    position = sim.get_open_positions()[0]
+    sim.close_sim_position(position["position_id"], "测试平仓", 101)
+    trade = sim.load_sim_trade_history()[0]
+
+    assert trade["professional_trade_score"] == 78
+    assert trade["simulation_score"] == 72
+    assert trade["entry_state"] == "pullback_confirmed"
+    assert trade["consensus_count"] == 4
+    assert trade["kline_confirming"] is True
+    assert trade["whale_confirming"] is True
+    assert trade["orderbook_confirming"] is False
+    assert trade["market_regime"] == "bullish"
+    assert trade["calibration_tags"]["base_quality_score"] == 72
+
+
 def test_corrupted_positions_restore_from_last_good_backup(tmp_path):
     use_temp_store(tmp_path)
     rows = [{"position_id": "safe_pos_1", "symbol": "BTCUSDT", "status": "open", "margin_usdt": 10}]
@@ -403,7 +435,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_sim_fee_and_slippage_are_applied_to_entry_and_exit(Path(raw) / "case12")
     with tempfile.TemporaryDirectory() as raw:
-        test_corrupted_positions_restore_from_last_good_backup(Path(raw) / "case13")
+        test_closed_trade_history_keeps_calibration_tags(Path(raw) / "case13")
     with tempfile.TemporaryDirectory() as raw:
-        test_early_exit_closes_and_opens_reverse_position_with_expanded_targets(Path(raw) / "case14")
+        test_corrupted_positions_restore_from_last_good_backup(Path(raw) / "case14")
+    with tempfile.TemporaryDirectory() as raw:
+        test_early_exit_closes_and_opens_reverse_position_with_expanded_targets(Path(raw) / "case15")
     print("sim_trade_engine tests passed")

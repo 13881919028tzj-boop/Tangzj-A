@@ -17,6 +17,7 @@ from typing import Any
 
 from services import market_cache
 from services.ai_committee_engine import get_committee_approved_signals
+from services.sim_calibration_engine import build_calibration_report, evaluate_signal_ev, extract_calibration_tags
 from services.structure_level_engine import build_structure_exit_plan
 from services.trading_database import record_sim_close, record_sim_open
 
@@ -685,14 +686,24 @@ def validate_signal_for_simulation(signal: dict[str, Any], current_prices: dict[
         reasons.append("委员会置信度不足。")
     if _rr_value(signal) and _rr_value(signal) < 1.2:
         reasons.append("风险收益比低于1:1.2。")
-    if "simulation_score" in signal and _to_float(signal.get("simulation_score"), 0) < 60:
-        reasons.append("模拟适配分低于60，暂不创建模拟订单。")
-    if "base_quality_score" in signal and _to_float(signal.get("base_quality_score"), 0) < 50:
-        reasons.append("基础质量分低于50，暂不创建模拟订单。")
-    if "liquidity_quality_score" in signal and _to_float(signal.get("liquidity_quality_score"), 0) < 40:
-        reasons.append("流动性质量低于40，滑点风险过高。")
-    if "portfolio_fit_score" in signal and _to_float(signal.get("portfolio_fit_score"), 0) < 25:
-        reasons.append("组合适配分低于25，当前模拟敞口过于拥挤。")
+    if "professional_trade_score" in signal and _to_float(signal.get("professional_trade_score"), 0) < 75:
+        reasons.append("专业交易分低于75，暂不创建模拟订单。")
+    if "simulation_score" in signal and _to_float(signal.get("simulation_score"), 0) < 70:
+        reasons.append("模拟适配分低于70，暂不创建模拟订单。")
+    if "base_quality_score" in signal and _to_float(signal.get("base_quality_score"), 0) < 70:
+        reasons.append("基础质量分低于70，暂不创建模拟订单。")
+    if "liquidity_quality_score" in signal and _to_float(signal.get("liquidity_quality_score"), 0) < 70:
+        reasons.append("流动性质量低于70，滑点风险过高。")
+    if "portfolio_fit_score" in signal and _to_float(signal.get("portfolio_fit_score"), 0) < 60:
+        reasons.append("组合适配分低于60，当前模拟敞口过于拥挤。")
+    if signal.get("direction") in {"long", "short"}:
+        ev_check = evaluate_signal_ev(signal, load_sim_trade_history())
+        signal.setdefault("historical_ev", ev_check.get("ev"))
+        signal.setdefault("historical_ev_sample_size", ev_check.get("sample_size"))
+        signal.setdefault("historical_ev_win_rate", ev_check.get("win_rate"))
+        signal.setdefault("historical_ev_reason", ev_check.get("reason"))
+        if not ev_check.get("allowed"):
+            reasons.append(ev_check.get("reason") or "同类历史EV不支持开仓。")
     if account.get("status") != "running":
         reasons.append("模拟交易未处于运行状态。")
     if settings.get("mode") == "observe":
@@ -824,6 +835,8 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         return {}
     quantity = notional / execution_price if execution_price > 0 else 0
     entry_slippage_cost = _slippage_cost(price, execution_price, quantity)
+    snapshot = order.get("committee_snapshot") or {}
+    calibration_tags = extract_calibration_tags({**snapshot, "direction": direction})
     position = {
         "position_id": f"sim_pos_{int(time.time() * 1000)}",
         "symbol": order.get("symbol"),
@@ -862,15 +875,29 @@ def open_sim_position(order: dict[str, Any], price: float) -> dict[str, Any]:
         "total_slippage_cost": entry_slippage_cost,
         "sim_fee_rate": _fee_rate(settings),
         "sim_slippage_pct": _slippage_pct(settings),
-        "risk_reward_ratio": order.get("committee_snapshot", {}).get("risk_reward_ratio"),
-        "committee_confidence": order.get("committee_snapshot", {}).get("committee_confidence"),
-        "committee_risk_score": order.get("committee_snapshot", {}).get("risk_score"),
-        "committee_action": order.get("committee_snapshot", {}).get("action"),
+        "risk_reward_ratio": snapshot.get("risk_reward_ratio"),
+        "committee_confidence": snapshot.get("committee_confidence"),
+        "committee_risk_score": snapshot.get("risk_score"),
+        "committee_action": snapshot.get("action"),
         "local_strategy_action": "",
-        "invalid_condition": order.get("committee_snapshot", {}).get("invalid_condition"),
+        "invalid_condition": snapshot.get("invalid_condition"),
         "open_reason": order.get("reason"),
         "close_reason": "",
-        "committee_snapshot": order.get("committee_snapshot"),
+        "professional_trade_score": calibration_tags.get("professional_trade_score"),
+        "simulation_score": calibration_tags.get("simulation_score"),
+        "entry_state": calibration_tags.get("entry_state"),
+        "consensus_count": calibration_tags.get("consensus_count"),
+        "kline_confirming": calibration_tags.get("kline_confirming"),
+        "whale_confirming": calibration_tags.get("whale_confirming"),
+        "orderbook_confirming": calibration_tags.get("orderbook_confirming"),
+        "market_regime": calibration_tags.get("market_regime"),
+        "liquidity_quality_score": calibration_tags.get("liquidity_quality_score"),
+        "base_quality_score": calibration_tags.get("base_quality_score"),
+        "historical_ev": snapshot.get("historical_ev"),
+        "historical_ev_sample_size": snapshot.get("historical_ev_sample_size"),
+        "historical_ev_win_rate": snapshot.get("historical_ev_win_rate"),
+        "calibration_tags": calibration_tags,
+        "committee_snapshot": snapshot,
         "local_strategy_snapshot": order.get("local_strategy_snapshot"),
     }
     positions = load_positions()
@@ -1297,6 +1324,7 @@ def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason
     r_multiple = calculate_position_r_multiple(position, exit_price)
     snapshot = position.get("committee_snapshot") or {}
     local_snapshot = position.get("local_strategy_snapshot") or {}
+    calibration_tags = position.get("calibration_tags") or extract_calibration_tags({**snapshot, **position})
     return {
         "trade_id": position.get("position_id"),
         "symbol": position.get("symbol"),
@@ -1326,6 +1354,21 @@ def _history_row(position: dict[str, Any], exit_price: float, pnl: float, reason
         "committee_action": position.get("committee_action"),
         "committee_confidence": position.get("committee_confidence"),
         "committee_risk_score": position.get("committee_risk_score"),
+        "professional_trade_score": calibration_tags.get("professional_trade_score"),
+        "simulation_score": calibration_tags.get("simulation_score"),
+        "entry_state": calibration_tags.get("entry_state"),
+        "consensus_count": calibration_tags.get("consensus_count"),
+        "kline_confirming": calibration_tags.get("kline_confirming"),
+        "whale_confirming": calibration_tags.get("whale_confirming"),
+        "orderbook_confirming": calibration_tags.get("orderbook_confirming"),
+        "risk_score": calibration_tags.get("risk_score"),
+        "market_regime": calibration_tags.get("market_regime"),
+        "liquidity_quality_score": calibration_tags.get("liquidity_quality_score"),
+        "base_quality_score": calibration_tags.get("base_quality_score"),
+        "historical_ev": position.get("historical_ev"),
+        "historical_ev_sample_size": position.get("historical_ev_sample_size"),
+        "historical_ev_win_rate": position.get("historical_ev_win_rate"),
+        "calibration_tags": calibration_tags,
         "local_strategy_action": position.get("local_strategy_action"),
         "risk_reward_ratio": position.get("risk_reward_ratio"),
         "exit_plan_source": position.get("exit_plan_source", "unknown"),
@@ -1501,11 +1544,21 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
                 {
                     "price": price,
                     "direction": signal.get("direction"),
+                    "professional_trade_score": signal.get("professional_trade_score"),
                     "simulation_score": signal.get("simulation_score"),
+                    "entry_state": signal.get("entry_state"),
+                    "consensus_count": signal.get("consensus_count") or signal.get("consensus_support_count"),
+                    "kline_confirming": signal.get("kline_confirming"),
+                    "whale_confirming": signal.get("whale_confirming"),
+                    "orderbook_confirming": signal.get("orderbook_confirming"),
+                    "market_regime": signal.get("market_regime"),
                     "base_quality_score": signal.get("base_quality_score"),
                     "liquidity_quality_score": signal.get("liquidity_quality_score"),
                     "portfolio_fit_score": signal.get("portfolio_fit_score"),
                     "risk_score": signal.get("risk_score"),
+                    "historical_ev": signal.get("historical_ev"),
+                    "historical_ev_sample_size": signal.get("historical_ev_sample_size"),
+                    "historical_ev_win_rate": signal.get("historical_ev_win_rate"),
                 },
             )
             continue
@@ -1521,10 +1574,20 @@ def process_committee_signals(current_prices: dict[str, float], signals: list[di
             {
                 "price": price,
                 "direction": signal.get("direction"),
+                "professional_trade_score": signal.get("professional_trade_score"),
                 "simulation_score": signal.get("simulation_score"),
+                "entry_state": signal.get("entry_state"),
+                "consensus_count": signal.get("consensus_count") or signal.get("consensus_support_count"),
+                "kline_confirming": signal.get("kline_confirming"),
+                "whale_confirming": signal.get("whale_confirming"),
+                "orderbook_confirming": signal.get("orderbook_confirming"),
+                "market_regime": signal.get("market_regime"),
                 "base_quality_score": signal.get("base_quality_score"),
                 "liquidity_quality_score": signal.get("liquidity_quality_score"),
                 "portfolio_fit_score": signal.get("portfolio_fit_score"),
+                "historical_ev": signal.get("historical_ev"),
+                "historical_ev_sample_size": signal.get("historical_ev_sample_size"),
+                "historical_ev_win_rate": signal.get("historical_ev_win_rate"),
                 "risk_score": signal.get("risk_score"),
             },
         )
@@ -1779,6 +1842,11 @@ def calculate_sim_score_feedback(history: list[dict[str, Any]] | None = None) ->
     }
 
 
+def get_sim_calibration_report(history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    rows = history if history is not None else load_sim_trade_history()
+    return build_calibration_report(rows)
+
+
 def calculate_sim_performance_stats() -> dict[str, Any]:
     stats = calculate_sim_stats()
     account = enrich_sim_account(load_sim_account())
@@ -1817,6 +1885,7 @@ def get_sim_account_summary(process_results: list[dict[str, Any]] | None = None)
         "events": load_sim_events(30),
         "diagnostics": load_sim_diagnostics(80),
         "score_feedback": calculate_sim_score_feedback(history),
+        "calibration_report": get_sim_calibration_report(history),
         "stats": stats,
         "process_results": process_results or [],
         "safety_notice": "当前为模拟交易，不会使用真实资金，不会执行真实订单。",

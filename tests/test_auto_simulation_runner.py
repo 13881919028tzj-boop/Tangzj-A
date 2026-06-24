@@ -82,7 +82,7 @@ def test_confirmed_short_precheck_becomes_sim_signal(tmp_path):
     assert signal["action"] == "轻仓试空"
 
 
-def test_auto_sim_allows_short_chasing_after_large_drop_for_sampling(tmp_path):
+def test_auto_sim_rejects_short_chasing_after_large_drop(tmp_path):
     use_temp_store(tmp_path)
 
     signal = runner._signal_from_precheck(
@@ -93,12 +93,10 @@ def test_auto_sim_allows_short_chasing_after_large_drop_for_sampling(tmp_path):
         )
     )
 
-    assert signal is not None
-    assert signal["direction"] == "short"
-    assert signal["action"] == "轻仓试空"
+    assert signal is None
 
 
-def test_auto_sim_allows_market_misalignment_for_sampling(tmp_path):
+def test_auto_sim_rejects_market_misalignment(tmp_path):
     use_temp_store(tmp_path)
 
     signal = runner._signal_from_precheck(
@@ -109,11 +107,10 @@ def test_auto_sim_allows_market_misalignment_for_sampling(tmp_path):
         )
     )
 
-    assert signal is not None
-    assert signal["direction"] == "short"
+    assert signal is None
 
 
-def test_auto_sim_allows_blocked_precheck_for_sampling(tmp_path):
+def test_auto_sim_rejects_blocked_precheck(tmp_path):
     use_temp_store(tmp_path)
 
     signal = runner._signal_from_precheck(
@@ -127,11 +124,7 @@ def test_auto_sim_allows_blocked_precheck_for_sampling(tmp_path):
         )
     )
 
-    assert signal is not None
-    assert signal["direction"] == "short"
-    assert signal["tradable_now"] is True
-    assert signal["action_gate"] == "open_now"
-    assert signal["sampling_override"] is True
+    assert signal is None
 
 
 def test_auto_sim_rejects_poor_liquidity_quality(tmp_path):
@@ -171,11 +164,11 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_confirmed_short_precheck_becomes_sim_signal(Path(raw) / "case1")
     with tempfile.TemporaryDirectory() as raw:
-        test_auto_sim_allows_short_chasing_after_large_drop_for_sampling(Path(raw) / "case2")
+        test_auto_sim_rejects_short_chasing_after_large_drop(Path(raw) / "case2")
     with tempfile.TemporaryDirectory() as raw:
-        test_auto_sim_allows_market_misalignment_for_sampling(Path(raw) / "case3")
+        test_auto_sim_rejects_market_misalignment(Path(raw) / "case3")
     with tempfile.TemporaryDirectory() as raw:
-        test_auto_sim_allows_blocked_precheck_for_sampling(Path(raw) / "case4")
+        test_auto_sim_rejects_blocked_precheck(Path(raw) / "case4")
     with tempfile.TemporaryDirectory() as raw:
         test_auto_sim_rejects_poor_liquidity_quality(Path(raw) / "case5")
     with tempfile.TemporaryDirectory() as raw:

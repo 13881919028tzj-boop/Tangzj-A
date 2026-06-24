@@ -10,7 +10,7 @@ import streamlit as st
 
 from components.ui import kline_symbol_link, render_metric_grid, render_page_head, safe_committee_text, signal_color
 from services import market_cache
-from services.sim_observability import build_sim_diagnostic_rows, build_sim_score_feedback_rows
+from services.sim_observability import build_sim_calibration_rows, build_sim_diagnostic_rows, build_sim_score_feedback_rows
 from services.sim_trade_engine import (
     cancel_order,
     calculate_position_holding_time,
@@ -454,3 +454,29 @@ def render_trading(build_current_committee_decision: Callable[[str, dict[str, An
             st.info("暂无可用于评分反馈的平仓样本。")
         for suggestion in feedback.get("suggestions", []) or []:
             st.caption(str(suggestion))
+        calibration = summary.get("calibration_report") or {}
+        calibration_summary = calibration.get("summary") or {}
+        st.markdown("**模拟历史统计校准**")
+        st.caption(
+            f"样本 {calibration_summary.get('trades', 0)} 笔｜"
+            f"整体胜率 {float(calibration_summary.get('win_rate', 0) or 0) * 100:.2f}%｜"
+            f"整体EV {float(calibration_summary.get('ev', 0) or 0):+.4f}｜"
+            f"数据质量 {calibration_summary.get('data_quality', 'unknown')}"
+        )
+        c_prof, c_sim = st.columns(2)
+        with c_prof:
+            st.caption("专业分分层")
+            st.dataframe(build_sim_calibration_rows(calibration.get("professional_score_buckets") or []), width="stretch", hide_index=True)
+        with c_sim:
+            st.caption("模拟分分层")
+            st.dataframe(build_sim_calibration_rows(calibration.get("simulation_score_buckets") or []), width="stretch", hide_index=True)
+        c_entry, c_confirm, c_market = st.columns(3)
+        with c_entry:
+            st.caption("入场形态")
+            st.dataframe(build_sim_calibration_rows(calibration.get("entry_state") or []), width="stretch", hide_index=True)
+        with c_confirm:
+            st.caption("确认组合")
+            st.dataframe(build_sim_calibration_rows(calibration.get("confirmation_combo") or []), width="stretch", hide_index=True)
+        with c_market:
+            st.caption("市场状态")
+            st.dataframe(build_sim_calibration_rows(calibration.get("market_regime") or []), width="stretch", hide_index=True)

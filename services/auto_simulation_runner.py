@@ -21,9 +21,11 @@ from services.sim_trade_engine import (
     get_pending_orders,
     load_settings,
     load_sim_account,
+    load_sim_trade_history,
     log_sim_event,
     update_simulation,
 )
+from services.sim_calibration_engine import evaluate_signal_ev, extract_calibration_tags
 
 
 _LAST_RUN_AT = 0.0
@@ -34,8 +36,12 @@ _LAST_PRICE_STATUS: dict[str, str] = {}
 MIN_AUTO_SIM_DIRECTION_GAP = 20
 MIN_AUTO_SIM_CONSENSUS_SUPPORT = 3
 MIN_AUTO_SIM_MARKET_ALIGNMENT = 80
-MIN_AUTO_SIM_SAMPLING_SCORE = 60
-MAX_AUTO_SIM_SAMPLING_RISK = 75
+MIN_AUTO_SIM_PROFESSIONAL_SCORE = 75
+MIN_AUTO_SIM_SIMULATION_SCORE = 70
+MIN_AUTO_SIM_BASE_QUALITY = 70
+MIN_AUTO_SIM_LIQUIDITY_QUALITY = 70
+MIN_AUTO_SIM_PORTFOLIO_FIT = 60
+MAX_AUTO_SIM_SAMPLING_RISK = 60
 SHORT_NO_CHASE_CHANGE_PCT = -8.0
 LONG_NO_CHASE_CHANGE_PCT = 8.0
 LONG_CONFIRMED_ENTRY_STATES = {"pullback_confirmed", "breakout_confirmed"}
@@ -166,16 +172,16 @@ def _sampling_reject_reasons(
         reasons.append("交易对象缺失。")
     if price <= 0:
         reasons.append("价格不可用。")
-    if score < MIN_AUTO_SIM_SAMPLING_SCORE:
-        reasons.append(f"专业分 {score} 低于自动模拟采样阈值 {MIN_AUTO_SIM_SAMPLING_SCORE}。")
-    if simulation_score < MIN_AUTO_SIM_SAMPLING_SCORE:
-        reasons.append(f"模拟适配分 {simulation_score} 低于自动模拟采样阈值 {MIN_AUTO_SIM_SAMPLING_SCORE}。")
-    if base_quality < 50:
-        reasons.append(f"基础质量分 {base_quality} 低于50。")
-    if liquidity_quality < 40:
-        reasons.append(f"流动性质量 {liquidity_quality} 低于40。")
-    if portfolio_fit < 25:
-        reasons.append(f"组合适配分 {portfolio_fit} 低于25。")
+    if score < MIN_AUTO_SIM_PROFESSIONAL_SCORE:
+        reasons.append(f"专业分 {score} 低于自动模拟开仓阈值 {MIN_AUTO_SIM_PROFESSIONAL_SCORE}。")
+    if simulation_score < MIN_AUTO_SIM_SIMULATION_SCORE:
+        reasons.append(f"模拟适配分 {simulation_score} 低于自动模拟开仓阈值 {MIN_AUTO_SIM_SIMULATION_SCORE}。")
+    if base_quality < MIN_AUTO_SIM_BASE_QUALITY:
+        reasons.append(f"基础质量分 {base_quality} 低于{MIN_AUTO_SIM_BASE_QUALITY}。")
+    if liquidity_quality < MIN_AUTO_SIM_LIQUIDITY_QUALITY:
+        reasons.append(f"流动性质量 {liquidity_quality} 低于{MIN_AUTO_SIM_LIQUIDITY_QUALITY}。")
+    if portfolio_fit < MIN_AUTO_SIM_PORTFOLIO_FIT:
+        reasons.append(f"组合适配分 {portfolio_fit} 低于{MIN_AUTO_SIM_PORTFOLIO_FIT}。")
     if risk >= MAX_AUTO_SIM_SAMPLING_RISK:
         reasons.append(f"风险分 {risk} 达到或超过 {MAX_AUTO_SIM_SAMPLING_RISK}。")
     return reasons
@@ -221,6 +227,14 @@ def _strict_auto_sim_reject_reasons(row: dict[str, Any], precheck: dict[str, Any
     whale = row.get("whale_signal") or {}
     orderbook = row.get("orderbook_signal") or {}
 
+    if precheck.get("allowed_candidate") is False:
+        reasons.append("委员会快速预判未允许进入候选。")
+    if row.get("tradable_now") is not True:
+        reasons.append("专业预审未给出 tradable_now。")
+    if str(row.get("action_gate") or precheck.get("action_gate") or "") != "open_now":
+        reasons.append("专业预审未进入 open_now。")
+    if block_reasons:
+        reasons.append("专业预审仍存在阻断原因。")
     if direction_gap < MIN_AUTO_SIM_DIRECTION_GAP:
         reasons.append(f"方向分差 {direction_gap:.0f} 低于自动模拟硬门槛 {MIN_AUTO_SIM_DIRECTION_GAP}。")
     if consensus_count < MIN_AUTO_SIM_CONSENSUS_SUPPORT:
@@ -229,8 +243,10 @@ def _strict_auto_sim_reject_reasons(row: dict[str, Any], precheck: dict[str, Any
         reasons.append("大盘未与开仓方向同向。")
     if kline and not _same_direction(kline.get("direction"), direction):
         reasons.append("K线方向未确认同向。")
-    if whale and not _same_direction(whale.get("direction"), direction):
-        reasons.append("大单资金未确认同向。")
+    whale_same = _same_direction(whale.get("direction"), direction) and whale.get("confirming") is not False
+    orderbook_same = _same_direction(orderbook.get("direction"), direction) and orderbook.get("confirming") is not False
+    if not whale_same and not orderbook_same:
+        reasons.append("大单或盘口没有至少一个同向确认。")
     if orderbook and orderbook.get("direction") in {"long", "short"} and not _same_direction(orderbook.get("direction"), direction):
         reasons.append("盘口方向与开仓方向冲突。")
 
@@ -255,7 +271,7 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
     price = _price(row)
     score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
     risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-    simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SAMPLING_SCORE))
+    simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SIMULATION_SCORE))
     base_quality = _to_int(row.get("base_quality_score"), max(65, min(80, simulation_score)))
     liquidity_quality = _to_int(row.get("liquidity_quality_score"), 70)
     relative_strength = _to_int(row.get("relative_strength_score"), 65)
@@ -266,6 +282,22 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         return None
     direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
     if direction not in {"long", "short"}:
+        return None
+    if _strict_auto_sim_reject_reasons(row, precheck, direction):
+        return None
+    preliminary_signal = {
+        **row,
+        "symbol": symbol,
+        "direction": direction,
+        "risk_score": risk,
+        "professional_trade_score": score,
+        "simulation_score": simulation_score,
+        "base_quality_score": base_quality,
+        "liquidity_quality_score": liquidity_quality,
+        "portfolio_fit_score": portfolio_fit,
+    }
+    ev_check = evaluate_signal_ev(preliminary_signal, load_sim_trade_history())
+    if not ev_check.get("allowed"):
         return None
     stop, tp1, tp2 = _risk_reward_prices(price, direction)
     action = "顺势做多" if direction == "long" and score >= 88 else "轻仓试多" if direction == "long" else "顺势做空" if score >= 88 else "轻仓试空"
@@ -322,6 +354,11 @@ def _signal_from_precheck(precheck: dict[str, Any]) -> dict[str, Any] | None:
         "source_board_rank": rank,
         "current_market_state": row.get("current_market_state") or row.get("opportunity_status") or "机会榜自动模拟候选",
         "opportunity_status": row.get("opportunity_status"),
+        "historical_ev": ev_check.get("ev"),
+        "historical_ev_sample_size": ev_check.get("sample_size"),
+        "historical_ev_win_rate": ev_check.get("win_rate"),
+        "historical_ev_reason": ev_check.get("reason"),
+        "calibration_tags": extract_calibration_tags(preliminary_signal),
     }
 
 
@@ -352,7 +389,7 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
                 symbol = str(precheck.get("symbol") or row.get("symbol") or "").upper()
                 score = _to_int(row.get("professional_trade_score", row.get("final_opportunity_score", row.get("opportunity_score"))), _to_int(precheck.get("professional_trade_score", precheck.get("score")), 0))
                 risk = _to_int(row.get("risk_score"), _to_int(precheck.get("risk_score"), 50))
-                simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SAMPLING_SCORE))
+                simulation_score = _to_int(row.get("simulation_score"), max(score, MIN_AUTO_SIM_SIMULATION_SCORE))
                 base_quality = _to_int(row.get("base_quality_score"), max(65, min(80, simulation_score)))
                 liquidity_quality = _to_int(row.get("liquidity_quality_score"), 70)
                 portfolio_fit = _to_int(row.get("portfolio_fit_score"), 75)
@@ -361,6 +398,24 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
                 reasons = _sampling_reject_reasons(symbol, price, score, simulation_score, base_quality, liquidity_quality, portfolio_fit, risk)
                 if direction not in {"long", "short"}:
                     reasons.append("方向不是 long/short。")
+                else:
+                    reasons.extend(_strict_auto_sim_reject_reasons(row, precheck, direction))
+                    ev_check = evaluate_signal_ev(
+                        {
+                            **row,
+                            "symbol": symbol,
+                            "direction": direction,
+                            "risk_score": risk,
+                            "professional_trade_score": score,
+                            "simulation_score": simulation_score,
+                            "base_quality_score": base_quality,
+                            "liquidity_quality_score": liquidity_quality,
+                            "portfolio_fit_score": portfolio_fit,
+                        },
+                        load_sim_trade_history(),
+                    )
+                    if not ev_check.get("allowed"):
+                        reasons.append(ev_check.get("reason") or "同类历史EV不支持开仓。")
                 append_sim_diagnostic(
                     "自动模拟候选拒绝",
                     symbol,

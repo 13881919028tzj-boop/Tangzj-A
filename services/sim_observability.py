@@ -29,3 +29,21 @@ def build_sim_diagnostic_rows(diagnostics: list[dict[str, Any]], limit: int = 80
 def build_sim_score_feedback_rows(feedback: dict[str, Any]) -> list[dict[str, Any]]:
     rows = feedback.get("stats") or []
     return rows if isinstance(rows, list) else []
+
+
+def build_sim_calibration_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for item in rows or []:
+        output.append(
+            {
+                "分层": item.get("key"),
+                "样本": item.get("trades"),
+                "胜率": f"{float(item.get('win_rate', 0) or 0) * 100:.2f}%",
+                "EV": item.get("ev"),
+                "总盈亏": item.get("total_pnl"),
+                "平均盈亏": item.get("avg_pnl"),
+                "盈利": item.get("wins"),
+                "亏损": item.get("losses"),
+            }
+        )
+    return output
