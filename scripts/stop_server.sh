@@ -2,4 +2,5 @@
 set -euo pipefail
 
 pkill -f "streamlit run app.py" || true
+pkill -f "scripts/background_worker.py" || true
 echo "$(date '+%F %T') streamlit stop requested"

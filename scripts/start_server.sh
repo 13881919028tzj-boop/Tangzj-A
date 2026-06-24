@@ -21,4 +21,6 @@ if [ -f ".env" ]; then
 fi
 
 echo "$(date '+%F %T') starting AI Model on ${HOST}:${PORT}" >> logs/server.log
+echo "$(date '+%F %T') starting background worker" >> logs/background_worker.log
+nohup python scripts/background_worker.py >> logs/background_worker.log 2>&1 &
 python -m streamlit run app.py --server.address "$HOST" --server.port "$PORT" >> logs/server.log 2>&1

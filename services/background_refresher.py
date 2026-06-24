@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import threading
 import time
+import fcntl
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from services.binance_public import (
     get_all_24hr_tickers,
@@ -42,8 +44,11 @@ from services import market_cache
 
 _STARTED = False
 _START_LOCK = threading.Lock()
+_THREADS: dict[str, threading.Thread] = {}
+_LOCK_HANDLE: Any | None = None
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LIVE_CACHE_LOG = LOG_DIR / "live_cache_debug.log"
+REFRESHER_LOCK = LOG_DIR / "background_refresher.lock"
 MAX_PRIORITY_REFRESH_PER_LOOP = 4
 
 
@@ -55,6 +60,40 @@ def _debug_log(path: Path, message: str) -> None:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except Exception:
         pass
+
+
+def _acquire_process_lock_locked() -> bool:
+    """Ensure only one process owns the background trading refresh loop."""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return True
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handle = REFRESHER_LOCK.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.flush()
+        _LOCK_HANDLE = handle
+        return True
+    except BlockingIOError:
+        _debug_log(LIVE_CACHE_LOG, "background_refresher_already_locked")
+        return False
+    except Exception as exc:
+        _debug_log(LIVE_CACHE_LOG, f"background_refresher_lock_failed error={repr(exc)}")
+        return True
+
+
+def _start_thread_locked(name: str, target: Callable[[], None]) -> bool:
+    existing = _THREADS.get(name)
+    if existing and existing.is_alive():
+        return False
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    _THREADS[name] = thread
+    _debug_log(LIVE_CACHE_LOG, f"background_thread_started name={name}")
+    return True
 
 
 def _standard_ticker(row: dict[str, Any]) -> dict[str, Any]:
@@ -374,22 +413,58 @@ def _whale_worker() -> None:
         time.sleep(max(0.05, 5.0 - (time.monotonic() - started_at)))
 
 
+def _worker_specs() -> tuple[tuple[str, Callable[[], None]], ...]:
+    return (
+        ("market-cache-refresher", _worker),
+        ("ticker-cache-refresher", _ticker_worker),
+        ("kline-cache-refresher", _kline_worker),
+        ("orderbook-cache-refresher", _orderbook_worker),
+        ("derivatives-cache-refresher", _derivatives_worker),
+        ("whale-cache-refresher", _whale_worker),
+    )
+
+
+def _ensure_worker_threads_locked() -> int:
+    started = 0
+    for name, target in _worker_specs():
+        if _start_thread_locked(name, target):
+            started += 1
+    return started
+
+
+def _watchdog_worker() -> None:
+    """Restart background refresh threads if a worker exits unexpectedly."""
+    while True:
+        time.sleep(15)
+        try:
+            with _START_LOCK:
+                restarted = _ensure_worker_threads_locked()
+            if restarted:
+                _debug_log(LIVE_CACHE_LOG, f"background_watchdog_restarted count={restarted}")
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"background_watchdog_failed error={repr(exc)}")
+
+
 def start_background_refresher() -> None:
-    """启动后台刷新服务，只启动一次。"""
+    """启动后台刷新服务；已启动时会检查线程存活并补齐。"""
     global _STARTED
     with _START_LOCK:
-        if _STARTED:
+        if not _acquire_process_lock_locked():
             return
-        market_thread = threading.Thread(target=_worker, name="market-cache-refresher", daemon=True)
-        ticker_thread = threading.Thread(target=_ticker_worker, name="ticker-cache-refresher", daemon=True)
-        kline_thread = threading.Thread(target=_kline_worker, name="kline-cache-refresher", daemon=True)
-        orderbook_thread = threading.Thread(target=_orderbook_worker, name="orderbook-cache-refresher", daemon=True)
-        derivatives_thread = threading.Thread(target=_derivatives_worker, name="derivatives-cache-refresher", daemon=True)
-        whale_thread = threading.Thread(target=_whale_worker, name="whale-cache-refresher", daemon=True)
-        market_thread.start()
-        ticker_thread.start()
-        kline_thread.start()
-        orderbook_thread.start()
-        derivatives_thread.start()
-        whale_thread.start()
+        started = _ensure_worker_threads_locked()
+        _start_thread_locked("background-refresher-watchdog", _watchdog_worker)
+        if started or not _STARTED:
+            _debug_log(LIVE_CACHE_LOG, f"background_refresher_ready started={started}")
         _STARTED = True
+
+
+def run_background_refresher_forever() -> None:
+    """Run the background refresher without requiring a Streamlit page session."""
+    start_background_refresher()
+    _debug_log(LIVE_CACHE_LOG, "background_refresher_forever_started")
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    run_background_refresher_forever()
