@@ -225,7 +225,7 @@ def test_early_exit_shadow_records_30m_and_60m_results(tmp_path):
         "notional_usdt": 200.0,
         "leverage": 5,
         "open_time": "2026-06-22 00:00:00",
-        "open_ts": sim._ts() - 900,
+        "open_ts": sim._ts() - 1300,
         "stop_loss": 98.0,
     }
 
@@ -328,6 +328,53 @@ def test_corrupted_positions_restore_from_last_good_backup(tmp_path):
     assert sim._positions_last_good_path().exists()
 
 
+def test_early_exit_closes_and_opens_reverse_position_with_expanded_targets(tmp_path):
+    prepare_running_account(tmp_path)
+    position = {
+        "position_id": "reverse_case_1",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+        "status": "open",
+        "entry_price": 100.0,
+        "current_price": 100.0,
+        "quantity": 2.0,
+        "margin_usdt": 40.0,
+        "notional_usdt": 200.0,
+        "leverage": 5,
+        "market_type": "futures",
+        "contract_type": "USDT_PERPETUAL",
+        "open_time": "2026-06-24 00:00:00",
+        "open_ts": sim._ts() - 1300,
+        "stop_loss": 98.0,
+        "take_profit_1": 102.0,
+        "take_profit_2": 104.0,
+        "committee_snapshot": {"position_suggestion": "3%-5%"},
+        "local_strategy_snapshot": {},
+    }
+    sim.save_positions([position])
+    account = sim.load_sim_account()
+    account["available_balance"] = 960.0
+    account["used_margin"] = 40.0
+    account["equity"] = 1000.0
+    sim.save_sim_account(account)
+
+    sim.update_sim_positions({"BTCUSDT": 98.5}, {"BTCUSDT": "live"})
+    positions = sim.load_positions()
+    closed = [p for p in positions if p.get("position_id") == "reverse_case_1"][0]
+    reverse = [p for p in positions if p.get("status") == "open"][0]
+
+    assert closed["status"] == "closed"
+    assert closed["close_reason"] == "反向复核提前退出"
+    assert reverse["direction"] == "short"
+    assert reverse["reverse_from_early_exit"] is True
+    assert reverse["reverse_source_position_id"] == "reverse_case_1"
+    assert abs(reverse["margin_usdt"] - 40.0) < 1e-9
+    assert abs(reverse["notional_usdt"] - 200.0) < 1e-9
+    assert abs(reverse["stop_loss"] - 102.5) < 1e-9
+    assert abs(reverse["take_profit_1"] - 94.5) < 1e-9
+    assert abs(reverse["take_profit_2"] - 90.5) < 1e-9
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_create_pending_order_from_committee_signal(Path(raw) / "case1")
@@ -357,4 +404,6 @@ if __name__ == "__main__":
         test_sim_fee_and_slippage_are_applied_to_entry_and_exit(Path(raw) / "case12")
     with tempfile.TemporaryDirectory() as raw:
         test_corrupted_positions_restore_from_last_good_backup(Path(raw) / "case13")
+    with tempfile.TemporaryDirectory() as raw:
+        test_early_exit_closes_and_opens_reverse_position_with_expanded_targets(Path(raw) / "case14")
     print("sim_trade_engine tests passed")

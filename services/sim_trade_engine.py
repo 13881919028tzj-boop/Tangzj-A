@@ -66,8 +66,8 @@ DEFAULT_SETTINGS = {
     "dynamic_stop_loss_low_risk_pct": 1.55,
     "dynamic_take_profit_1_r": 1.0,
     "dynamic_take_profit_2_r": 2.4,
-    "early_exit_min_seconds": 600,
-    "early_exit_adverse_r": 0.5,
+    "early_exit_min_seconds": 1200,
+    "early_exit_adverse_r": 0.6,
     "sim_fee_rate": 0.0004,
     "sim_slippage_pct": 0.0003,
 }
@@ -1131,6 +1131,96 @@ def check_committee_reversal(position: dict[str, Any]) -> tuple[bool, str]:
     return False, ""
 
 
+def _reverse_direction(direction: str) -> str:
+    return "short" if str(direction) == "long" else "long"
+
+
+def _expanded_reverse_exit_plan(position: dict[str, Any], price: float, reverse_direction: str) -> tuple[float, float, float]:
+    price = _to_float(price, 0)
+    entry = _to_float(position.get("entry_price"), price)
+    old_stop = _to_float(position.get("stop_loss"), 0)
+    old_tp1 = _to_float(position.get("take_profit_1"), 0)
+    old_tp2 = _to_float(position.get("take_profit_2"), 0)
+    stop_distance = abs(entry - old_stop) * 2 if old_stop > 0 else price * 0.025
+    tp1_distance = abs(old_tp1 - entry) * 2 if old_tp1 > 0 else stop_distance * 1.0
+    tp2_distance = abs(old_tp2 - entry) * 2 if old_tp2 > 0 else stop_distance * 2.4
+    if reverse_direction == "short":
+        return price + stop_distance, price - tp1_distance, price - tp2_distance
+    return price - stop_distance, price + tp1_distance, price + tp2_distance
+
+
+def open_reverse_position_after_early_exit(position: dict[str, Any], price: float, r_multiple: float | None = None) -> dict[str, Any]:
+    reverse_direction = _reverse_direction(str(position.get("direction")))
+    stop, tp1, tp2 = _expanded_reverse_exit_plan(position, price, reverse_direction)
+    snapshot = dict(position.get("committee_snapshot") or {})
+    snapshot.update(
+        {
+            "symbol": position.get("symbol"),
+            "direction": reverse_direction,
+            "action": "反向复核反手开仓",
+            "trade_permission": "approved",
+            "approved_for_simulation": True,
+            "position_suggestion": position.get("position_pct") or snapshot.get("position_suggestion") or "反向同仓",
+            "chairman_summary": f"反向复核触发后自动反手，沿用原保证金 {float(_to_float(position.get('margin_usdt'), 0)):.2f} USDT，止盈止损距离扩大一倍。",
+        }
+    )
+    order = {
+        "order_id": f"sim_reverse_{int(time.time() * 1000)}",
+        "symbol": position.get("symbol"),
+        "direction": reverse_direction,
+        "action": "反向复核反手开仓",
+        "status": "filled",
+        "entry_zone_low": price,
+        "entry_zone_high": price,
+        "planned_entry_price": price,
+        "stop_loss": stop,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "dynamic_stop_loss_pct": abs(price - stop) / price * 100 if price else 0,
+        "dynamic_take_profit_1_r": "",
+        "dynamic_take_profit_2_r": "",
+        "exit_plan_source": "early_exit_reverse_expanded",
+        "structure_exit_plan": {
+            "valid": True,
+            "source": "early_exit_reverse_expanded",
+            "reason": "反向复核触发反手，止损和止盈距离按原仓扩大一倍。",
+            "original_position_id": position.get("position_id"),
+            "early_exit_r_multiple": r_multiple,
+        },
+        "position_pct": position.get("position_pct") or (position.get("committee_snapshot") or {}).get("position_suggestion") or "反向同仓",
+        "notional_usdt": _to_float(position.get("notional_usdt"), 0),
+        "margin_usdt": _to_float(position.get("margin_usdt"), 0),
+        "quantity": _to_float(position.get("notional_usdt"), 0) / price if price > 0 else 0,
+        "leverage": int(position.get("leverage", 1) or 1),
+        "market_type": position.get("market_type", "futures"),
+        "contract_type": position.get("contract_type", "USDT_PERPETUAL"),
+        "source": "反向复核自动反手",
+        "committee_snapshot": snapshot,
+        "local_strategy_snapshot": position.get("local_strategy_snapshot") or {},
+        "reason": snapshot.get("chairman_summary", "反向复核触发自动反手。"),
+    }
+    reverse_position = open_sim_position(order, price)
+    if reverse_position:
+        rows = load_positions()
+        for row in rows:
+            if row.get("position_id") == reverse_position.get("position_id"):
+                row["reverse_from_early_exit"] = True
+                row["reverse_source_position_id"] = position.get("position_id")
+                row["reverse_source_r_multiple"] = r_multiple
+                row["open_reason"] = order["reason"]
+                break
+        save_positions(rows)
+        log_sim_event(
+            "反向复核反手开仓",
+            str(position.get("symbol") or ""),
+            reverse_direction,
+            price,
+            content=f"原仓反向复核退出后反手，保证金 {_to_float(order.get('margin_usdt'), 0):.2f} USDT，止盈止损距离扩大一倍。",
+            reason=f"source_position={position.get('position_id')}",
+        )
+    return reverse_position
+
+
 def close_sim_position(position_id: str, reason: str, price: float, ratio: float = 1.0) -> dict[str, Any] | None:
     positions = load_positions()
     history = load_sim_trade_history()
@@ -1289,8 +1379,8 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
     live_count = 0
     stale_count = 0
     missing_count = 0
-    early_exit_seconds = max(0, int(_to_float(settings.get("early_exit_min_seconds"), 600)))
-    early_exit_adverse_r = max(0.0, _to_float(settings.get("early_exit_adverse_r"), 0.5))
+    early_exit_seconds = max(0, int(_to_float(settings.get("early_exit_min_seconds"), 1200)))
+    early_exit_adverse_r = max(0.0, _to_float(settings.get("early_exit_adverse_r"), 0.6))
     for position in positions:
         if position.get("status") not in {"open", "partially_closed"}:
             continue
@@ -1334,6 +1424,7 @@ def update_sim_positions(current_prices: dict[str, float], price_statuses: dict[
             _debug_price_log(f"auto_close_trigger symbol={symbol} position={position.get('position_id')} reason=early_adverse_review price={price} r={r_multiple:.4f} status={status}")
             create_early_exit_shadow(position, price, r_multiple)
             close_sim_position(position["position_id"], "反向复核提前退出", price)
+            open_reverse_position_after_early_exit(position, price, r_multiple)
             external_position_change = True
             continue
         if can_auto_exit and check_stop_loss(position, price):
