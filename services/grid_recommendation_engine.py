@@ -43,6 +43,10 @@ def _candidate_rows(limit: int = 80) -> list[dict[str, Any]]:
                 continue
             merged = {**rows.get(symbol, {}), **dict(item or {})}
             rows[symbol] = merged
+    for symbol, ticker in (snapshot.get("tickers") or {}).items():
+        normalized = str(symbol or (ticker or {}).get("symbol") or "").upper()
+        if normalized.endswith("USDT"):
+            rows[normalized] = {**rows.get(normalized, {}), **dict(ticker or {})}
     if not rows:
         try:
             for ticker in get_all_24hr_tickers()[: max(limit, 80)]:

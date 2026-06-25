@@ -99,6 +99,18 @@ def _combined_trade_opportunities(rankings: dict[str, list[dict[str, Any]]] | No
     return sorted(by_symbol.values(), key=lambda row: safe_score(row.get("final_opportunity_score", row.get("opportunity_score")), -1), reverse=True)[:limit]
 
 
+def _with_live_ticker(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(row.get("symbol") or "").upper().strip()
+    ticker = market_cache.get_ticker(symbol) or {}
+    if not ticker:
+        return row
+    merged = dict(row)
+    for key in ("last_price", "current_price", "price_change_percent", "quote_volume", "high_price", "low_price", "updated_at"):
+        if ticker.get(key) is not None:
+            merged[key] = ticker.get(key)
+    return merged
+
+
 def _top10_precheck_map(rankings: dict[str, list[dict[str, Any]]] | None) -> dict[str, dict[str, Any]]:
     try:
         results = run_committee_top10_precheck(rankings, 10)
@@ -279,6 +291,7 @@ def render_trade_opportunity_board(
         unsafe_allow_html=True,
     )
     for index, row in enumerate(rows, start=1):
+        row = _with_live_ticker(row)
         medal_class = "gold" if index == 1 else "silver" if index == 2 else "bronze" if index == 3 else ""
         score = safe_score(row.get("final_opportunity_score", row.get("opportunity_score")))
         raw_score = safe_score(row.get("raw_opportunity_score"), score)

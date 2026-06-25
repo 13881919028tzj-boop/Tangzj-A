@@ -10,7 +10,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.background_refresher import run_background_refresher_forever
+from services.local_api_server import start_local_api_server
 
 
 if __name__ == "__main__":
+    start_local_api_server()
     run_background_refresher_forever()

@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 
 from components.ui import kline_href
+from services import market_cache
 from services.fast_opportunity_engine import get_fast_opportunity_status
 from services.watchlist_manager import add_to_watchlist, is_watched, remove_from_watchlist
 from utils.formatters import format_compact, format_percent, format_price, format_score, safe_number, safe_score
@@ -44,6 +45,18 @@ def watch_action_html(symbol: str, page: str, source: str) -> str:
     return f'<a class="watch-pill" href="?page={page}&symbol={symbol}&watch_add={symbol}" target="_self">加入观察池</a>'
 
 
+def _with_live_ticker(row: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(row.get("symbol") or "").upper().strip()
+    ticker = market_cache.get_ticker(symbol) or {}
+    if not ticker:
+        return row
+    merged = dict(row)
+    for key in ("last_price", "current_price", "price_change_percent", "quote_volume", "high_price", "low_price", "updated_at"):
+        if ticker.get(key) is not None:
+            merged[key] = ticker.get(key)
+    return merged
+
+
 def render_rank_list(title: str, rows: list[dict[str, Any]], mode: str) -> None:
     """Render a compact market ranking list."""
     st.markdown(f'<div class="list-card"><div class="module-title">{title}</div>', unsafe_allow_html=True)
@@ -52,9 +65,11 @@ def render_rank_list(title: str, rows: list[dict[str, Any]], mode: str) -> None:
         st.markdown('<div class="pending">正在获取行情</div>', unsafe_allow_html=True)
     active_page = st.session_state.active_page
     for index, row in enumerate(rows[:10], start=1):
+        row = _with_live_ticker(row)
         medal_class = "gold" if index == 1 else "silver" if index == 2 else "bronze" if index == 3 else ""
-        change_class = "green" if row["price_change_percent"] >= 0 else "red"
-        symbol = row["symbol"]
+        change = safe_number(row.get("price_change_percent"), 0) or 0
+        change_class = "green" if change >= 0 else "red"
+        symbol = str(row.get("symbol") or "")
         href = kline_href(symbol)
         st.markdown(
             f"""
@@ -63,10 +78,10 @@ def render_rank_list(title: str, rows: list[dict[str, Any]], mode: str) -> None:
                 <a class="rank-link" href="{href}" target="_self"><div class="opp-symbol"><span class="rank-index {medal_class}">#{index}</span> {symbol}</div></a>
                 <div class="opp-meta">点击查看K线图</div>
               </div>
-              <div class="opp-symbol">{format_price(row["last_price"])}</div>
+              <div class="opp-symbol">{format_price(row.get("last_price"))}</div>
               <div>{watch_action_html(symbol, active_page, title)}</div>
-              <div class="{change_class}" style="font-weight:900;">{format_percent(row["price_change_percent"])}</div>
-              <div class="rank-volume">{format_compact(row["quote_volume"])}</div>
+              <div class="{change_class}" style="font-weight:900;">{format_percent(change)}</div>
+              <div class="rank-volume">{format_compact(row.get("quote_volume"))}</div>
             </div>""",
             unsafe_allow_html=True,
         )
@@ -137,6 +152,7 @@ def render_opportunity_list(title: str, rows: list[dict[str, Any]], mode: str) -
         unsafe_allow_html=True,
     )
     for index, row in enumerate(rows[:10], start=1):
+        row = _with_live_ticker(row)
         symbol = row.get("symbol", "")
         opportunity_score = safe_score(row.get("final_opportunity_score", row.get("opportunity_score")))
         raw_score = safe_score(row.get("raw_opportunity_score"), opportunity_score)

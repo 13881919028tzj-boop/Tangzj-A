@@ -812,7 +812,7 @@ def render_signals(symbol: str, ticker: dict[str, Any] | None, scores: dict[str,
         live_ticker = market_cache.get_ticker(live_symbol) or ticker
         render_orderbook_system(live_symbol, live_ticker)
 
-        @fragment(run_every="15s")
+        @fragment(run_every="1s")
         def _live_signal_analysis() -> None:
             live_symbol = st.session_state.get("current_symbol", symbol)
             live_ticker = market_cache.get_ticker(live_symbol) or ticker

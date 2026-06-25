@@ -11,7 +11,7 @@ def frontend_api_client_js(function_name: str = "fetchLocalApiJson") -> str:
     return (
         """
       const LOCAL_API_PORT = "__PORT__";
-      const LOCAL_API_PORTS = Array.from(new Set([LOCAL_API_PORT, "8765", "8766", "8767", "8768", "8769", "8770", "8771", "8772", "8773", "8774"]));
+      const LOCAL_API_PORTS = Array.from(new Set(["8765", LOCAL_API_PORT, "8766", "8767", "8768", "8769", "8770", "8771", "8772", "8773", "8774"]));
       function localApiCandidateBases() {
         const candidates = [];
         const seen = new Set();

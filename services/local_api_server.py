@@ -14,11 +14,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from services import market_cache
-from services.binance_public import get_24hr_ticker
-from services.kline_service import get_klines
 from services.grid_trade_engine import get_grid_summary, load_grid_bots, update_grid_bots
 from services.orderbook_service import get_orderbook
-from services.whale_monitor import get_whale_snapshot
 
 
 _START_LOCK = threading.Lock()
@@ -35,14 +32,14 @@ def _json_default(value: Any) -> Any:
 
 def _kline_payload(symbol: str, interval: str) -> list[dict[str, Any]]:
     rows = market_cache.get_klines(symbol, interval)
-    if not rows or _klines_are_stale(rows, interval):
+    if not rows:
         market_cache.request_kline_refresh()
+        return []
+    if _klines_are_stale(rows, interval):
         try:
-            rows = get_klines(symbol, interval, limit=300)
-            market_cache.set_klines(symbol, interval, rows)
-        except Exception as exc:
-            market_cache.set_kline_error(f"K线REST兜底失败：{exc!r}")
-            rows = []
+            market_cache.request_kline_refresh()
+        except Exception:
+            pass
     result: list[dict[str, Any]] = []
     for row in rows:
         result.append(
@@ -73,28 +70,22 @@ def _klines_are_stale(rows: list[dict[str, Any]], interval: str) -> bool:
 
 
 def _ticker_payload(symbol: str) -> dict[str, Any]:
-    source = "binance_rest_live"
-    try:
-        ticker = get_24hr_ticker(symbol)
-        market_cache.set_ticker(symbol, ticker)
-    except Exception as exc:
-        ticker = market_cache.get_ticker(symbol)
-        source = "market_cache_stale_fallback"
-        market_cache.set_error(f"Ticker REST实时刷新失败，已回退缓存：{exc!r}")
-        if not ticker:
-            return {
-                "ok": False,
-                "error": "ticker_not_found",
-                "message": f"{symbol} 实时价格暂未写入缓存",
-                "symbol": symbol,
-                "last_price": None,
-                "price": None,
-                "price_change_percent": None,
-                "change_24h": None,
-                "updated_at": "",
-                "source": source,
-                "detail": f"Ticker REST实时刷新失败：{exc!r}",
-            }
+    ticker = market_cache.get_ticker(symbol)
+    if not ticker:
+        market_cache.request_refresh()
+        return {
+            "ok": True,
+            "error": "ticker_not_found",
+            "message": f"{symbol} 实时价格正在后台刷新",
+            "symbol": symbol,
+            "last_price": None,
+            "price": None,
+            "price_change_percent": None,
+            "change_24h": None,
+            "updated_at": "",
+            "source": "market_cache_pending",
+        }
+    market_cache.request_refresh()
     price = ticker.get("last_price")
     change = ticker.get("price_change_percent")
     return {
@@ -105,7 +96,7 @@ def _ticker_payload(symbol: str) -> dict[str, Any]:
         "change_24h": change,
         "price_change_percent": change,
         "updated_at": ticker.get("updated_at") or ticker.get("close_time") or "",
-        "source": source,
+        "source": "market_cache_realtime",
         **ticker,
     }
 
@@ -134,15 +125,10 @@ def _klines_response(symbol: str, interval: str) -> dict[str, Any]:
 
 
 def _orderbook_response(symbol: str) -> dict[str, Any]:
-    try:
-        orderbook = get_orderbook(symbol, limit=20)
-        market_cache.set_orderbook(symbol, orderbook)
-        return {"ok": True, "source": "local_api_rest_live", **orderbook}
-    except Exception as exc:
-        market_cache.set_orderbook_error(f"盘口REST兜底失败：{exc!r}")
     orderbook = market_cache.get_orderbook(symbol)
     if orderbook:
-        return {"ok": True, "source": "market_cache_stale_fallback", **orderbook}
+        market_cache.request_orderbook_refresh()
+        return {"ok": True, "source": "market_cache_realtime", **orderbook}
     market_cache.request_orderbook_refresh()
     snapshot = market_cache.snapshot()
     return {
@@ -166,17 +152,10 @@ def _empty_whale_stats() -> dict[str, dict[str, Any]]:
 
 
 def _whales_response(symbol: str) -> dict[str, Any]:
-    try:
-        ticker = market_cache.get_ticker(symbol) or get_24hr_ticker(symbol)
-        derivatives = market_cache.get_derivatives(symbol)
-        whales = get_whale_snapshot(symbol, ticker, derivatives)
-        market_cache.set_whales(symbol, whales)
-        return {"ok": True, "source": "local_api_rest_live", **whales}
-    except Exception as exc:
-        market_cache.set_whale_error(f"大单REST兜底失败：{exc!r}")
     whales = market_cache.get_whales(symbol)
     if whales:
-        return {"ok": True, "source": "market_cache_stale_fallback", **whales}
+        market_cache.request_whale_refresh()
+        return {"ok": True, "source": "market_cache_realtime", **whales}
     market_cache.request_whale_refresh()
     snapshot = market_cache.snapshot()
     message = snapshot.get("whale_last_error") or f"{symbol} 大单正在后台刷新"

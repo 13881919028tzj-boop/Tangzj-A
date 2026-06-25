@@ -42,7 +42,24 @@ BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 BINANCE_SPOT_TESTNET_BASE = "https://testnet.binance.vision"
 BINANCE_FUTURES_TESTNET_BASE = "https://testnet.binancefuture.com"
 
-LIVE_TRADING_ENABLED = str(os.environ.get("LIVE_TRADING_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+
+def _env_value(name: str, default: str = "") -> str:
+    if os.environ.get(name) is not None:
+        return str(os.environ.get(name) or "")
+    for path in [ROOT_DIR / ".env", Path.cwd() / ".env"]:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            if key.strip() == name:
+                return value.strip().strip('"').strip("'")
+    return default
+
+
+LIVE_TRADING_ENABLED = str(_env_value("LIVE_TRADING_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
 
 
 DEFAULT_SETTINGS = {
@@ -209,6 +226,35 @@ def check_api_connection(testnet: bool = False, market_type: str = "spot") -> di
         return {"status": "失败", "ok": False, "message": f"API连接失败：{exc}"}
 
 
+def check_api_key_restrictions(testnet: bool = False) -> dict[str, Any]:
+    """Check the actual Binance API-key level restrictions.
+
+    /api/v3/account can report account-level withdrawal availability. The
+    API-key restriction endpoint is the safer source for whether this key itself
+    can withdraw or transfer funds.
+    """
+    if testnet:
+        return {"ok": False, "message": "Testnet 不支持正式 API Key 权限限制检查。"}
+    credentials = load_api_credentials_safely(False)
+    if not credentials["configured"]:
+        return {"ok": False, "message": "API尚未配置，请先完成安全设置。"}
+    try:
+        data = _signed_get("/sapi/v1/account/apiRestrictions", {}, credentials, "spot", False)
+        safe = {
+            "ipRestrict": bool(data.get("ipRestrict")),
+            "enableWithdrawals": bool(data.get("enableWithdrawals")),
+            "enableInternalTransfer": bool(data.get("enableInternalTransfer")),
+            "permitsUniversalTransfer": bool(data.get("permitsUniversalTransfer")),
+            "enableReading": bool(data.get("enableReading")),
+            "enableSpotAndMarginTrading": bool(data.get("enableSpotAndMarginTrading")),
+            "enableFutures": bool(data.get("enableFutures")),
+            "enableMargin": bool(data.get("enableMargin")),
+        }
+        return {"ok": True, "message": "API Key 权限限制检查完成。", **safe}
+    except Exception as exc:
+        return {"ok": False, "message": f"API Key 权限限制检查失败：{exc}"}
+
+
 def check_api_permissions(testnet: bool = False, market_type: str = "spot") -> dict[str, Any]:
     credentials = load_api_credentials_safely(testnet)
     if not credentials["configured"]:
@@ -224,11 +270,27 @@ def check_api_permissions(testnet: bool = False, market_type: str = "spot") -> d
             can_trade = bool(data.get("canTrade"))
             can_withdraw = bool(data.get("canWithdraw"))
             balances = data.get("balances", [])
+        restrictions = check_api_key_restrictions(testnet) if not testnet else {"ok": False}
+        if restrictions.get("ok"):
+            can_withdraw = bool(restrictions.get("enableWithdrawals"))
+            if market_type == "spot":
+                can_trade = can_trade and bool(restrictions.get("enableSpotAndMarginTrading"))
+            elif market_type == "futures":
+                can_trade = can_trade and bool(restrictions.get("enableFutures"))
         status = "可交易" if can_trade else "只读"
         if can_withdraw:
             status = "权限异常"
         log_live_audit_event("API权限检查", mode="testnet" if testnet else "read_only", result=status, reason="已完成只读权限检查。")
-        return {"ok": True, "permission_status": status, "can_trade": can_trade, "can_withdraw": can_withdraw, "ip_restricted": "请在 Binance 后台确认", "balances_preview": len(balances), "message": "API权限检查完成。"}
+        return {
+            "ok": True,
+            "permission_status": status,
+            "can_trade": can_trade,
+            "can_withdraw": can_withdraw,
+            "ip_restricted": "已开启" if restrictions.get("ipRestrict") else "未开启" if restrictions.get("ok") else "请在 Binance 后台确认",
+            "balances_preview": len(balances),
+            "api_key_restrictions": restrictions,
+            "message": "API权限检查完成。",
+        }
     except Exception as exc:
         msg = str(exc)
         ip_hint = "可能未配置IP白名单或当前IP不在白名单内。" if "-2015" in msg or "Invalid API-key" in msg else "请检查 API Key / Secret 和网络。"

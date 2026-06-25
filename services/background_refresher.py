@@ -50,7 +50,7 @@ _LOCK_HANDLE: Any | None = None
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LIVE_CACHE_LOG = LOG_DIR / "live_cache_debug.log"
 REFRESHER_LOCK = LOG_DIR / "background_refresher.lock"
-MAX_PRIORITY_REFRESH_PER_LOOP = 4
+MAX_PRIORITY_REFRESH_PER_LOOP = 12
 
 
 def _debug_log(path: Path, message: str) -> None:
@@ -269,7 +269,7 @@ def _worker() -> None:
 
             market_cache.mark_status_ok()
             fast_settings = get_fast_opportunity_settings()
-            ranking_seconds = max(60, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 60) or 60))
+            ranking_seconds = max(3, int(fast_settings.get("TOP10_OPPORTUNITY_REFRESH_SECONDS", 3) or 3))
             if now - last_ranking_refresh >= ranking_seconds:
                 _refresh_rankings(symbols)
                 last_ranking_refresh = now
@@ -365,7 +365,7 @@ def _ticker_worker() -> None:
         except Exception as exc:
             print(f"[AI模型7.1.2] 行情后台刷新异常 error={repr(exc)}")
             market_cache.set_error("Binance行情获取失败，请检查网络或稍后重试。")
-        time.sleep(max(0.5, 5.0 - (time.monotonic() - started_at)))
+        time.sleep(max(0.05, 1.0 - (time.monotonic() - started_at)))
 
 
 def _kline_worker() -> None:

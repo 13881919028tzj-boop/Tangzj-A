@@ -138,12 +138,12 @@ NAV_ITEMS = [
     ("信号", "signals", "◇"),
     ("交易", "trading", "⇄"),
     ("网格", "grid_trading", "▦"),
+    ("自动", "auto_trade", "▶"),
     ("记录", "trade_records", "≡"),
     ("持仓", "positions", "▤"),
     ("学习", "learning", "▣"),
     ("策略", "strategy", "◎"),
     ("安全", "live", "◆"),
-    ("自动", "auto_trade", "▶"),
     ("数据", "dashboard", "▦"),
     ("远控", "remote", "▣"),
     ("服务器", "server", "▧"),
@@ -636,7 +636,11 @@ def render_page(page_key: str, symbol: str, ticker: dict[str, Any] | None, ranki
             build_current_local_strategy=build_current_local_strategy,
         )
     elif page_key == "market":
-        render_market_page(rankings, PAGE_TITLES, VERSION, render_trade_opportunity_board, render_rank_list, render_watchlist, render_opportunity_list)
+        def _render_market_live() -> None:
+            live_rankings = market_cache.get_rankings() or rankings or {}
+            render_market_page(live_rankings, PAGE_TITLES, VERSION, render_trade_opportunity_board, render_rank_list, render_watchlist, render_opportunity_list)
+
+        _fragment_1s(_render_market_live)()
     elif page_key == "signals":
         render_signals(symbol, ticker, scores, PAGE_TITLES, VERSION, lambda message: append_debug_log(SIGNAL_CHAIN_LOG, message))
     elif page_key == "trading":
