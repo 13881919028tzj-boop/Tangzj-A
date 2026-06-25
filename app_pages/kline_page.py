@@ -400,24 +400,32 @@ def frontend_kline_html(symbol: str, interval: str, visible_mas: list[str], char
       }}
       async function fetchKlinesLive() {{
         try {{
+          return await fetchKlineJson(`/api/klines?symbol=${{encodeURIComponent(symbol)}}&interval=${{encodeURIComponent(interval)}}`);
+        }} catch (localErr) {{
+          try {{
           const data = await fetchAnyJson([
             `https://api.binance.com/api/v3/klines?symbol=${{encodeURIComponent(symbol)}}&interval=${{encodeURIComponent(interval)}}&limit=300`,
             `https://fapi.binance.com/fapi/v1/klines?symbol=${{encodeURIComponent(symbol)}}&interval=${{encodeURIComponent(interval)}}&limit=300`
           ]);
           return {{source:"frontend_binance_klines", rows: normalizeDirectKlines(data)}};
-        }} catch (err) {{
-          return await fetchKlineJson(`/api/klines?symbol=${{encodeURIComponent(symbol)}}&interval=${{encodeURIComponent(interval)}}`);
+          }} catch (directErr) {{
+            throw localErr;
+          }}
         }}
       }}
       async function fetchTickerLive() {{
         try {{
+          return await fetchKlineJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
+        }} catch (localErr) {{
+          try {{
           const data = await fetchAnyJson([
             `https://api.binance.com/api/v3/ticker/24hr?symbol=${{encodeURIComponent(symbol)}}`,
             `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${{encodeURIComponent(symbol)}}`
           ]);
           return {{last_price: Number(data.lastPrice || data.price), source:"frontend_binance_ticker"}};
-        }} catch (err) {{
-          return await fetchKlineJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
+          }} catch (directErr) {{
+            throw localErr;
+          }}
         }}
       }}
 

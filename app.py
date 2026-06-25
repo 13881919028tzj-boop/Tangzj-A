@@ -94,6 +94,7 @@ from app_pages.profile_page import render_profile
 from app_pages.remote_page import render_remote_control_page
 from app_pages.live_page import render_live_trading_center
 from app_pages.auto_trade_page import render_approval_center_page
+from app_pages.grid_trading_page import render_grid_trading_page
 from app_pages.signals_page import render_committee_overview_window, render_signals, _safe_committee_text
 from app_state.session import (
     ensure_current_device,
@@ -136,6 +137,7 @@ NAV_ITEMS = [
     ("市场", "market", "▥"),
     ("信号", "signals", "◇"),
     ("交易", "trading", "⇄"),
+    ("网格", "grid_trading", "▦"),
     ("记录", "trade_records", "≡"),
     ("持仓", "positions", "▤"),
     ("学习", "learning", "▣"),
@@ -153,6 +155,7 @@ PAGE_TITLES = {
     "market": ("市场", "专业列表方式查看涨幅榜、跌幅榜和成交量榜。"),
     "signals": ("信号", "K线、均线、金叉死叉、本地策略和市场结构预留。"),
     "trading": ("交易", "模拟交易、人工交易和自动交易入口预留。"),
+    "grid_trading": ("网格交易", "独立本地模拟网格，区间挂单、成交记录和收益观察。"),
     "trade_records": ("交易记录", "查看持久化模拟交易记录、统计中心和自动复盘。"),
     "positions": ("持仓", "持仓、盈亏、成交记录和复盘入口预留。"),
     "learning": ("学习", "技术指标、市场结构和交易知识学习中心。"),
@@ -479,6 +482,12 @@ def _multi_review_map() -> dict[str, dict[str, Any]]:
 def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]] | None = None) -> None:
     """Keep the global current symbol, topbar and committee target anchored to opportunity TOP1."""
     current_source = str(st.session_state.get("current_symbol_source", ""))
+    if current_source == "grid_temp_view" and st.session_state.get("active_page") == "signals":
+        current = str(st.session_state.get("current_symbol", "")).upper().strip()
+        st.session_state["committee_active_symbol"] = current
+        st.session_state["committee_target_symbol"] = current
+        st.session_state["committee_anchor_source"] = "网格临时查看"
+        return
     if current_source == "manual_select" or current_source.endswith("_search") or current_source.startswith("watch_"):
         current = str(st.session_state.get("current_symbol", "")).upper().strip()
         st.session_state["committee_active_symbol"] = current
@@ -496,7 +505,7 @@ def anchor_current_symbol_to_fast_top1(rankings: dict[str, list[dict[str, Any]]]
         return
     selected_target = target
     selected_source = "opportunity_top1_default"
-    if selected_target != str(st.session_state.get("current_symbol", "")).upper() and current_source in {"", "default_bootstrap", "url_param", "opportunity_top1_default", "candidate_auto_switch", "opportunity_board_click"}:
+    if selected_target != str(st.session_state.get("current_symbol", "")).upper() and current_source in {"", "default_bootstrap", "url_param", "grid_temp_view", "opportunity_top1_default", "candidate_auto_switch", "opportunity_board_click"}:
         set_current_symbol(selected_target, source=selected_source)
     st.session_state["committee_active_symbol"] = selected_target
     st.session_state["committee_target_symbol"] = selected_target
@@ -632,6 +641,8 @@ def render_page(page_key: str, symbol: str, ticker: dict[str, Any] | None, ranki
         render_signals(symbol, ticker, scores, PAGE_TITLES, VERSION, lambda message: append_debug_log(SIGNAL_CHAIN_LOG, message))
     elif page_key == "trading":
         render_trading(build_current_committee_decision, PAGE_TITLES, VERSION)
+    elif page_key == "grid_trading":
+        render_grid_trading_page(PAGE_TITLES, VERSION, str(st.session_state.get("current_symbol", "BTCUSDT")))
     elif page_key == "trade_records":
         render_trade_records_page(PAGE_TITLES, VERSION)
     elif page_key == "positions":
@@ -757,6 +768,13 @@ def enforce_account_login() -> bool:
 def main() -> None:
     """应用入口。"""
     st.set_page_config(page_title=f"{APP_TITLE} - {VERSION}", page_icon="📱", layout="wide", initial_sidebar_state="collapsed")
+    try:
+        start_local_api_server()
+        if "前端行情API启动失败" in str(st.session_state.get("last_error") or ""):
+            st.session_state.pop("last_error", None)
+    except Exception as exc:
+        st.session_state["last_error"] = f"前端行情API启动失败，页面已降级运行：{exc!r}"
+    start_background_refresher()
     if not st.session_state.get("runtime_file_guard_done"):
         st.session_state["runtime_file_guard_events"] = ensure_runtime_files()
         st.session_state["runtime_file_guard_done"] = True
@@ -785,11 +803,6 @@ def main() -> None:
     ticker = market_cache.get_ticker(current_symbol)
     kline_rows = market_cache.get_klines(current_symbol, interval)
     scores = local_scores(ticker, kline_rows)
-    try:
-        start_local_api_server()
-    except Exception as exc:
-        st.session_state["last_error"] = f"前端行情API启动失败，页面已降级运行：{exc!r}"
-    start_background_refresher()
     inject_styles()
     render_fixed_market_bar(current_symbol, SIGNAL_CHAIN_LOG)
     render_error(snapshot)

@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from services import market_cache
 from services.binance_public import get_24hr_ticker
 from services.kline_service import get_klines
+from services.grid_trade_engine import get_grid_summary, load_grid_bots, update_grid_bots
 from services.orderbook_service import get_orderbook
 from services.whale_monitor import get_whale_snapshot
 
@@ -207,6 +208,68 @@ def _whales_response(symbol: str) -> dict[str, Any]:
     }
 
 
+def _orderbook_mid_price(orderbook: dict[str, Any] | None) -> float:
+    if not orderbook:
+        return 0.0
+    bids = orderbook.get("bids") if isinstance(orderbook, dict) else []
+    asks = orderbook.get("asks") if isinstance(orderbook, dict) else []
+    if not isinstance(bids, list) or not isinstance(asks, list) or not bids or not asks:
+        return 0.0
+    try:
+        bid = float((bids[0] or {}).get("price") if isinstance(bids[0], dict) else bids[0][0])
+        ask = float((asks[0] or {}).get("price") if isinstance(asks[0], dict) else asks[0][0])
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    if bid <= 0 or ask <= 0:
+        return 0.0
+    return (bid + ask) / 2
+
+
+def _grid_summary_response() -> dict[str, Any]:
+    price_map: dict[str, float] = {}
+    orderbooks: dict[str, Any] = {}
+    for bot in load_grid_bots():
+        if bot.get("status") not in {"running", "paused"}:
+            continue
+        symbol = str(bot.get("symbol") or "").upper().strip()
+        ticker = market_cache.get_ticker(symbol) or {}
+        try:
+            price = float(ticker.get("last_price") or bot.get("last_price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if symbol and price > 0:
+            price_map[symbol] = price
+        if symbol:
+            try:
+                orderbook = get_orderbook(symbol, limit=20)
+                market_cache.set_orderbook(symbol, orderbook)
+                orderbooks[symbol] = {"ok": True, "source": "grid_summary_live", **orderbook}
+                mid_price = _orderbook_mid_price(orderbook)
+                if mid_price > 0:
+                    price_map[symbol] = mid_price
+            except Exception as exc:
+                cached = market_cache.get_orderbook(symbol)
+                if cached:
+                    orderbooks[symbol] = {"ok": True, "source": "grid_summary_cache", **cached}
+                    mid_price = _orderbook_mid_price(cached)
+                    if mid_price > 0:
+                        price_map[symbol] = mid_price
+                else:
+                    orderbooks[symbol] = {
+                        "ok": False,
+                        "symbol": symbol,
+                        "bids": [],
+                        "asks": [],
+                        "source": "grid_summary_unavailable",
+                        "message": f"盘口暂不可用：{exc!r}",
+                    }
+    if price_map:
+        update_grid_bots(price_map)
+    summary = get_grid_summary(price_map)
+    summary["orderbooks"] = orderbooks
+    return {"ok": True, "source": "grid_trade_engine", **summary}
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AIModelLocalAPI/7.1.2"
 
@@ -242,6 +305,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(_orderbook_response(symbol))
             elif parsed.path == "/api/whales":
                 self._send_json(_whales_response(symbol))
+            elif parsed.path == "/api/grid_summary":
+                self._send_json(_grid_summary_response())
             elif parsed.path == "/api/snapshot":
                 self._send_json(market_cache.snapshot())
             else:

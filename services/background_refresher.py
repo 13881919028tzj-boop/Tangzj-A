@@ -34,6 +34,7 @@ from services.fast_opportunity_engine import (
     process_top1_fast_opportunity,
 )
 from services.auto_simulation_runner import run_auto_simulation_cycle
+from services.grid_trade_engine import load_grid_bots, update_grid_bots
 from services.live_auto_pilot import run_live_auto_trading_cycle
 from services.watchlist_manager import sync_watchlist_from_rankings
 from services.market_oi import get_derivatives_snapshot
@@ -232,6 +233,20 @@ def _refresh_rankings(symbols: list[str]) -> None:
         except Exception as sim_exc:
             print(f"[AI模型8.5] 后台自动模拟循环失败，不影响行情刷新。error={repr(sim_exc)}")
         try:
+            grid_prices = {}
+            for bot in load_grid_bots():
+                if bot.get("status") != "running":
+                    continue
+                symbol = str(bot.get("symbol") or "").upper().strip()
+                ticker = market_cache.get_ticker(symbol) or {}
+                price = float(ticker.get("last_price") or 0)
+                if symbol and price > 0:
+                    grid_prices[symbol] = price
+            if grid_prices:
+                update_grid_bots(grid_prices)
+        except Exception as grid_exc:
+            print(f"[网格交易] 后台网格模拟循环失败，不影响行情刷新。error={repr(grid_exc)}")
+        try:
             run_live_auto_trading_cycle(rankings)
         except Exception as live_auto_exc:
             print(f"[AI模型9.0] 后台自动交易循环失败，不影响行情刷新。error={repr(live_auto_exc)}")
@@ -286,6 +301,14 @@ def _ticker_worker() -> None:
                     positions.append(symbol)
         except Exception as exc:
             _debug_log(LIVE_CACHE_LOG, f"priority_sim_positions_failed error={repr(exc)}")
+        try:
+            for bot in load_grid_bots():
+                if bot.get("status") == "running":
+                    symbol = str(bot.get("symbol") or "").upper().strip()
+                    if symbol:
+                        positions.append(symbol)
+        except Exception as exc:
+            _debug_log(LIVE_CACHE_LOG, f"priority_grid_bots_failed error={repr(exc)}")
         try:
             for position in load_live_auto_positions(1000):
                 if position.get("status") == "open":

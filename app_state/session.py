@@ -63,6 +63,7 @@ def init_state(page_titles: dict[str, tuple[str, str]], ma_options: list[str]) -
     page = st.query_params.get("page", "home")
     st.session_state.active_page = page if page in page_titles else "home"
     query_symbol = str(st.query_params.get("symbol", "") or "").upper().strip()
+    grid_view = str(st.query_params.get("grid_view", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     watch_add_symbol = str(st.query_params.get("watch_add", "") or "").upper().strip()
     initial_symbol = query_symbol or market_cache.get_current_symbol()
     st.session_state.setdefault("current_symbol", initial_symbol)
@@ -74,7 +75,9 @@ def init_state(page_titles: dict[str, tuple[str, str]], ma_options: list[str]) -
     st.session_state.setdefault("chart_interactive", False)
     st.session_state.setdefault("watchlist", [])
     if query_symbol and query_symbol != st.session_state.current_symbol:
-        set_current_symbol(query_symbol, source="url_param")
+        set_current_symbol(query_symbol, source="grid_temp_view" if grid_view else "url_param")
+    elif query_symbol and grid_view:
+        st.session_state["current_symbol_source"] = "grid_temp_view"
     if watch_add_symbol:
         add_to_watchlist(watch_add_symbol, source="市场榜单", category="ai")
     market_cache.set_current_symbol(st.session_state.current_symbol)

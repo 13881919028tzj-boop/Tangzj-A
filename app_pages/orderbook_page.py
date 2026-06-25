@@ -257,24 +257,32 @@ def frontend_orderbook_html(
       }}
       async function fetchDepthLive() {{
         try {{
+          return await fetchOrderbookJson(`/api/orderbook?symbol=${{encodeURIComponent(symbol)}}`);
+        }} catch (localErr) {{
+          try {{
           const data = await fetchAnyJson([
             `https://api.binance.com/api/v3/depth?symbol=${{encodeURIComponent(symbol)}}&limit=20`,
             `https://fapi.binance.com/fapi/v1/depth?symbol=${{encodeURIComponent(symbol)}}&limit=20`
           ]);
           return normalizeDirectDepth(data);
-        }} catch (err) {{
-          return await fetchOrderbookJson(`/api/orderbook?symbol=${{encodeURIComponent(symbol)}}`);
+          }} catch (directErr) {{
+            throw localErr;
+          }}
         }}
       }}
       async function fetchTickerLive() {{
         try {{
+          return await fetchOrderbookJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
+        }} catch (localErr) {{
+          try {{
           const data = await fetchAnyJson([
             `https://api.binance.com/api/v3/ticker/24hr?symbol=${{encodeURIComponent(symbol)}}`,
             `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${{encodeURIComponent(symbol)}}`
           ]);
           return normalizeDirectTicker(data);
-        }} catch (err) {{
-          return await fetchOrderbookJson(`/api/ticker?symbol=${{encodeURIComponent(symbol)}}`);
+          }} catch (directErr) {{
+            throw localErr;
+          }}
         }}
       }}
       function buildFrontendWhale(trades) {{
@@ -337,14 +345,18 @@ def frontend_orderbook_html(
       }}
       async function fetchWhaleLive() {{
         try {{
+          return await fetchOrderbookJson(`/api/whales?symbol=${{encodeURIComponent(symbol)}}`);
+        }} catch (localErr) {{
+          try {{
           const data = await fetchAnyJson([
             `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${{encodeURIComponent(symbol)}}&limit=1000`,
             `https://api.binance.com/api/v3/aggTrades?symbol=${{encodeURIComponent(symbol)}}&limit=1000`
           ]);
           frontCache.trades = Array.isArray(data) ? data : [];
           return buildFrontendWhale(frontCache.trades);
-        }} catch (err) {{
-          return await fetchOrderbookJson(`/api/whales?symbol=${{encodeURIComponent(symbol)}}`);
+          }} catch (directErr) {{
+            throw localErr;
+          }}
         }}
       }}
       function clean(v) {{ return String(v).replace(/0+$/,'').replace(/\\.$/,''); }}
