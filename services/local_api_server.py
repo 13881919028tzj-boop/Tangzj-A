@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,7 @@ from services.whale_monitor import get_whale_snapshot
 _START_LOCK = threading.Lock()
 _STARTED = False
 _PORT = 8765
+_INTERVAL_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
 def _json_default(value: Any) -> Any:
@@ -33,7 +35,7 @@ def _json_default(value: Any) -> Any:
 
 def _kline_payload(symbol: str, interval: str) -> list[dict[str, Any]]:
     rows = market_cache.get_klines(symbol, interval)
-    if not rows:
+    if not rows or _klines_are_stale(rows, interval):
         market_cache.request_kline_refresh()
         try:
             rows = get_klines(symbol, interval, limit=300)
@@ -57,16 +59,29 @@ def _kline_payload(symbol: str, interval: str) -> list[dict[str, Any]]:
     return result
 
 
+def _klines_are_stale(rows: list[dict[str, Any]], interval: str) -> bool:
+    if not rows:
+        return True
+    latest = rows[-1]
+    close_time = latest.get("close_time") or latest.get("closeTime")
+    try:
+        close_ts = float(close_time) / 1000
+    except (TypeError, ValueError):
+        return True
+    interval_seconds = _INTERVAL_SECONDS.get(str(interval or "1m"), 60)
+    return time.time() > close_ts + min(5, max(2, interval_seconds * 0.1))
+
+
 def _ticker_payload(symbol: str) -> dict[str, Any]:
-    ticker = market_cache.get_ticker(symbol)
-    source = "market_cache"
-    if not ticker:
-        try:
-            ticker = get_24hr_ticker(symbol)
-            market_cache.set_ticker(symbol, ticker)
-            source = "binance_rest_fallback"
-        except Exception as exc:
-            market_cache.set_error(f"Ticker REST回退失败：{exc!r}")
+    source = "binance_rest_live"
+    try:
+        ticker = get_24hr_ticker(symbol)
+        market_cache.set_ticker(symbol, ticker)
+    except Exception as exc:
+        ticker = market_cache.get_ticker(symbol)
+        source = "market_cache_stale_fallback"
+        market_cache.set_error(f"Ticker REST实时刷新失败，已回退缓存：{exc!r}")
+        if not ticker:
             return {
                 "ok": False,
                 "error": "ticker_not_found",
@@ -78,7 +93,7 @@ def _ticker_payload(symbol: str) -> dict[str, Any]:
                 "change_24h": None,
                 "updated_at": "",
                 "source": source,
-                "detail": f"Ticker REST回退失败：{exc!r}",
+                "detail": f"Ticker REST实时刷新失败：{exc!r}",
             }
     price = ticker.get("last_price")
     change = ticker.get("price_change_percent")
