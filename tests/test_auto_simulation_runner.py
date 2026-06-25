@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services import auto_simulation_runner as runner
+from services import sim_observation_engine as obs
 from services import sim_trade_engine as sim
 
 
@@ -28,6 +29,8 @@ def use_temp_store(tmp_path):
     sim.EQUITY_JSON_PATH = tmp_path / "sim_equity_curve.json"
     sim.EQUITY_CSV_PATH = tmp_path / "sim_equity_curve.csv"
     sim.EARLY_EXIT_SHADOW_PATH = tmp_path / "sim_early_exit_shadow.json"
+    obs.DATA_DIR = tmp_path
+    obs.OBSERVATION_PATH = tmp_path / "sim_observation_signals.json"
     tmp_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -160,6 +163,25 @@ def test_price_map_includes_pending_early_exit_shadow_symbol(tmp_path, monkeypat
     assert prices["ETHUSDT"] == 123.0
 
 
+def test_price_map_includes_pending_observation_symbol(tmp_path, monkeypatch):
+    use_temp_store(tmp_path)
+    obs.record_observation_signal(
+        symbol="SOLUSDT",
+        direction="long",
+        entry_price=100.0,
+        rank=1,
+        reasons=["专业预审未进入 open_now。"],
+        row={"entry_state": "waiting_retest"},
+        precheck={},
+        scores={"professional_trade_score": 65, "simulation_score": 64},
+    )
+    monkeypatch.setattr(runner, "_fetch_live_price", lambda symbol: 99.0 if symbol == "SOLUSDT" else 0.0)
+
+    prices = runner._build_price_map([])
+
+    assert prices["SOLUSDT"] == 99.0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as raw:
         test_confirmed_short_precheck_becomes_sim_signal(Path(raw) / "case1")
@@ -173,4 +195,6 @@ if __name__ == "__main__":
         test_auto_sim_rejects_poor_liquidity_quality(Path(raw) / "case5")
     with tempfile.TemporaryDirectory() as raw:
         test_price_map_includes_pending_early_exit_shadow_symbol(Path(raw) / "case6", SimpleMonkeyPatch())
+    with tempfile.TemporaryDirectory() as raw:
+        test_price_map_includes_pending_observation_symbol(Path(raw) / "case7", SimpleMonkeyPatch())
     print("auto_simulation_runner tests passed")

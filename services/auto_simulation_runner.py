@@ -26,6 +26,11 @@ from services.sim_trade_engine import (
     update_simulation,
 )
 from services.sim_calibration_engine import evaluate_signal_ev, extract_calibration_tags
+from services.sim_observation_engine import (
+    get_pending_observation_symbols,
+    record_observation_signal,
+    update_observation_signals,
+)
 
 
 _LAST_RUN_AT = 0.0
@@ -114,6 +119,7 @@ def _build_price_map(opportunities: list[dict[str, Any]]) -> dict[str, float]:
     symbols.update(str(item.get("symbol") or "").upper() for item in get_open_positions())
     symbols.update(str(item.get("symbol") or "").upper() for item in get_pending_orders())
     symbols.update(get_pending_early_exit_shadow_symbols())
+    symbols.update(get_pending_observation_symbols())
     price_map: dict[str, float] = {}
     statuses: dict[str, str] = {}
     by_symbol = {str(item.get("symbol") or "").upper(): item for item in opportunities}
@@ -395,6 +401,7 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
                 portfolio_fit = _to_int(row.get("portfolio_fit_score"), 75)
                 price = _price(row)
                 direction = str(precheck.get("direction") or row.get("trade_direction") or _direction(row, precheck))
+                ev_check: dict[str, Any] = {}
                 reasons = _sampling_reject_reasons(symbol, price, score, simulation_score, base_quality, liquidity_quality, portfolio_fit, risk)
                 if direction not in {"long", "short"}:
                     reasons.append("方向不是 long/short。")
@@ -416,6 +423,24 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
                     )
                     if not ev_check.get("allowed"):
                         reasons.append(ev_check.get("reason") or "同类历史EV不支持开仓。")
+                record_observation_signal(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=price,
+                    rank=int(precheck.get("rank", 0) or 0),
+                    reasons=reasons,
+                    row=row,
+                    precheck=precheck,
+                    ev_check=ev_check,
+                    scores={
+                        "professional_trade_score": score,
+                        "simulation_score": simulation_score,
+                        "base_quality_score": base_quality,
+                        "liquidity_quality_score": liquidity_quality,
+                        "portfolio_fit_score": portfolio_fit,
+                        "risk_score": risk,
+                    },
+                )
                 append_sim_diagnostic(
                     "自动模拟候选拒绝",
                     symbol,
@@ -436,6 +461,7 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
                     },
                 )
     summary = update_simulation(price_map, signals, _LAST_PRICE_STATUS)
+    observation_summary = update_observation_signals(price_map)
     _debug_log(f"update_simulation signals={len(signals)} prices={len(price_map)}")
     if signals:
         log_sim_event("后台自动模拟扫描", content=f"本轮候选 {len(signals)} 个，已交给模拟风控执行。")
@@ -446,4 +472,4 @@ def run_auto_simulation_cycle(rankings: dict[str, list[dict[str, Any]]] | None =
             reason="本轮无可执行模拟信号。",
             details={"opportunities": len(opportunities), "prices": len(price_map)},
         )
-    return {"ok": True, "signals": len(signals), "prices": len(price_map), "summary": summary}
+    return {"ok": True, "signals": len(signals), "prices": len(price_map), "summary": summary, "observations": observation_summary}
