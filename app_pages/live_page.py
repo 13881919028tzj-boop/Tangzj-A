@@ -154,8 +154,9 @@ def render_live_trading_center(page_titles: dict[str, tuple[str, str]], version:
             new_settings["daily_live_notional_limit_usdt"] = st.number_input("单日真实交易总额上限 USDT", min_value=10.0, max_value=500.0, value=float(settings.get("daily_live_notional_limit_usdt", 100)), step=10.0)
             new_settings["daily_live_loss_limit_usdt"] = st.number_input("单日真实亏损上限 USDT", min_value=1.0, max_value=100.0, value=float(settings.get("daily_live_loss_limit_usdt", 5)), step=1.0)
             new_settings["max_live_risk_pct"] = st.number_input("单笔真实风险上限 %", min_value=0.1, max_value=5.0, value=float(settings.get("max_live_risk_pct", 0.5)), step=0.1)
-            symbols_text = st.text_input("允许实盘候选交易对象", value=",".join(settings.get("allowed_symbols", ["BTCUSDT", "ETHUSDT"])))
-            new_settings["allowed_symbols"] = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
+            new_settings["enforce_allowed_symbols"] = False
+            new_settings["allowed_symbols"] = settings.get("allowed_symbols", [])
+            st.info("币种白名单已关闭，所有交易对只按交易所规则、权限、额度和风控检查。")
             if st.form_submit_button("保存安全配置", width="stretch"):
                 save_live_settings(new_settings)
                 st.success("安全配置已保存。真实提交仍要求 LIVE_TRADING_ENABLED=true、Spot Test Order 和确认短句。")
@@ -534,7 +535,7 @@ def render_live_trading_center(page_titles: dict[str, tuple[str, str]], version:
             """
             <div class="app-shell"><div class="module-card warning-box">
               <b>小资金自动实盘试运行提示</b><br>
-              LIVE_AUTO_PILOT 是小资金全自动试运行层。默认关闭，只有通过准入检查、白名单、额度限制、冷却、熔断、交易所规则和对应 Test Order 后，才允许提交极小资金真实 Spot 或 U本位合约订单。
+              LIVE_AUTO_PILOT 是小资金全自动试运行层。默认关闭，只有通过准入检查、额度限制、冷却、熔断、交易所规则和对应 Test Order 后，才允许提交极小资金真实 Spot 或 U本位合约订单。
             </div></div>
             """,
             unsafe_allow_html=True,
@@ -572,8 +573,9 @@ def render_live_trading_center(page_titles: dict[str, tuple[str, str]], version:
             st.markdown("**自动试运行配置**")
             with st.form("live_auto_config_form"):
                 new_config = dict(auto_config)
-                symbols_text = st.text_input("自动实盘白名单", value=",".join(auto_config.get("allowed_symbols") or ["BTCUSDT", "ETHUSDT"]))
-                new_config["allowed_symbols"] = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
+                new_config["enforce_allowed_symbols"] = False
+                new_config["allowed_symbols"] = auto_config.get("allowed_symbols") or []
+                st.info("币种白名单已关闭，所有交易对只按交易所规则、权限、额度和风控检查。")
                 new_config["max_order_usdt"] = st.number_input("单笔自动真实订单上限 USDT", min_value=1.0, max_value=50.0, value=float(auto_config.get("max_order_usdt", 5) or 5), step=1.0)
                 new_config["daily_limit_usdt"] = st.number_input("单日自动真实额度上限 USDT", min_value=5.0, max_value=200.0, value=float(auto_config.get("daily_limit_usdt", 20) or 20), step=5.0)
                 new_config["max_positions"] = st.number_input("最大同时自动真实持仓", min_value=1, max_value=5, value=int(auto_config.get("max_positions", 1) or 1), step=1)
@@ -685,7 +687,7 @@ def render_live_trading_center(page_titles: dict[str, tuple[str, str]], version:
                     ("金额", f"{float(auto_plan.get('quote_amount', 0) or 0):.2f} USDT", "yellow"),
                 ]
             )
-            st.caption("该计划不是订单。点击执行前，仍需通过自动试运行开关、白名单、额度、交易所规则和对应 Test Order。")
+            st.caption("该计划不是订单。点击执行前，仍需通过自动试运行开关、额度、交易所规则和对应 Test Order。")
             if st.button("执行自动试运行订单（极小资金）", width="stretch"):
                 st.session_state["live_auto_execute_result"] = execute_live_auto_spot_order(auto_plan)
                 st.rerun()

@@ -1,6 +1,6 @@
 """小资金自动实盘试运行安全版。
 
-LIVE_AUTO_PILOT 是小资金全自动试运行层。默认关闭，强白名单、极小额度、
+LIVE_AUTO_PILOT 是小资金全自动试运行层。默认关闭，极小额度、
 冷却、熔断和审计；真实 Spot / U本位合约订单必须经过对应 Test Order 与实盘安全链路。
 """
 
@@ -55,6 +55,7 @@ DEFAULT_CONFIG = {
     "daily_limit_usdt": 20.0,
     "max_positions": 1,
     "allowed_symbols": ["BTCUSDT", "ETHUSDT"],
+    "enforce_allowed_symbols": False,
     "allow_market_order": False,
     "allow_spot": True,
     "allow_futures": True,
@@ -131,6 +132,7 @@ def save_live_auto_config(config: dict[str, Any]) -> dict[str, Any]:
     merged["daily_limit_usdt"] = min(max(_to_float(merged.get("daily_limit_usdt"), merged["max_order_usdt"]), merged["max_order_usdt"]), merged["principal_usdt"])
     merged["max_positions"] = int(min(max(_to_float(merged.get("max_positions"), 1), 1), 5))
     merged["allowed_symbols"] = [str(x).upper().strip() for x in merged.get("allowed_symbols", []) if str(x).strip()]
+    merged["enforce_allowed_symbols"] = bool(merged.get("enforce_allowed_symbols", False))
     merged["allow_spot"] = bool(merged.get("allow_spot", True))
     merged["allow_futures"] = bool(merged.get("allow_futures", True))
     if not merged["allow_spot"] and not merged["allow_futures"]:
@@ -297,7 +299,7 @@ def run_live_auto_admission_check(user_confirmed: bool = False) -> dict[str, Any
         {"name": "API权限安全", "ok": bool((live_status.get("permission") or {}).get("can_trade")) and not bool((live_status.get("permission") or {}).get("can_withdraw")), "message": "API需可交易且提现权限关闭。"},
         {"name": "自动模拟样本参考", "ok": True, "message": f"自动模拟样本 {sim_stats.get('total_trades', 0)} 笔，仅作为风控参考，不再阻断自动交易。"},
         {"name": "模拟 Profit Factor参考", "ok": True, "message": f"Profit Factor {sim_stats.get('profit_factor', 0)}，仅作为风控参考。"},
-        {"name": "白名单存在", "ok": bool(config.get("allowed_symbols")), "message": "至少需要一个自动实盘白名单交易对。"},
+        {"name": "交易对象限制", "ok": True, "message": "币种白名单已关闭，所有交易对按交易所规则、权限和风控检查。"},
     ]
     failed = [row for row in checks if not row["ok"]]
     return {"ok": not failed, "checks": checks, "message": "自动实盘准入通过。" if not failed else "自动实盘准入失败：样本数量不足或安全条件未满足。"}
@@ -325,7 +327,8 @@ def filter_live_auto_signal(signal: dict[str, Any]) -> tuple[bool, list[str]]:
     spot_enabled = bool(config.get("allow_spot", True))
     futures_enabled = bool(config.get("allow_futures"))
     external_ai = signal.get("external_ai") or signal.get("external_ai_snapshot") or {}
-    if symbol not in config.get("allowed_symbols", []):
+    allowed_symbols = set(config.get("allowed_symbols") or [])
+    if config.get("enforce_allowed_symbols") and allowed_symbols and symbol not in allowed_symbols:
         reasons.append("非自动实盘白名单交易对。")
     allowed_actions = {"轻仓试多", "顺势做多", "轻仓试空", "顺势做空"} if futures_enabled else {"轻仓试多", "顺势做多"}
     if action not in allowed_actions:
@@ -496,7 +499,7 @@ def run_live_auto_preflight(order_plan: dict[str, Any]) -> dict[str, Any]:
         {"name": "当前模式", "ok": config.get("mode") == LIVE_AUTO_MODE, "message": "当前模式必须为 LIVE_AUTO_PILOT。"},
         {"name": "未暂停", "ok": not config.get("paused"), "message": "自动实盘已暂停。"},
         {"name": "未熔断", "ok": not config.get("circuit_breaker_enabled"), "message": config.get("circuit_breaker_reason") or "自动熔断已开启。"},
-        {"name": "白名单", "ok": str(order_plan.get("symbol")) in config.get("allowed_symbols", []), "message": "交易对必须在白名单。"},
+        {"name": "交易对象限制", "ok": (not config.get("enforce_allowed_symbols")) or str(order_plan.get("symbol")) in set(config.get("allowed_symbols") or []), "message": "币种白名单已关闭，按交易所规则、权限和风控检查。" if not config.get("enforce_allowed_symbols") else "交易对必须在白名单。"},
         {"name": "市场类型", "ok": (market_type == "spot" and bool(config.get("allow_spot", True))) or (market_type == "futures" and bool(config.get("allow_futures"))), "message": "当前配置未允许该市场自动交易。"},
         {"name": "合约杠杆", "ok": market_type != "futures" or 1 <= int(order_plan.get("leverage", 5) or 5) <= int(config.get("max_leverage", 20) or 20), "message": "合约杠杆超过配置上限。"},
         {"name": "单笔额度", "ok": _to_float(order_plan.get("quote_amount")) <= _to_float(config.get("max_order_usdt"), 5), "message": "单笔额度超过限制。"},

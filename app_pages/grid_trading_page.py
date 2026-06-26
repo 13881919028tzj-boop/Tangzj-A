@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from html import escape
 from typing import Any
 
 import streamlit as st
@@ -18,11 +19,12 @@ from services.live_grid_trade_engine import (
     get_live_grid_status,
     load_live_grid_audit,
     load_live_grid_settings,
+    run_live_grid_runtime_cycle,
     run_live_grid_plan_test_orders,
     save_live_grid_settings,
     submit_live_grid_plan_orders,
 )
-from services.live_trading_center import get_live_account_snapshot, get_live_position_summary, load_live_order_records
+from services.live_trading_center import get_live_account_snapshot, get_live_position_summary, load_live_order_records, load_live_settings
 from utils.formatters import format_price, money_text
 
 
@@ -30,6 +32,16 @@ GRID_DIRECTION_LABELS = {
     "long_spot": "现货做多网格",
     "short_contract": "合约做空网格",
     "neutral_contract": "中性网格",
+}
+
+GRID_INVESTMENT_MODE_LABELS = {
+    "fixed_equal": "币安等额固定投入",
+    "compound_reinvest": "币安复利模式",
+}
+
+GRID_FUNDING_MODE_LABELS = {
+    "single_order": "按单格挂单金额",
+    "total_amount": "按总投入金额自动分配",
 }
 
 
@@ -40,6 +52,33 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _live_order_cap() -> float:
+    live_settings = load_live_settings()
+    cap = min(
+        _to_float(live_settings.get("max_live_notional_usdt"), 10.0),
+        _to_float(live_settings.get("hard_max_live_notional_usdt"), 50.0),
+    )
+    return cap if cap > 0 else 10.0
+
+
+def _clean_result_text(value: Any, limit: int = 420) -> str:
+    text = " ".join(str(value or "-").replace("\n", " ").split())
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return escape(text)
+
+
+def _preview_error_text(preview: dict[str, Any]) -> str:
+    if preview.get("ok"):
+        return ""
+    reasons: list[str] = []
+    reasons.extend(str(item) for item in (preview.get("risk_errors") or []) if str(item).strip())
+    for section in ("rule_check", "plan_check"):
+        data = preview.get(section) or {}
+        reasons.extend(str(item) for item in (data.get("errors") or []) if str(item).strip())
+    return "；".join(reasons[:5]) or "价格、数量、最小金额或风控规则未通过。"
 
 
 def _price(symbol: str) -> float:
@@ -198,12 +237,13 @@ def _collapsed_panel(key: str, title: str, summary: str) -> bool:
 def _render_interface_summary(status: dict[str, Any], settings: dict[str, Any], symbol: str, current_price: float) -> None:
     permission = status.get("permission") or {}
     restrictions = status.get("restrictions") or {}
+    effective_order_cap = min(_to_float(settings.get("max_order_usdt"), 5.0), _live_order_cap())
     summary = (
         f"接口 {'可检查' if status.get('ready_for_review') else '阻断'}｜"
         f"真实提交 {'可用' if status.get('real_submit_enabled') else '关闭'}｜"
         f"{symbol} {format_price(current_price)}｜"
         f"杠杆 {int(settings.get('futures_leverage', 3) or 3)}x｜"
-        f"挂单上限 {money_text(settings.get('max_order_usdt'))}"
+        f"实际挂单上限 {money_text(effective_order_cap)}"
     )
     if not _collapsed_panel("live_grid_interface_summary", "接口与参数摘要", summary):
         return
@@ -218,7 +258,8 @@ def _render_interface_summary(status: dict[str, Any], settings: dict[str, Any], 
             ("交易对象", symbol, "blue"),
             ("当前价", format_price(current_price), "green" if current_price > 0 else "yellow"),
             ("合约杠杆", f"{int(settings.get('futures_leverage', 3) or 3)}x", "yellow"),
-            ("单挂单上限", money_text(settings.get("max_order_usdt")), "blue"),
+            ("网格配置上限", money_text(settings.get("max_order_usdt")), "blue"),
+            ("实际可提交上限", money_text(effective_order_cap), "green"),
         ]
     )
     if status.get("blockers"):
@@ -250,6 +291,97 @@ def _plan_summary(plan_result: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _plan_rows(plan_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in (plan_result or {}).get("plans") or []:
+        plan = item.get("plan") or {}
+        preview = item.get("preview") or {}
+        rows.append(
+            {
+                "计划ID": plan.get("plan_id"),
+                "币种": plan.get("symbol"),
+                "市场": "合约" if plan.get("market_type") == "futures" else "现货",
+                "方向": plan.get("side"),
+                "杠杆": f"{int(_to_float(plan.get('leverage'), 1))}x" if plan.get("market_type") == "futures" else "-",
+                "价格": format_price(plan.get("price")),
+                "数量": f"{_to_float(plan.get('quantity')):.8f}",
+                "金额": money_text(plan.get("quote_amount")),
+                "投入模式": GRID_INVESTMENT_MODE_LABELS.get(str(plan.get("grid_investment_mode") or "fixed_equal"), str(plan.get("grid_investment_mode") or "-")),
+                "总投入": money_text(plan.get("grid_total_investment_usdt", plan.get("quote_amount"))),
+                "预览": "通过" if preview.get("ok") else "失败",
+                "错误": _preview_error_text(preview),
+            }
+        )
+    return rows
+
+
+def _clear_live_grid_plan() -> None:
+    for key in ("live_grid_plan_result", "live_grid_test_result", "live_grid_submit_result"):
+        st.session_state.pop(key, None)
+    st.session_state.pop("live_grid_delete_plan_select", None)
+    st.session_state.pop("grid_overview_delete_plan_select", None)
+
+
+def _delete_live_grid_plan_at(index: int) -> None:
+    plan_result = dict(st.session_state.get("live_grid_plan_result") or {})
+    plans = list(plan_result.get("plans") or [])
+    if 0 <= int(index) < len(plans):
+        plans.pop(int(index))
+    kept = plans
+    plan_result["plans"] = kept
+    plan_result["ok"] = bool(kept)
+    plan_result["message"] = f"当前保留 {len(kept)} 个真实网格订单计划。"
+    st.session_state["live_grid_plan_result"] = plan_result
+    st.session_state.pop("live_grid_test_result", None)
+    st.session_state.pop("live_grid_submit_result", None)
+    st.session_state.pop("live_grid_delete_plan_select", None)
+    st.session_state.pop("grid_overview_delete_plan_select", None)
+
+
+def _render_live_grid_plan_controls(plan_result: dict[str, Any] | None, key_prefix: str, allow_delete: bool = True) -> None:
+    rows = _plan_rows(plan_result)
+    if not rows:
+        st.info("当前暂无真实网格订单计划。")
+        return
+    top1, top2 = st.columns([3, 1])
+    top1.caption(f"当前共有 {len(rows)} 个计划挂单。")
+    if allow_delete and top2.button("清空全部计划", key=f"{key_prefix}_clear_all_plans", width="stretch"):
+        _clear_live_grid_plan()
+        st.rerun()
+    if allow_delete:
+        delete_options = [
+            f"{idx + 1}. {row.get('币种')} {row.get('方向')} {row.get('市场')} {row.get('价格')} {row.get('金额')}"
+            for idx, row in enumerate(rows)
+        ]
+        delete_col1, delete_col2 = st.columns([3, 1])
+        selected_delete = delete_col1.selectbox("删除订单计划", delete_options, key=f"{key_prefix}_delete_plan_select")
+        selected_delete_index = delete_options.index(selected_delete) if selected_delete in delete_options else 0
+        if delete_col2.button("删除选中计划", key=f"{key_prefix}_delete_selected_plan", width="stretch"):
+            _delete_live_grid_plan_at(selected_delete_index)
+            st.rerun()
+    for idx, item in enumerate((plan_result or {}).get("plans") or []):
+        plan = item.get("plan") or {}
+        preview = item.get("preview") or {}
+        status_text = "预览通过" if preview.get("ok") else "预览失败"
+        col_info, col_delete = st.columns([4, 1])
+        col_info.markdown(
+            f"""
+            <div class="status-card">
+              <b>{idx + 1}. {plan.get('symbol')}</b>｜{plan.get('side')}｜{plan.get('market_type')}｜{status_text}<br>
+              价格：{format_price(plan.get('price'))}　数量：{_to_float(plan.get('quantity')):.8f}　金额：{money_text(plan.get('quote_amount'))}<br>
+              投入：{GRID_INVESTMENT_MODE_LABELS.get(str(plan.get('grid_investment_mode') or 'fixed_equal'), str(plan.get('grid_investment_mode') or '-'))}　总投入：{money_text(plan.get('grid_total_investment_usdt', plan.get('quote_amount')))}<br>
+              计划ID：{plan.get('plan_id', '-')}　来源：{plan.get('source', '-')}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if allow_delete and col_delete.button("删除", key=f"{key_prefix}_delete_visible_plan_{idx}", width="stretch"):
+            _delete_live_grid_plan_at(idx)
+            st.rerun()
+    with st.expander(f"计划挂单明细表｜{len(rows)} 个", expanded=False):
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+
 def _is_grid_order(row: dict[str, Any]) -> bool:
     text = " ".join(str(row.get(key, "")) for key in ("source", "client_order_id", "order_id", "symbol"))
     return "网格" in text or "grid" in text.lower()
@@ -258,6 +390,21 @@ def _is_grid_order(row: dict[str, Any]) -> bool:
 def _order_filled(row: dict[str, Any]) -> bool:
     status = str(row.get("order_status") or "").upper()
     return status in {"FILLED", "PARTIALLY_FILLED"} or _to_float(row.get("executed_qty")) > 0
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_live_grid_status() -> dict[str, Any]:
+    return get_live_grid_status()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_live_account_snapshot(market_type: str) -> dict[str, Any]:
+    return get_live_account_snapshot(False, market_type)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_live_position_summary(price_items: tuple[tuple[str, float], ...]) -> dict[str, Any]:
+    return get_live_position_summary(dict(price_items))
 
 
 def _grid_order_records(limit: int = 500) -> list[dict[str, Any]]:
@@ -272,7 +419,7 @@ def _grid_context(symbol: str, current_price: float) -> dict[str, Any]:
     current_prices = {sym: _price(sym) for sym in symbols}
     if symbol and current_price > 0:
         current_prices[str(symbol).upper()] = current_price
-    position_summary = get_live_position_summary(current_prices)
+    position_summary = _cached_live_position_summary(tuple(sorted(current_prices.items())))
     open_positions = position_summary.get("open_system_positions") or []
     plan = _plan_summary(st.session_state.get("live_grid_plan_result") or {})
     filled_count = len([row for row in records if _order_filled(row)])
@@ -296,7 +443,8 @@ def _grid_context(symbol: str, current_price: float) -> dict[str, Any]:
 
 
 def _render_grid_account_overview(status: dict[str, Any], settings: dict[str, Any], symbol: str, current_price: float, context: dict[str, Any]) -> None:
-    snapshot = get_live_account_snapshot(False, "futures" if settings.get("allow_futures_grid") else "spot")
+    snapshot = _cached_live_account_snapshot("futures" if settings.get("allow_futures_grid") else "spot")
+    effective_order_cap = min(_to_float(settings.get("max_order_usdt"), 5.0), _live_order_cap())
     balances = snapshot.get("balances") or []
     plan = context.get("plan") or {}
     open_positions = context.get("open_positions") or []
@@ -317,10 +465,66 @@ def _render_grid_account_overview(status: dict[str, Any], settings: dict[str, An
             ("总盈亏", f"{_to_float(context.get('total_pnl')):+.4f} USDT", "green" if _to_float(context.get("total_pnl")) >= 0 else "red"),
             ("当前币价", format_price(current_price), "green" if current_price > 0 else "yellow"),
             ("杠杆", f"{int(settings.get('futures_leverage', 3) or 3)}x", "yellow"),
-            ("单挂单上限", money_text(settings.get("max_order_usdt")), "blue"),
+            ("实际单挂上限", money_text(effective_order_cap), "blue"),
             ("历史订单", str(len(records)), ""),
         ]
     )
+    action_col1, action_col2, action_col3 = st.columns(3)
+    if action_col1.button("查看运行网格", key="grid_overview_open_positions", width="stretch"):
+        st.session_state["grid_overview_positions_expanded"] = not bool(st.session_state.get("grid_overview_positions_expanded", False))
+        st.rerun()
+    if action_col2.button("查看计划挂单", key="grid_overview_open_plans", width="stretch"):
+        st.session_state["grid_overview_plans_expanded"] = not bool(st.session_state.get("grid_overview_plans_expanded", False))
+        st.rerun()
+    if action_col3.button("生成网格计划", key="grid_overview_create_plan", width="stretch"):
+        st.session_state["grid_ledger_next_tab"] = "真实订单计划"
+        st.session_state["live_grid_manual_expanded"] = True
+        st.rerun()
+    ctl1, ctl2, ctl3 = st.columns(3)
+    if ctl1.button("开启自动补单", key="grid_runtime_enable", width="stretch"):
+        save_live_grid_settings({**settings, "auto_replenish_enabled": True})
+        st.success("真实网格自动补单已开启。")
+        st.rerun()
+    if ctl2.button("暂停自动补单", key="grid_runtime_pause", width="stretch"):
+        save_live_grid_settings({**settings, "auto_replenish_enabled": False})
+        st.warning("真实网格自动补单已暂停。")
+        st.rerun()
+    if ctl3.button("清空补单检查结果", key="grid_runtime_clear_result", width="stretch"):
+        st.session_state.pop("live_grid_runtime_result", None)
+        st.rerun()
+    if st.button("执行一次真实网格补单检查", key="grid_overview_runtime_cycle", width="stretch"):
+        st.session_state["live_grid_runtime_result"] = run_live_grid_runtime_cycle(limit=20, force=True)
+        st.rerun()
+    runtime_result = st.session_state.get("live_grid_runtime_result")
+    if runtime_result:
+        (st.success if runtime_result.get("ok") else st.warning)(runtime_result.get("message", "补单检查完成。"))
+        for item in runtime_result.get("failures") or []:
+            st.warning(str(item))
+    if st.session_state.get("grid_overview_positions_expanded"):
+        st.markdown("**运行网格明细**")
+        if open_positions:
+            for pos in open_positions:
+                pnl = _to_float(pos.get("total_pnl"))
+                pnl_class = "green" if pnl >= 0 else "red"
+                st.markdown(
+                    f"""
+                    <div class="status-card">
+                      <b>{pos.get('symbol')}</b>｜{pos.get('status')}｜真实网格持仓<br>
+                      当前价：{format_price(pos.get('current_price'))}　成本均价：{format_price(pos.get('avg_entry_price'))}　剩余数量：{_to_float(pos.get('remaining_quantity')):.8f}<br>
+                      成本：{money_text(pos.get('quote_cost'))}　已实现：{_to_float(pos.get('realized_pnl')):+.4f} USDT　浮盈：{_to_float(pos.get('unrealized_pnl')):+.4f} USDT<br>
+                      <span class="{pnl_class}">总盈亏：{pnl:+.4f} USDT / {_to_float(pos.get('unrealized_pnl_pct')):+.2f}%</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("当前暂无可识别的真实网格持仓。若已有计划挂单但未成交，会显示在计划挂单明细里。")
+        if records:
+            with st.expander(f"相关真实网格订单记录｜{len(records)} 条", expanded=False):
+                st.dataframe(records[:100], width="stretch", hide_index=True)
+    if st.session_state.get("grid_overview_plans_expanded"):
+        st.markdown("**计划挂单明细**")
+        _render_live_grid_plan_controls(st.session_state.get("live_grid_plan_result") or {}, "grid_overview")
     st.markdown(
         f"""
         <div class="app-shell"><div class="module-card">
@@ -360,6 +564,11 @@ def _render_grid_positions(context: dict[str, Any], settings: dict[str, Any], cu
     open_positions = context.get("open_positions") or []
     if not open_positions:
         st.info("当前暂无可识别的真实网格持仓。提交真实订单并成交后会显示在这里。")
+        if (context.get("plan") or {}).get("count"):
+            if st.button("查看当前计划挂单", key="grid_positions_open_plans", width="stretch"):
+                st.session_state["grid_ledger_next_tab"] = "真实订单计划"
+                st.session_state["live_grid_plan_detail_expanded"] = True
+                st.rerun()
         return
     for pos in open_positions:
         pnl = _to_float(pos.get("total_pnl"))
@@ -443,7 +652,7 @@ def _render_grid_runtime_status(status: dict[str, Any], settings: dict[str, Any]
     records = [row for row in load_live_order_records(500) if _is_grid_order(row)]
     live_symbols = sorted({str(row.get("symbol") or "").upper() for row in records if row.get("symbol")})
     current_prices = {sym: _price(sym) for sym in live_symbols}
-    position_summary = get_live_position_summary(current_prices)
+    position_summary = _cached_live_position_summary(tuple(sorted(current_prices.items())))
     open_positions = position_summary.get("open_system_positions") or []
     grid_position_symbols = {str(pos.get("symbol") or "").upper() for pos in open_positions}
     running_grid_count = len(grid_position_symbols) or (1 if plan["count"] else 0)
@@ -515,7 +724,8 @@ def _render_settings(settings: dict[str, Any]) -> None:
         q1, q2 = st.columns(2)
         allow_test = q1.checkbox("允许 Binance Test Order", value=bool(settings.get("allow_test_orders")))
         allow_real = q2.checkbox("允许真实提交", value=bool(settings.get("allow_real_order_submit", False)))
-        st.caption("保存后本区域会自动折叠。真实提交仍需全局实盘开关、IP白名单、Test Order 和确认短句。")
+        auto_replenish = st.checkbox("开启真实网格自动循环补单", value=bool(settings.get("auto_replenish_enabled", True)))
+        st.caption("保存后本区域会自动折叠。真实提交仍需全局实盘开关、IP白名单、Test Order 和确认短句。自动补单只处理本系统提交且带网格层级的订单。")
         if st.form_submit_button("保存实盘网格接口配置", width="stretch"):
             save_live_grid_settings(
                 {
@@ -531,6 +741,7 @@ def _render_settings(settings: dict[str, Any]) -> None:
                     "allow_futures_grid": allow_futures,
                     "allow_test_orders": allow_test,
                     "allow_real_order_submit": allow_real,
+                    "auto_replenish_enabled": auto_replenish,
                 }
             )
             st.session_state["live_grid_settings_expanded"] = False
@@ -543,7 +754,8 @@ def _render_manual_plan_form(symbol: str, current_price: float, settings: dict[s
     default_lower = _to_float(suggestion.get("lower"), current_price * 0.94 if current_price else 0.0)
     default_upper = _to_float(suggestion.get("upper"), current_price * 1.06 if current_price else 0.0)
     default_direction = str(suggestion.get("direction") or "long_spot")
-    summary = f"{symbol}｜{GRID_DIRECTION_LABELS.get(default_direction, default_direction)}｜建议区间 {format_price(default_lower)} - {format_price(default_upper)}"
+    summary = f"{symbol}｜总投入自动分配｜固定投入/复利可选｜建议区间 {format_price(default_lower)} - {format_price(default_upper)}"
+    st.session_state.setdefault("live_grid_manual_expanded", True)
     if not _collapsed_panel("live_grid_manual", "真实网格订单参数", summary):
         return
     components.html(_live_price_html(symbol, current_price), height=86, scrolling=False)
@@ -559,22 +771,54 @@ def _render_manual_plan_form(symbol: str, current_price: float, settings: dict[s
         lower = c3.number_input("区间下限", min_value=0.0, value=float(default_lower), step=0.0001, format="%.8f")
         upper = c4.number_input("区间上限", min_value=0.0, value=float(default_upper), step=0.0001, format="%.8f")
         grid_count = c5.number_input("网格数量", min_value=2, max_value=200, value=20, step=1)
+        funding_keys = list(GRID_FUNDING_MODE_LABELS.keys())
+        funding_mode = st.radio("资金输入方式", funding_keys, index=1, format_func=lambda item: GRID_FUNDING_MODE_LABELS.get(item, item), horizontal=True)
+        investment_keys = list(GRID_INVESTMENT_MODE_LABELS.keys())
+        investment_mode = st.radio("币安投入模式", investment_keys, index=0, format_func=lambda item: GRID_INVESTMENT_MODE_LABELS.get(item, item), horizontal=True)
+        max_initial_orders = int(settings.get("max_initial_orders", 2) or 2)
+        configured_order_cap = float(settings.get("max_order_usdt", 5.0) or 5.0)
+        live_order_cap = _live_order_cap()
+        max_order_usdt = max(1.0, min(configured_order_cap, live_order_cap))
+        grid_count_int = int(grid_count)
+        min_exchange_notional = 5.0
+        min_total_amount = min_exchange_notional * grid_count_int
+        total_default = min_total_amount
+        max_total_amount = max_order_usdt * grid_count_int
         c6, c7 = st.columns(2)
-        quote_amount = c6.number_input("单格挂单金额USDT", min_value=1.0, max_value=float(settings.get("max_order_usdt", 5.0)), value=float(settings.get("max_order_usdt", 5.0)), step=1.0)
-        c7.text_input("合约执行杠杆", value=f"{int(settings.get('futures_leverage', 3) or 3)}x", disabled=True)
-        st.caption("杠杆在上方“实盘网格接口配置”中统一选择；生成计划后不会自动下单。")
-        if st.form_submit_button("生成真实网格订单计划", width="stretch"):
-            st.session_state["live_grid_plan_result"] = build_live_grid_manual_order_plans(
-                {
-                    "symbol": input_symbol,
-                    "current_price": float(input_current),
-                    "lower_price": float(lower),
-                    "upper_price": float(upper),
-                    "direction": direction,
-                    "grid_count": int(grid_count),
-                    "quote_amount": float(quote_amount),
-                }
-            )
+        if funding_mode == "total_amount":
+            total_quote_amount = c6.number_input("总投入金额USDT", min_value=float(min_total_amount), max_value=float(max_total_amount), value=float(total_default), step=1.0)
+            quote_amount = float(total_quote_amount) / max(grid_count_int, 1)
+            c7.text_input("预计单格投入", value=f"{quote_amount:.2f} USDT", disabled=True)
+        else:
+            quote_amount = c6.number_input("单格挂单金额USDT", min_value=1.0, max_value=max_order_usdt, value=max_order_usdt, step=1.0)
+            total_quote_amount = quote_amount * grid_count_int
+            c7.text_input("预计总投入", value=f"{total_quote_amount:.2f} USDT", disabled=True)
+        st.caption(f"资金按网格数量分配：单格投入 = 总投入 / {grid_count_int}。最多初始提交 {max_initial_orders} 单只控制第一批挂单数量，不参与资金分配。单格上限按 {max_order_usdt:.2f} USDT 控制。")
+        submit_phrase = st.text_input("一键真实提交确认短句", value="", type="password", placeholder="我确认执行小资金实盘订单")
+        one_click_confirmed = st.checkbox("我确认生成计划后立即执行 Test Order 并提交真实初始订单")
+        manual_config = {
+            "symbol": input_symbol,
+            "current_price": float(input_current),
+            "lower_price": float(lower),
+            "upper_price": float(upper),
+            "direction": direction,
+            "grid_count": int(grid_count),
+            "quote_amount": float(quote_amount),
+            "funding_mode": funding_mode,
+            "total_quote_amount": float(total_quote_amount),
+            "investment_mode": investment_mode,
+        }
+        gen_col, one_click_col = st.columns(2)
+        if gen_col.form_submit_button("只生成真实网格订单计划", width="stretch"):
+            st.session_state["live_grid_plan_result"] = build_live_grid_manual_order_plans(manual_config)
+            st.session_state.pop("live_grid_test_result", None)
+            st.session_state.pop("live_grid_submit_result", None)
+            st.session_state["live_grid_manual_expanded"] = False
+            st.rerun()
+        if one_click_col.form_submit_button("一键生成并提交真实初始订单", width="stretch", disabled=not one_click_confirmed):
+            plan_result = build_live_grid_manual_order_plans(manual_config)
+            st.session_state["live_grid_plan_result"] = plan_result
+            st.session_state["live_grid_submit_result"] = submit_live_grid_plan_orders(plan_result.get("plans") or [], submit_phrase)
             st.session_state["live_grid_manual_expanded"] = False
             st.rerun()
 
@@ -623,27 +867,10 @@ def _render_plan_result() -> None:
         st.success(str(plan_result.get("message")))
     else:
         st.warning(str(plan_result.get("message")))
-    rows = []
-    for item in plan_result.get("plans") or []:
-        plan = item.get("plan") or {}
-        preview = item.get("preview") or {}
-        rows.append(
-            {
-                "计划ID": plan.get("plan_id"),
-                "币种": plan.get("symbol"),
-                "市场": "合约" if plan.get("market_type") == "futures" else "现货",
-                "方向": plan.get("side"),
-                "杠杆": f"{int(_to_float(plan.get('leverage'), 1))}x" if plan.get("market_type") == "futures" else "-",
-                "价格": format_price(plan.get("price")),
-                "数量": f"{_to_float(plan.get('quantity')):.8f}",
-                "金额": money_text(plan.get("quote_amount")),
-                "预览": "通过" if preview.get("ok") else "失败",
-                "错误": "；".join(str(x) for x in (preview.get("risk_errors") or [])),
-            }
-        )
+    rows = _plan_rows(plan_result)
     if not rows:
         return
-    st.dataframe(rows, width="stretch", hide_index=True)
+    _render_live_grid_plan_controls(plan_result, "live_grid")
     c_test, c_submit = st.columns(2)
     if c_test.button("执行 Binance Test Order", width="stretch"):
         st.session_state["live_grid_test_result"] = run_live_grid_plan_test_orders(plan_result.get("plans") or [])
@@ -655,6 +882,52 @@ def _render_plan_result() -> None:
         st.rerun()
 
 
+def _render_grid_action_result_rows(result: dict[str, Any]) -> None:
+    blockers = (result.get("status") or {}).get("blockers") or []
+    if blockers:
+        st.markdown("**阻断项**")
+        for item in blockers:
+            st.warning(str(item))
+    rows = result.get("results") or []
+    if not rows:
+        st.info("当前没有返回订单结果。")
+        return
+    for idx, row in enumerate(rows):
+        ok = bool(row.get("ok"))
+        plan_id = row.get("plan_id") or (row.get("order") or {}).get("order_id") or "-"
+        message = _clean_result_text(row.get("message") or ("通过" if ok else "失败"))
+        order = row.get("order") or {}
+        symbol = _clean_result_text(order.get("symbol") or row.get("symbol") or "-")
+        side = _clean_result_text(order.get("side") or row.get("side") or "-")
+        status_text = _clean_result_text(order.get("order_status") or order.get("raw_status_summary") or ("通过" if ok else "失败"))
+        price_text = format_price(order.get("price") or row.get("price"))
+        qty_text = f"{_to_float(order.get('quantity') or row.get('quantity')):.8f}" if _to_float(order.get("quantity") or row.get("quantity")) > 0 else "-"
+        preflight = row.get("preflight") or {}
+        st.markdown(
+            f"""
+            <div class="status-card">
+              <b>{idx + 1}. {'通过' if ok else '失败'}</b>｜计划/订单：{_clean_result_text(plan_id)}<br>
+              {message}<br>
+              交易对象：{symbol}　方向：{side}　状态：{status_text}<br>
+              价格：{price_text}　数量：{qty_text}　金额：{money_text(order.get('notional') or row.get('quote_amount'))}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        checklist = preflight.get("checklist") or []
+        if checklist:
+            with st.expander(f"检查明细｜{idx + 1}", expanded=not ok):
+                for item in checklist:
+                    status = str(item.get("status", ""))
+                    text = f"{_clean_result_text(status)}｜{_clean_result_text(item.get('name'))}｜{_clean_result_text(item.get('message'))}"
+                    if status == "通过":
+                        st.success(text)
+                    elif status == "警告":
+                        st.warning(text)
+                    else:
+                        st.error(text)
+
+
 def _render_action_results() -> None:
     test_result = st.session_state.get("live_grid_test_result")
     if test_result:
@@ -663,7 +936,7 @@ def _render_action_results() -> None:
             st.success(str(test_result.get("message")))
         else:
             st.warning(str(test_result.get("message")))
-        st.json({"results": test_result.get("results", []), "blockers": (test_result.get("status") or {}).get("blockers", [])})
+        _render_grid_action_result_rows(test_result)
     submit_result = st.session_state.get("live_grid_submit_result")
     if submit_result:
         st.markdown("**真实提交结果**")
@@ -671,7 +944,7 @@ def _render_action_results() -> None:
             st.success(str(submit_result.get("message")))
         else:
             st.warning(str(submit_result.get("message")))
-        st.json({"results": submit_result.get("results", []), "blockers": (submit_result.get("status") or {}).get("blockers", [])})
+        _render_grid_action_result_rows(submit_result)
 
 
 def _render_audit() -> None:
@@ -689,40 +962,47 @@ def render_grid_trading_page(page_titles: dict[str, tuple[str, str]], version: s
     symbol = query_symbol or str(current_symbol or "BTCUSDT").upper().strip()
     current_price = _price(symbol)
     settings = load_live_grid_settings()
-    status = get_live_grid_status()
-    context = _grid_context(symbol, current_price)
-    audit = load_live_grid_audit(200)
 
     st.markdown("**真实网格交易**")
     st.caption("本页只生成、测试、提交真实 Binance 订单计划；不会自动绕过 Test Order 和确认短句。")
     if st.session_state.pop("live_grid_settings_saved", False):
         st.success("实盘网格接口配置已保存。")
 
-    tabs = st.tabs(["账户总览", "当前持仓", "真实订单计划", "交易历史", "统计分析", "参数设置", "事件日志"])
+    tab_options = ["账户总览", "当前持仓", "真实订单计划", "交易历史", "统计分析", "参数设置", "事件日志"]
+    requested_tab = st.session_state.pop("grid_ledger_next_tab", None)
+    if requested_tab in tab_options:
+        st.session_state["grid_ledger_active_tab"] = requested_tab
+    active_tab = st.radio("网格页面", tab_options, horizontal=True, label_visibility="collapsed", key="grid_ledger_active_tab")
 
-    with tabs[0]:
+    if active_tab == "账户总览":
+        status = _cached_live_grid_status()
+        context = _grid_context(symbol, current_price)
         _render_grid_account_overview(status, settings, symbol, current_price, context)
         _render_interface_summary(status, settings, symbol, current_price)
 
-    with tabs[1]:
+    elif active_tab == "当前持仓":
+        context = _grid_context(symbol, current_price)
         _render_grid_positions(context, settings, current_price)
 
-    with tabs[2]:
+    elif active_tab == "真实订单计划":
         _render_manual_plan_form(symbol, current_price, settings)
         _render_recommendations(settings)
         _render_plan_result()
         _render_action_results()
 
-    with tabs[3]:
-        _render_grid_history(context.get("records") or [])
+    elif active_tab == "交易历史":
+        _render_grid_history(_grid_order_records(500))
 
-    with tabs[4]:
+    elif active_tab == "统计分析":
+        context = _grid_context(symbol, current_price)
+        audit = load_live_grid_audit(200)
         _render_grid_statistics(context, audit)
 
-    with tabs[5]:
+    elif active_tab == "参数设置":
         _render_settings(settings)
 
-    with tabs[6]:
+    elif active_tab == "事件日志":
+        audit = load_live_grid_audit(200)
         if not audit:
             st.info("当前暂无实盘网格事件日志。")
         for row in audit:

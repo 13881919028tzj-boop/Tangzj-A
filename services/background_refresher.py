@@ -36,6 +36,7 @@ from services.fast_opportunity_engine import (
 from services.auto_simulation_runner import run_auto_simulation_cycle
 from services.grid_trade_engine import load_grid_bots, update_grid_bots
 from services.live_auto_pilot import run_live_auto_trading_cycle
+from services.live_grid_trade_engine import run_live_grid_runtime_cycle
 from services.watchlist_manager import sync_watchlist_from_rankings
 from services.market_oi import get_derivatives_snapshot
 from services.orderbook_service import get_orderbook
@@ -250,6 +251,10 @@ def _refresh_rankings(symbols: list[str]) -> None:
             run_live_auto_trading_cycle(rankings)
         except Exception as live_auto_exc:
             print(f"[AI模型9.0] 后台自动交易循环失败，不影响行情刷新。error={repr(live_auto_exc)}")
+        try:
+            run_live_grid_runtime_cycle(limit=10)
+        except Exception as live_grid_exc:
+            print(f"[真实网格] 后台自动补单循环失败，不影响行情刷新。error={repr(live_grid_exc)}")
     except Exception as exc:
         print(f"[AI模型7.0.6] Binance榜单获取失败 error={repr(exc)}")
         market_cache.set_error("Binance行情获取失败，请检查网络或稍后重试。")

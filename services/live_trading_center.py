@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "daily_live_loss_limit_usdt": 5.0,
     "system_suggested_live_amount_usdt": 5.0,
     "allowed_symbols": ["BTCUSDT", "ETHUSDT"],
+    "enforce_allowed_symbols": False,
     "max_leverage": 5,
     "daily_loss_limit_pct": 1.0,
     "max_drawdown_limit_pct": 3.0,
@@ -326,12 +327,38 @@ def get_live_account_snapshot(testnet: bool = False, market_type: str = "spot") 
         return {"ok": False, "message": f"账户只读数据获取失败：{exc}", "balances": [], "positions": [], "open_orders": [], "updated_time": _now()}
 
 
+def _normalize_exchange_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(rule, dict):
+        return {"ok": False, "message": "交易规则格式无效。"}
+    filters = rule.get("raw_filters") or {}
+    price_filter = filters.get("PRICE_FILTER") or {}
+    min_notional_filter = filters.get("MIN_NOTIONAL") or {}
+    notional_filter = filters.get("NOTIONAL") or {}
+    normalized = dict(rule)
+    if not _to_float(normalized.get("maxPrice")):
+        normalized["maxPrice"] = _to_float(price_filter.get("maxPrice"))
+    if not _to_float(normalized.get("minNotional")):
+        normalized["minNotional"] = _to_float(
+            min_notional_filter.get("minNotional")
+            or min_notional_filter.get("notional")
+            or notional_filter.get("minNotional")
+            or notional_filter.get("notional")
+        )
+    if not _to_float(normalized.get("maxNotional")):
+        normalized["maxNotional"] = _to_float(notional_filter.get("maxNotional"))
+    return normalized
+
+
 def load_exchange_rules(symbol: str, market_type: str = "spot", testnet: bool = False) -> dict[str, Any]:
     symbol = str(symbol or "BTCUSDT").upper()
     RULE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = RULE_CACHE_DIR / f"{market_type}_{symbol}.json"
     if path.exists() and time.time() - path.stat().st_mtime < 86400:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        normalized = _normalize_exchange_rule(raw)
+        if normalized != raw:
+            path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+        return normalized
     try:
         if market_type == "futures":
             url = f"{_base_url(market_type, testnet)}/fapi/v1/exchangeInfo"
@@ -350,12 +377,15 @@ def load_exchange_rules(symbol: str, market_type: str = "spot", testnet: bool = 
             "quoteAsset": item.get("quoteAsset"),
             "tickSize": _to_float((filters.get("PRICE_FILTER") or {}).get("tickSize")),
             "minPrice": _to_float((filters.get("PRICE_FILTER") or {}).get("minPrice")),
+            "maxPrice": _to_float((filters.get("PRICE_FILTER") or {}).get("maxPrice")),
             "stepSize": _to_float((filters.get("LOT_SIZE") or {}).get("stepSize") or (filters.get("MARKET_LOT_SIZE") or {}).get("stepSize")),
             "minQty": _to_float((filters.get("LOT_SIZE") or {}).get("minQty") or (filters.get("MARKET_LOT_SIZE") or {}).get("minQty")),
             "maxQty": _to_float((filters.get("LOT_SIZE") or {}).get("maxQty") or (filters.get("MARKET_LOT_SIZE") or {}).get("maxQty")),
-            "minNotional": _to_float((filters.get("MIN_NOTIONAL") or {}).get("minNotional") or (filters.get("NOTIONAL") or {}).get("minNotional")),
+            "minNotional": _to_float((filters.get("MIN_NOTIONAL") or {}).get("minNotional") or (filters.get("MIN_NOTIONAL") or {}).get("notional") or (filters.get("NOTIONAL") or {}).get("minNotional") or (filters.get("NOTIONAL") or {}).get("notional")),
+            "maxNotional": _to_float((filters.get("NOTIONAL") or {}).get("maxNotional")),
             "raw_filters": filters,
         }
+        rule = _normalize_exchange_rule(rule)
         path.write_text(json.dumps(rule, ensure_ascii=False, indent=2), encoding="utf-8")
         return rule
     except Exception as exc:
@@ -380,6 +410,12 @@ def validate_order_against_exchange_rules(order_plan: dict[str, Any]) -> dict[st
     notional = qty * price
     if rule.get("status") not in {"TRADING", "TRADING_ALLOWED", None}:
         errors.append("交易对象当前状态不可交易。")
+    if price <= 0:
+        errors.append("限价单价格必须大于 0。")
+    if _to_float(rule.get("minPrice")) and price < _to_float(rule.get("minPrice")):
+        errors.append("计划价格低于交易所最小价格。")
+    if _to_float(rule.get("maxPrice")) and price > _to_float(rule.get("maxPrice")):
+        errors.append("计划价格高于交易所最大价格。")
     if qty < _to_float(rule.get("minQty")):
         errors.append("下单数量低于交易所最小数量。")
     if _to_float(rule.get("maxQty")) and qty > _to_float(rule.get("maxQty")):
@@ -387,9 +423,11 @@ def validate_order_against_exchange_rules(order_plan: dict[str, Any]) -> dict[st
     if not _is_step_aligned(qty, _to_float(rule.get("stepSize"))):
         errors.append("下单数量不符合 step size 精度要求。")
     if _to_float(rule.get("tickSize")) and not _is_step_aligned(price, _to_float(rule.get("tickSize"))):
-        warnings.append("计划价格可能不完全符合 tick size，正式执行前需要按交易所精度修正。")
+        errors.append("计划价格不符合 tick size 精度要求。")
     if _to_float(rule.get("minNotional")) and notional < _to_float(rule.get("minNotional")):
         errors.append("订单金额低于最小名义金额。")
+    if _to_float(rule.get("maxNotional")) and notional > _to_float(rule.get("maxNotional")):
+        errors.append("订单金额高于交易所最大名义金额。")
     return {"ok": not errors, "errors": errors, "warnings": warnings, "rule": rule}
 
 
@@ -397,6 +435,8 @@ def _daily_live_notional() -> float:
     today = time.strftime("%Y-%m-%d")
     total = 0.0
     for row in load_live_order_records(500):
+        if _is_legacy_grid_placeholder_record(row):
+            continue
         if str(row.get("time", "")).startswith(today) and str(row.get("order_status", "")) not in {"REJECTED", "CANCELED"}:
             total += _to_float(row.get("notional"), 0)
     return total
@@ -472,7 +512,8 @@ def validate_live_order_plan(order_plan: dict[str, Any]) -> dict[str, Any]:
         errors.append("用户选择金额超过风控允许最大金额。")
     if _daily_live_notional() + notional > _to_float(settings.get("daily_live_notional_limit_usdt"), 100):
         errors.append("单日真实交易总额将超过上限。")
-    if str(order_plan.get("symbol")) not in settings.get("allowed_symbols", ["BTCUSDT", "ETHUSDT"]):
+    allowed_symbols = set(settings.get("allowed_symbols") or [])
+    if settings.get("enforce_allowed_symbols") and allowed_symbols and str(order_plan.get("symbol")) not in allowed_symbols:
         warnings.append("当前交易对象不在默认实盘候选白名单。")
     rule_check = validate_order_against_exchange_rules({**order_plan, "testnet": settings.get("mode") == "testnet"})
     errors.extend(rule_check.get("errors") or [])
@@ -508,12 +549,25 @@ def create_live_order_preview(order_plan: dict[str, Any]) -> dict[str, Any]:
     plan_check = validate_live_order_plan({**order_plan, **plan})
     if plan["notional"] > _to_float(settings.get("max_live_notional_usdt"), 10):
         risk_errors.append("订单名义金额超过实盘前置安全上限。")
-    if plan["symbol"] not in settings.get("allowed_symbols", ["BTCUSDT", "ETHUSDT"]):
+    allowed_symbols = set(settings.get("allowed_symbols") or [])
+    if settings.get("enforce_allowed_symbols") and allowed_symbols and plan["symbol"] not in allowed_symbols:
         risk_errors.append("当前交易对象不在默认实盘候选白名单。")
     risk_errors.extend(plan_check.get("errors") or [])
     preview = {"ok": rule_check["ok"] and not risk_errors, "plan": plan, "rule_check": rule_check, "plan_check": plan_check, "risk_errors": risk_errors, "message": "这只是订单预览，尚未执行真实订单。"}
     log_live_audit_event("订单预览生成" if preview["ok"] else "订单预览失败", mode=str(settings.get("mode")), symbol=plan["symbol"], result="通过" if preview["ok"] else "失败", reason="；".join(rule_check.get("errors", []) + risk_errors) or "订单预览生成。")
     return preview
+
+
+def _is_legacy_grid_placeholder_record(row: dict[str, Any]) -> bool:
+    text = " ".join(str(row.get(key, "")) for key in ("source", "client_order_id", "order_id"))
+    return (
+        "网格" in text
+        and str(row.get("order_id") or "") == "123"
+        and row.get("grid_level_index") is None
+        and row.get("grid_lower_price") is None
+        and row.get("grid_upper_price") is None
+        and row.get("grid_count") is None
+    )
 
 
 def preview_live_order(order_plan: dict[str, Any]) -> dict[str, Any]:
@@ -694,6 +748,16 @@ def submit_live_futures_order(order_plan: dict[str, Any], test_order_result: dic
             "executed_qty": response.get("executedQty"),
             "avg_price": response.get("avgPrice", ""),
             "source": plan.get("source"),
+            "grid_bot_id": plan.get("grid_bot_id"),
+            "grid_level_index": plan.get("grid_level_index"),
+            "grid_position": plan.get("grid_position"),
+            "grid_direction": plan.get("grid_direction"),
+            "grid_lower_price": plan.get("grid_lower_price"),
+            "grid_upper_price": plan.get("grid_upper_price"),
+            "grid_count": plan.get("grid_count"),
+            "grid_price_step": plan.get("grid_price_step"),
+            "grid_investment_mode": plan.get("grid_investment_mode"),
+            "grid_funding_mode": plan.get("grid_funding_mode"),
             "committee_action": (plan.get("committee_snapshot") or {}).get("action") or (plan.get("committee_snapshot") or {}).get("final_action"),
             "risk_score": ((plan.get("committee_snapshot") or {}).get("risk_score") or (plan.get("committee_snapshot") or {}).get("committee_risk_score")),
             "live_safety_status": "通过",

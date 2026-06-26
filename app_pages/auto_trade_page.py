@@ -71,6 +71,16 @@ def _money(value: Any) -> str:
     return f"{float(value or 0):.2f} USDT"
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_live_account_snapshot(market_type: str) -> dict[str, Any]:
+    return get_live_account_snapshot(False, market_type)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_live_auto_status(price_items: tuple[tuple[str, float], ...] = ()) -> dict[str, Any]:
+    return get_live_auto_status(dict(price_items))
+
+
 def _live_balance_value(row: dict[str, Any]) -> float:
     free = safe_number(row.get("free"), 0) or 0
     locked = safe_number(row.get("locked"), 0) or 0
@@ -137,9 +147,10 @@ def _render_live_trade_ledger(
     ok, reasons = filter_live_auto_signal(signal)
     plan = st.session_state.get("live_auto_order_plan")
 
-    tabs = st.tabs(["账户总览", "当前持仓", "真实订单计划", "交易历史", "统计分析", "参数设置", "事件日志"])
+    tab_options = ["账户总览", "当前持仓", "真实订单计划", "交易历史", "统计分析", "参数设置", "事件日志"]
+    active_tab = st.radio("自动交易页面", tab_options, horizontal=True, label_visibility="collapsed", key="live_auto_ledger_active_tab")
 
-    with tabs[0]:
+    if active_tab == "账户总览":
         if account_snapshot.get("ok"):
             st.success("Binance API 已接入，账户只读检查通过。")
         else:
@@ -209,7 +220,7 @@ def _render_live_trade_ledger(
             for item in admission.get("checks", []):
                 (st.success if item.get("ok") else st.error)(f"{item.get('name')}：{item.get('message')}")
 
-    with tabs[1]:
+    elif active_tab == "当前持仓":
         st.markdown('<div class="app-shell"><div class="module-card"><div class="module-title">当前实盘自动持仓中心</div>', unsafe_allow_html=True)
         if not positions:
             st.markdown('<div class="status-card">当前暂无自动实盘持仓。</div>', unsafe_allow_html=True)
@@ -238,7 +249,7 @@ def _render_live_trade_ledger(
                     st.caption(f"{event.get('time')}｜{event.get('event')}｜{event.get('result')}｜{event.get('reason')}")
         st.markdown("</div></div>", unsafe_allow_html=True)
 
-    with tabs[2]:
+    elif active_tab == "真实订单计划":
         st.markdown("**当前自动信号**")
         render_metric_grid(
             [
@@ -249,7 +260,7 @@ def _render_live_trade_ledger(
                 ("置信度", str(signal.get("committee_confidence", 0)), "green" if float(signal.get("committee_confidence") or 0) >= 70 else "yellow"),
                 ("风险评分", format_score(signal.get("risk_score")), "green" if safe_compare_lt(signal.get("risk_score"), 55.01) else "red"),
                 ("信号过滤", "通过" if ok else "拒绝", "green" if ok else "red"),
-                ("白名单", "通过" if current_symbol in set(auto_config.get("allowed_symbols") or []) else "未加入", "green" if current_symbol in set(auto_config.get("allowed_symbols") or []) else "yellow"),
+                ("交易对象限制", "已放开", "green"),
             ]
         )
         for reason in reasons:
@@ -283,7 +294,7 @@ def _render_live_trade_ledger(
                 for item in preflight.get("checks", []):
                     st.caption(f"{'通过' if item.get('ok') else '失败'}｜{item.get('name')}｜{item.get('message')}")
 
-    with tabs[3]:
+    elif active_tab == "交易历史":
         if not orders:
             st.info("当前暂无真实自动交易历史。真实下单提交后会记录在这里。")
         else:
@@ -313,7 +324,7 @@ def _render_live_trade_ledger(
                     unsafe_allow_html=True,
                 )
 
-    with tabs[4]:
+    elif active_tab == "统计分析":
         render_metric_grid(
             [
                 ("真实订单数", str(live_stats.get("order_count", 0)), ""),
@@ -335,7 +346,7 @@ def _render_live_trade_ledger(
         else:
             st.dataframe(orders[:100], width="stretch", hide_index=True)
 
-    with tabs[5]:
+    elif active_tab == "参数设置":
         param_summary = f"{market_text}｜{float(auto_config.get('position_pct', 5) or 5):.2f}%｜{int(auto_config.get('default_leverage', 5) or 5)}x｜{_money(auto_config.get('max_order_usdt'))}"
         if _fold_panel("live_params", "真实订单参数", param_summary, expanded=False):
             with st.form("auto_trade_settings_form"):
@@ -345,7 +356,9 @@ def _render_live_trade_ledger(
                 st.info(f"按当前设置，单笔保证金约为 {float(new_config['principal_usdt']) * float(new_config['position_pct']) / 100:.2f} USDT。")
                 new_config["daily_limit_usdt"] = st.number_input("单日自动交易额度 USDT", min_value=1.0, max_value=float(new_config["principal_usdt"]), value=min(float(auto_config.get("daily_limit_usdt", 20) or 20), float(new_config["principal_usdt"])), step=10.0)
                 new_config["max_positions"] = st.number_input("最大同时持仓", min_value=1, max_value=5, value=int(auto_config.get("max_positions", 1) or 1), step=1)
-                new_config["allowed_symbols"] = [s.strip().upper() for s in st.text_input("自动交易白名单", value=",".join(auto_config.get("allowed_symbols") or ["BTCUSDT", "ETHUSDT"])).split(",") if s.strip()]
+                new_config["enforce_allowed_symbols"] = False
+                new_config["allowed_symbols"] = auto_config.get("allowed_symbols") or []
+                st.info("币种白名单已关闭，所有交易对只按交易所规则、权限、额度和风控检查。")
                 c1, c2 = st.columns(2)
                 new_config["allow_spot"] = c1.checkbox("允许现货自动交易", value=bool(auto_config.get("allow_spot", True)))
                 new_config["allow_futures"] = c2.checkbox("允许U本位永续自动交易", value=bool(auto_config.get("allow_futures", True)))
@@ -365,7 +378,7 @@ def _render_live_trade_ledger(
                     _close_fold("live_params")
                     st.rerun()
 
-    with tabs[6]:
+    elif active_tab == "事件日志":
         render_metric_grid(
             [
                 ("自动订单数", str(auto_review.get("auto_order_count", 0)), ""),
@@ -387,14 +400,15 @@ def render_approval_center_page(page_titles: dict[str, tuple[str, str]], version
     binance_ready = bool((secure_status.get("BINANCE_API_KEY") or {}).get("configured")) and bool((secure_status.get("BINANCE_API_SECRET") or {}).get("configured"))
     auto_config = load_live_auto_config()
     auto_symbols = set(auto_config.get("allowed_symbols") or [])
-    for pos in (get_live_auto_status().get("open_positions") or []):
+    initial_auto_status = _cached_live_auto_status()
+    for pos in (initial_auto_status.get("open_positions") or []):
         if pos.get("symbol"):
             auto_symbols.add(str(pos.get("symbol")).upper())
     auto_prices = {sym: float((market_cache.get_ticker(sym) or {}).get("last_price") or 0) for sym in sorted(auto_symbols)}
-    auto_status = get_live_auto_status(auto_prices)
+    auto_status = _cached_live_auto_status(tuple(sorted(auto_prices.items())))
     auto_config = auto_status.get("config") or auto_config
     auto_review = auto_status.get("review") or {}
-    account_snapshot = get_live_account_snapshot(False, "futures" if auto_config.get("allow_futures") else "spot") if binance_ready else {}
+    account_snapshot = _cached_live_account_snapshot("futures" if auto_config.get("allow_futures") else "spot") if binance_ready else {}
     positions = auto_status.get("open_positions") or []
     market_text = " / ".join(
         name
@@ -524,7 +538,7 @@ def render_approval_center_page(page_titles: dict[str, tuple[str, str]], version
             ("置信度", str(signal.get("committee_confidence", 0)), "green" if float(signal.get("committee_confidence") or 0) >= 70 else "yellow"),
             ("风险评分", format_score(signal.get("risk_score")), "green" if safe_compare_lt(signal.get("risk_score"), 55.01) else "red"),
             ("信号过滤", "通过" if ok else "拒绝", "green" if ok else "red"),
-            ("白名单", "通过" if current_symbol in set(auto_config.get("allowed_symbols") or []) else "未加入", "green" if current_symbol in set(auto_config.get("allowed_symbols") or []) else "yellow"),
+            ("交易对象限制", "已放开", "green"),
         ]
     )
     for reason in reasons:
@@ -587,7 +601,9 @@ def render_approval_center_page(page_titles: dict[str, tuple[str, str]], version
             st.info(f"按当前设置，单笔保证金约为 {float(new_config['principal_usdt']) * float(new_config['position_pct']) / 100:.2f} USDT。")
             new_config["daily_limit_usdt"] = st.number_input("单日自动交易额度 USDT", min_value=1.0, max_value=float(new_config["principal_usdt"]), value=min(float(auto_config.get("daily_limit_usdt", 20) or 20), float(new_config["principal_usdt"])), step=10.0)
             new_config["max_positions"] = st.number_input("最大同时持仓", min_value=1, max_value=5, value=int(auto_config.get("max_positions", 1) or 1), step=1)
-            new_config["allowed_symbols"] = [s.strip().upper() for s in st.text_input("自动交易白名单", value=",".join(auto_config.get("allowed_symbols") or ["BTCUSDT", "ETHUSDT"])).split(",") if s.strip()]
+            new_config["enforce_allowed_symbols"] = False
+            new_config["allowed_symbols"] = auto_config.get("allowed_symbols") or []
+            st.info("币种白名单已关闭，所有交易对只按交易所规则、权限、额度和风控检查。")
             c1, c2 = st.columns(2)
             new_config["allow_spot"] = c1.checkbox("允许现货自动交易", value=bool(auto_config.get("allow_spot", True)))
             new_config["allow_futures"] = c2.checkbox("允许U本位永续自动交易", value=bool(auto_config.get("allow_futures", True)))

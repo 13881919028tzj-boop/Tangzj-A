@@ -14,5 +14,8 @@ from services.local_api_server import start_local_api_server
 
 
 if __name__ == "__main__":
-    start_local_api_server()
+    try:
+        start_local_api_server()
+    except Exception as exc:
+        print(f"[后台Worker] 本地前端行情API启动失败，继续运行后台刷新与交易循环。error={exc!r}", flush=True)
     run_background_refresher_forever()
